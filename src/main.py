@@ -58,6 +58,8 @@ class SlashCommandCompleter(Completer):
             ("/trace off", "关闭工具调用轨迹显示"),
             ("/stream on", "开启流式输出"),
             ("/stream off", "关闭流式输出"),
+            ("/mode ", "?????/mode auto|wiki_only|general_only"),
+            ("/reset", "清空会话上下文记忆"),
             ("/exit", "退出 CLI"),
         ]
 
@@ -127,6 +129,34 @@ def build_llm(config: AppConfig | None = None) -> LLMClient:
     cfg = config or load_config()
     return LLMClient(cfg.llm)
 
+
+
+def _run_agent_with_thinking(
+    agent: WikiFirstAgent,
+    *,
+    user_input: str,
+    force_wiki: bool,
+    mode: str = "auto",
+    code_context: str = "",
+    response_mode: str = "answer",
+    target_file: str = "",
+    history: list[tuple[str, str]] | None = None,
+):
+    status_text = "[bold cyan]Thinking... searching Wiki and calling model[/bold cyan]"
+    if mode == "general_only":
+        status_text = "[bold cyan]Thinking... calling model directly (general_only)[/bold cyan]"
+    elif mode == "wiki_only":
+        status_text = "[bold cyan]Thinking... searching Wiki only (wiki_only)[/bold cyan]"
+    with console.status(status_text, spinner="dots"):
+        return agent.run(
+            user_input,
+            force_wiki=force_wiki,
+            mode=mode,  # type: ignore[arg-type]
+            code_context=code_context,
+            response_mode=response_mode,  # type: ignore[arg-type]
+            target_file=target_file,
+            history=history,
+        )
 
 
 def _print_trace(resp_thought: str, resp_actions: list[str]) -> None:
@@ -577,10 +607,12 @@ def chat(
 
     show_trace = trace
     show_stream = stream
+    session_mode = "auto"
     last_patch_file = ""
     last_patch_output = ""
     last_patch_allowed: set[str] | None = None
     last_backup_id = ""
+    session_history: list[tuple[str, str]] = []
 
     while True:
         try:
@@ -615,6 +647,8 @@ def chat(
                 "/structure 查看知识库结构\n"
                 "/trace on|off 轨迹开关\n"
                 "/stream on|off 流式输出开关\n"
+                "/mode auto|wiki_only|general_only ??????\n"
+                "/reset 清空会话上下文记忆\n"
                 "/exit 退出"
             )
             continue
@@ -737,9 +771,32 @@ def chat(
                 console.print("Usage: /stream on|off")
             continue
 
+        if cmd.startswith("/mode "):
+            val = cmd.split(" ", 1)[1].strip().lower()
+            if val not in {"auto", "wiki_only", "general_only"}:
+                console.print("[yellow]Usage: /mode auto|wiki_only|general_only[/yellow]")
+                continue
+            session_mode = val
+            console.print(f"[cyan]session mode = {session_mode}[/cyan]")
+            continue
+
+        if cmd == "/reset":
+            session_history = []
+            console.print("[cyan]已清空会话上下文记忆。[/cyan]")
+            continue
+
+        remember_turn = False
         if cmd.startswith("/ask "):
             query = cmd[5:].strip()
-            resp = agent.run(query, force_wiki=True)
+            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
+            resp = _run_agent_with_thinking(
+                agent,
+                user_input=query,
+                force_wiki=True,
+                history=session_history,
+                mode="wiki_only",
+            )
+            remember_turn = True
         elif cmd.startswith("/review "):
             body = cmd[len("/review ") :].strip()
             if "::" not in body:
@@ -751,7 +808,15 @@ def chat(
                 console.print(f"[red]File not found or empty:[/red] {file}")
                 continue
             code_ctx = f"file: {file}\n```\\n{code}\\n```"
-            resp = agent.run(query, force_wiki=True, code_context=code_ctx)
+            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
+            resp = _run_agent_with_thinking(
+                agent,
+                user_input=query,
+                force_wiki=True,
+                code_context=code_ctx,
+                history=session_history,
+                mode="wiki_only",
+            )
         elif cmd.startswith("/patch "):
             body = cmd[len("/patch ") :].strip()
             if "::" not in body:
@@ -763,12 +828,16 @@ def chat(
                 console.print(f"[red]File not found or empty:[/red] {file}")
                 continue
             code_ctx = f"file: {file}\n```\\n{code}\\n```"
-            resp = agent.run(
-                query,
+            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
+            resp = _run_agent_with_thinking(
+                agent,
+                user_input=query,
                 force_wiki=True,
                 code_context=code_ctx,
                 response_mode="patch",
                 target_file=file,
+                history=session_history,
+                mode="wiki_only",
             )
             last_patch_file = file
             last_patch_output = resp.output
@@ -795,23 +864,39 @@ def chat(
             if missing:
                 continue
             code_ctx = "\n\n".join(blocks)
-            resp = agent.run(
-                query,
+            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
+            resp = _run_agent_with_thinking(
+                agent,
+                user_input=query,
                 force_wiki=True,
                 code_context=code_ctx,
                 response_mode="patch",
                 target_file=", ".join(file_list),
+                history=session_history,
+                mode="wiki_only",
             )
             last_patch_file = file_list[0]
             last_patch_output = resp.output
             last_patch_allowed = set(file_list)
         else:
-            resp = agent.run(cmd, force_wiki=False)
+            console.print(f"[black on bright_cyan] You: {cmd} [/black on bright_cyan]")
+            resp = _run_agent_with_thinking(
+                agent,
+                user_input=cmd,
+                force_wiki=False,
+                history=session_history,
+                mode=session_mode,
+            )
+            remember_turn = True
 
         if show_trace:
             _print_trace(resp.thought, resp.actions)
 
         _stream_markdown(resp.output, enabled=show_stream)
+        if remember_turn:
+            session_history.append((cmd, resp.output))
+            if len(session_history) > 12:
+                session_history = session_history[-12:]
         if cmd.startswith("/patch ") or cmd.startswith("/patchm "):
             _print_patch_preview(resp.output)
 
