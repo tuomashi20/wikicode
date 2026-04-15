@@ -1,7 +1,7 @@
 llm:
   provider: jiutian
   model: jiutian-think-v3
-  api_key: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhcGlfa2V5IjoiNjk4NzYxMjM3NWY3NDljMTY0ZmM5NjVhIiwiZXhwIjoxODU1NDQzNTc5Nzk3MTgsInRpbWVzdGFtcCI6MTc3MDg3ODkxOH0.Vf6Ao2Dndr-ZCgP7M21VDFvxvaYoVgRH1MBcxtGayrM
+  api_key: 
   base_url: null
   image_understand_model: null
   image_generate_model: null
