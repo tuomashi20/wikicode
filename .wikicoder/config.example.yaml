@@ -1,0 +1,22 @@
+﻿llm:
+  provider: "jiutian"
+  model: "jiutian-think-v3"
+  api_key: "YOUR_JIUTIAN_API_KEY"
+  base_url: null
+  image_understand_model: null
+  image_generate_model: null
+  image_understand_url: null
+  image_generate_url: null
+  temperature: 0.2
+  timeout_seconds: 45
+
+wiki_strategy:
+  raw_path: "./data/raw"
+  split_mode: "heading"
+  heading_level: 2
+  style_guidelines:
+    priority: ["MUST", "REQUIRED"]
+    language: "Chinese"
+
+sync:
+  auto_on_startup: true

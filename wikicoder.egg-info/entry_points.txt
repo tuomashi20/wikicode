@@ -1,3 +1,0 @@
-[console_scripts]
-wikicoder = src.main:run_cli
-wikicoderctl = src.main:app

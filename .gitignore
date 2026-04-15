@@ -2,8 +2,22 @@
 *.py[cod]
 *.pyc.*
 
+# runtime logs/index/cache
 logs/
-data/wiki_processed/chunks/
-data/wiki_processed/*.sqlite*
+data/wiki_processed/
 
+# local config/secrets & backups
+.wikicoder/config.yaml
+.wikicoder/backups/
+
+# packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# local env
 .venv/
+
+# local raw test files
+data/raw/*.txt
+data/raw/recycle.md
