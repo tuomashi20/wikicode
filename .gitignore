@@ -1,0 +1,9 @@
+﻿__pycache__/
+*.py[cod]
+*.pyc.*
+
+logs/
+data/wiki_processed/chunks/
+data/wiki_processed/*.sqlite*
+
+.venv/

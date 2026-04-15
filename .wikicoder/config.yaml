@@ -1,0 +1,22 @@
+llm:
+  provider: jiutian
+  model: jiutian-think-v3
+  api_key: eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJhcGlfa2V5IjoiNjk4NzYxMjM3NWY3NDljMTY0ZmM5NjVhIiwiZXhwIjoxODU1NDQzNTc5Nzk3MTgsInRpbWVzdGFtcCI6MTc3MDg3ODkxOH0.Vf6Ao2Dndr-ZCgP7M21VDFvxvaYoVgRH1MBcxtGayrM
+  base_url: null
+  image_understand_model: null
+  image_generate_model: null
+  image_understand_url: null
+  image_generate_url: null
+  temperature: 0.2
+  timeout_seconds: 45
+wiki_strategy:
+  raw_path: D:\project\testwiki_row
+  split_mode: heading
+  heading_level: 2
+  style_guidelines:
+    priority:
+    - MUST
+    - REQUIRED
+    language: Chinese
+sync:
+  auto_on_startup: true
