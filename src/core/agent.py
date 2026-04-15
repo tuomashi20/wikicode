@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from src.core.llm_client import LLMClient
-from src.skills.wiki_tools import wiki_read_chunk, wiki_search
+from src.skills.wiki_tools import wiki_read_chunk, wiki_search_v2
 from src.utils.config import AppConfig
 from src.utils.logger import get_file_logger
 
@@ -43,8 +43,17 @@ class WikiFirstAgent:
 
         thought = "Wiki-first: search wiki before final response."
 
-        results = wiki_search(query, limit=8) if query else []
-        actions.append(f"wiki_search(query={query!r}) -> {len(results)}")
+        results, rw = (
+            wiki_search_v2(query, limit=8, synonyms_path=self.config.wiki_strategy.synonyms_path) if query else ([], None)
+        )
+        if rw is not None:
+            actions.append(
+                f"query_rewrite(keywords={rw.keywords[:6]}, expanded={rw.expanded_terms[:6]})"
+            )
+        actions.append(f"wiki_search_v2(query={query!r}) -> {len(results)}")
+        if results:
+            reasons = [str(r.get("_hit_reason", "")) for r in results[:3]]
+            actions.append(f"wiki_hit_reason(top3={reasons})")
 
         chunks: list[dict[str, str]] = []
         for r in results[:3]:
@@ -67,6 +76,8 @@ class WikiFirstAgent:
                 response_mode=response_mode,
                 target_file=target_file,
             )
+            if rw is not None and rw.suggest_terms:
+                output += "\n\n建议关键词：" + "、".join(rw.suggest_terms[:6])
             self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
             return AgentResponse(thought=thought + " (fallback-general)", actions=actions, output=output)
 

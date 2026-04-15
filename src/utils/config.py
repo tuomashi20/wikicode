@@ -28,9 +28,17 @@ class LLMConfig:
 
 @dataclass
 class WikiStrategyConfig:
+    vault_path: Path | None
     raw_path: Path
+    wiki_path: Path
+    processed_path: Path
+    raw_subdirs: list[str]
+    wiki_subdirs: list[str]
+    raw_to_wiki_map: dict[str, str]
+    synonyms_path: Path
     split_mode: str
     heading_level: int
+    wiki_compile_on_sync: bool
     style_guidelines: dict[str, Any]
 
 
@@ -44,15 +52,6 @@ class AppConfig:
     llm: LLMConfig
     wiki_strategy: WikiStrategyConfig
     sync: SyncConfig
-
-
-REQUIRED_DIRS = [
-    PROJECT_ROOT / "data",
-    PROJECT_ROOT / "data" / "raw",
-    PROJECT_ROOT / "data" / "wiki_processed",
-    PROJECT_ROOT / "data" / "wiki_processed" / "chunks",
-    PROJECT_ROOT / "logs",
-]
 
 
 
@@ -84,9 +83,95 @@ def _read_api_key(llm_data: dict[str, Any]) -> str:
     return ""
 
 
+def _infer_wiki_category(name: str) -> str:
+    n = str(name).strip().lower()
+    if not n:
+        return "concepts"
+    if any(k in n for k in ["对比", "比较", "评估", "选型", "comparison", "compare"]):
+        return "comparisons"
+    if any(k in n for k in ["问答", "faq", "问题", "query", "queries"]):
+        return "queries"
+    if any(k in n for k in ["组织", "角色", "岗位", "客户", "供应商", "终端", "设备", "entity", "entities"]):
+        return "entities"
+    return "concepts"
 
-def ensure_workspace() -> None:
-    for d in REQUIRED_DIRS:
+
+
+def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
+    vault_raw = str(wiki_data.get("vault_path", "")).strip()
+    vault_path = _resolve_path(vault_raw) if vault_raw else None
+
+    raw_dir = str(wiki_data.get("raw_dir", "raw"))
+    wiki_dir = str(wiki_data.get("wiki_dir", "wiki"))
+    processed_dir = str(wiki_data.get("processed_dir", "wiki_processed"))
+
+    if vault_path:
+        raw_default = vault_path / raw_dir
+        wiki_default = vault_path / wiki_dir
+        processed_default = vault_path / processed_dir
+    else:
+        raw_default = PROJECT_ROOT / "data" / "raw"
+        wiki_default = PROJECT_ROOT / "data" / "wiki"
+        processed_default = PROJECT_ROOT / "data" / "wiki_processed"
+
+    raw_path = _resolve_path(wiki_data.get("raw_path", str(raw_default)))
+    wiki_path = _resolve_path(wiki_data.get("wiki_path", str(wiki_default)))
+    processed_path = _resolve_path(wiki_data.get("processed_path", str(processed_default)))
+    synonyms_path = _resolve_path(wiki_data.get("synonyms_path", "./data/dictionaries/synonyms_zh.yaml"))
+    # Support both raw_subdirs and legacy typo row_subdirs
+    raw_subdirs_cfg = wiki_data.get("raw_subdirs")
+    if raw_subdirs_cfg is None:
+        raw_subdirs_cfg = wiki_data.get("row_subdirs")
+    raw_subdirs = [str(x) for x in (raw_subdirs_cfg or []) if str(x).strip()]
+    wiki_subdirs = [str(x) for x in (wiki_data.get("wiki_subdirs") or []) if str(x).strip()]
+    raw_to_wiki_map = {
+        str(k): str(v)
+        for k, v in (wiki_data.get("raw_to_wiki_map") or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    if not raw_to_wiki_map and raw_subdirs:
+        raw_to_wiki_map = {x: _infer_wiki_category(x) for x in raw_subdirs}
+
+    return WikiStrategyConfig(
+        vault_path=vault_path,
+        raw_path=raw_path,
+        wiki_path=wiki_path,
+        processed_path=processed_path,
+        raw_subdirs=raw_subdirs,
+        wiki_subdirs=wiki_subdirs,
+        raw_to_wiki_map=raw_to_wiki_map,
+        synonyms_path=synonyms_path,
+        split_mode=str(wiki_data.get("split_mode", "heading")),
+        heading_level=int(wiki_data.get("heading_level", 2)),
+        wiki_compile_on_sync=bool(wiki_data.get("wiki_compile_on_sync", True)),
+        style_guidelines=wiki_data.get("style_guidelines", {}),
+    )
+
+
+
+def ensure_workspace(config: AppConfig | None = None) -> None:
+    cfg = config
+    if cfg is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = None
+
+    dirs = [PROJECT_ROOT / "logs", PROJECT_ROOT / "data" / "dictionaries", PROJECT_ROOT / ".wikicoder"]
+    if cfg is not None:
+        ws = cfg.wiki_strategy
+        dirs.extend([ws.raw_path, ws.wiki_path, ws.processed_path, ws.processed_path / "chunks"])
+        dirs.extend([ws.raw_path / d for d in ws.raw_subdirs])
+        dirs.extend([ws.wiki_path / d for d in ws.wiki_subdirs])
+    else:
+        dirs.extend([
+            PROJECT_ROOT / "data" / "raw",
+            PROJECT_ROOT / "data" / "wiki",
+            PROJECT_ROOT / "data" / "wiki_processed",
+            PROJECT_ROOT / "data" / "wiki_processed" / "chunks",
+        ])
+
+    for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -101,7 +186,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     wiki_data = data.get("wiki_strategy", {})
     sync_data = data.get("sync", {})
 
-    return AppConfig(
+    cfg = AppConfig(
         llm=LLMConfig(
             provider=str(llm_data.get("provider", "jiutian")),
             model=str(llm_data.get("model", "jiutian-think-v3")),
@@ -114,11 +199,16 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             temperature=float(llm_data.get("temperature", 0.2)),
             timeout_seconds=int(llm_data.get("timeout_seconds", 45)),
         ),
-        wiki_strategy=WikiStrategyConfig(
-            raw_path=_resolve_path(wiki_data.get("raw_path", "./data/raw")),
-            split_mode=str(wiki_data.get("split_mode", "heading")),
-            heading_level=int(wiki_data.get("heading_level", 2)),
-            style_guidelines=wiki_data.get("style_guidelines", {}),
-        ),
+        wiki_strategy=_build_wiki_strategy(wiki_data),
         sync=SyncConfig(auto_on_startup=bool(sync_data.get("auto_on_startup", True))),
     )
+
+    # runtime db path follows processed_path
+    try:
+        from src.utils.db_manager import configure_db_path
+
+        configure_db_path(cfg.wiki_strategy.processed_path / "db.sqlite")
+    except Exception:
+        pass
+
+    return cfg

@@ -43,7 +43,8 @@ class SlashCommandCompleter(Completer):
             ("/help", "查看命令帮助"),
             ("/sync", "同步知识库（RAW -> WIKI）"),
             ("/kbclear yes", "一键清空索引（需 yes 确认）"),
-            ("/kbpath ", "设置知识库RAW路径：/kbpath <目录>"),
+            ("/kbclear all yes", "Clear index + wiki pages (keep raw)"),
+            ("/vaultpath ", "设置统一知识库根目录：/vaultpath <目录>"),
             ("/ask ", "强制走 Wiki 检索提问"),
             ("/review ", "审阅文件：/review <文件> :: <问题>"),
             ("/patch ", "生成单文件补丁：/patch <文件> :: <需求>"),
@@ -144,7 +145,8 @@ def _print_patch_preview(patch_text: str) -> None:
         console.print(f"- {it.file or '(unknown)'} | hunks={it.hunks} +{it.added} -{it.removed}")
 
 
-def _set_kb_path(path_str: str) -> tuple[bool, str]:
+
+def _set_vault_path(path_str: str) -> tuple[bool, str]:
     path_str = path_str.strip()
     if not path_str:
         return False, "路径不能为空。"
@@ -155,11 +157,20 @@ def _set_kb_path(path_str: str) -> tuple[bool, str]:
     ws = data.get("wiki_strategy") or {}
     if not isinstance(ws, dict):
         ws = {}
-    ws["raw_path"] = path_str
+    ws["vault_path"] = path_str
+    ws.setdefault("raw_dir", "raw")
+    ws.setdefault("wiki_dir", "wiki")
+    ws.setdefault("processed_dir", "wiki_processed")
+    ws.setdefault("raw_subdirs", ["inbox", "drafts", "archive"])
+    ws.setdefault("wiki_subdirs", ["entities", "concepts", "comparisons", "queries"])
+    # clear explicit path overrides so vault auto-rules take effect
+    ws.pop("raw_path", None)
+    ws.pop("wiki_path", None)
+    ws.pop("processed_path", None)
     data["wiki_strategy"] = ws
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    return True, f"已更新知识库路径为: {path_str}"
+    return True, f"已更新 vault_path 为: {path_str}（raw/wiki/processed 将自动在该目录下构建）"
 
 
 def _extract_image_fields(obj: object) -> tuple[list[str], list[str], list[str]]:
@@ -243,12 +254,42 @@ def _backup_and_apply_multi(allowed_files: set[str], patch_output: str) -> tuple
     return ok, backup_id, msgs
 
 
+def _clear_wiki_output(wiki_path: Path) -> list[str]:
+    messages: list[str] = []
+    wiki_dir = Path(wiki_path)
+    if not wiki_dir.exists():
+        return [f"Wiki dir not found: {wiki_dir}"]
+
+    # 1) clear files first
+    for file_path in sorted([p for p in wiki_dir.rglob("*") if p.is_file()], key=lambda p: len(p.parts), reverse=True):
+        try:
+            file_path.unlink()
+            messages.append(f"Removed wiki file: {file_path}")
+        except Exception as e:  # noqa: BLE001
+            try:
+                file_path.write_text("", encoding="utf-8")
+                messages.append(f"Truncated locked wiki file: {file_path}")
+            except Exception as e2:  # noqa: BLE001
+                messages.append(f"Failed clearing wiki file {file_path}: {e}; {e2}")
+
+    # 2) try remove empty dirs (keep root)
+    for dir_path in sorted([p for p in wiki_dir.rglob("*") if p.is_dir()], key=lambda p: len(p.parts), reverse=True):
+        try:
+            dir_path.rmdir()
+            messages.append(f"Removed wiki dir: {dir_path}")
+        except Exception:
+            # directory not empty or locked; keep it
+            continue
+    return messages
+
+
 @app.command()
 def sync() -> None:
     """Run RAW -> WIKI sync."""
     ensure_workspace()
     result = run_sync()
-    console.print(f"[green]Sync completed[/green]: files={result['files']} chunks={result['chunks']}")
+    wp = result.get("wiki_pages", 0)
+    console.print(f"[green]Sync completed[/green]: files={result['files']} chunks={result['chunks']} wiki_pages={wp}")
 
 
 @app.command()
@@ -270,29 +311,44 @@ def structure() -> None:
         console.print(f"- {item['parent_file']} ({item['chunk_count']} chunks)")
 
 
+
 @app.command()
-def kbpath(path: str) -> None:
-    """Set RAW knowledge base path in config."""
+def vaultpath(path: str) -> None:
+    """Set unified vault path; raw/wiki/processed paths will be derived automatically."""
     ensure_workspace()
-    ok, msg = _set_kb_path(path)
+    ok, msg = _set_vault_path(path)
     if ok:
+        cfg = load_config()
+        ensure_workspace(cfg)
+        raw_dir = cfg.wiki_strategy.raw_path
         console.print(f"[green]{msg}[/green]")
-        console.print("[cyan]请执行 /sync 或 `python -m src.main sync` 使新路径生效。[/cyan]")
+        console.print(f"[cyan]目录已创建：{cfg.wiki_strategy.vault_path}[/cyan]")
+        console.print(f"[cyan]请将知识原文件放入 RAW 子目录：{raw_dir}[/cyan]")
+        console.print("[cyan]然后执行同步命令：/sync 或 `wikicoderctl sync`[/cyan]")
     else:
         console.print(f"[red]{msg}[/red]")
 
 
 @app.command()
-def kbclear(yes: bool = typer.Option(False, "--yes", help="Confirm clear index")) -> None:
-    """Clear wiki index store (chunks + sqlite)."""
+def kbclear(
+    yes: bool = typer.Option(False, "--yes", help="Confirm clear index"),
+    clear_all: bool = typer.Option(False, "--all", help="Also clear generated wiki pages"),
+) -> None:
+    """Clear wiki index store (chunks + sqlite); optionally clear wiki pages too."""
     ensure_workspace()
     if not yes:
         console.print("[yellow]危险操作：请使用 --yes 确认清空索引。[/yellow]")
         return
-    msgs = clear_index_store()
+    cfg = load_config()
+    msgs = clear_index_store(processed_path=cfg.wiki_strategy.processed_path)
+    if clear_all:
+        msgs.extend(_clear_wiki_output(cfg.wiki_strategy.wiki_path))
     for m in msgs:
-        console.print(f"[green]{m}[/green]" if m.startswith(("Cleared", "Removed")) else f"[yellow]{m}[/yellow]")
-    console.print("[cyan]已清空索引。可执行 /sync 重新构建。[/cyan]")
+        console.print(f"[green]{m}[/green]" if m.startswith(("Cleared", "Removed", "Truncated")) else f"[yellow]{m}[/yellow]")
+    if clear_all:
+        console.print("[cyan]Index and wiki pages cleared (raw kept). Run /sync to rebuild.[/cyan]")
+    else:
+        console.print("[cyan]已清空索引。可执行 /sync 重新构建。[/cyan]")
 
 
 @app.command()
@@ -507,7 +563,8 @@ def chat(
 
     if config.sync.auto_on_startup:
         result = run_sync()
-        console.print(f"[cyan]Auto sync[/cyan]: files={result['files']} chunks={result['chunks']}")
+        wp = result.get("wiki_pages", 0)
+        console.print(f"[cyan]Auto sync[/cyan]: files={result['files']} chunks={result['chunks']} wiki_pages={wp}")
 
     agent = build_agent(config)
     session = PromptSession(
@@ -545,7 +602,8 @@ def chat(
                 "命令列表：\n"
                 "/sync 同步知识库\n"
                 "/kbclear yes 清空索引（chunks+sqlite）\n"
-                "/kbpath <目录> 设置知识库RAW路径（绝对/相对路径都支持）\n"
+                "/kbclear all yes 清空索引+wiki页面（保留raw）\n"
+                "/vaultpath <目录> 设置统一知识库根目录（自动创建 raw/wiki/wiki_processed）\n"
                 "/ask <问题> 强制Wiki问答\n"
                 "/review <文件> :: <问题> 文件审阅\n"
                 "/patch <文件> :: <需求> 生成单文件补丁\n"
@@ -563,18 +621,31 @@ def chat(
 
         if cmd == "/sync":
             result = run_sync()
-            console.print(f"[green]Sync completed[/green]: files={result['files']} chunks={result['chunks']}")
+            wp = result.get("wiki_pages", 0)
+            console.print(f"[green]Sync completed[/green]: files={result['files']} chunks={result['chunks']} wiki_pages={wp}")
             continue
 
-        if cmd == "/kbclear" or cmd == "/kbclear yes":
-            if cmd != "/kbclear yes":
-                console.print("[yellow]危险操作，请使用 /kbclear yes 确认。[/yellow]")
+        if cmd in {"/kbclear", "/kbclear yes", "/kbclear all yes"}:
+            if cmd == "/kbclear":
+                console.print("[yellow]危险操作，请使用 /kbclear yes 或 /kbclear all yes 确认。[/yellow]")
                 continue
-            msgs = clear_index_store()
+            clear_all = cmd == "/kbclear all yes"
+            cfg = load_config()
+            msgs = clear_index_store(processed_path=cfg.wiki_strategy.processed_path)
+            if clear_all:
+                msgs.extend(_clear_wiki_output(cfg.wiki_strategy.wiki_path))
             for m in msgs:
-                console.print(f"[green]{m}[/green]" if m.startswith(("Cleared", "Removed")) else f"[yellow]{m}[/yellow]")
-            console.print("[cyan]已清空索引。可执行 /sync 重新构建。[/cyan]")
+                console.print(
+                    f"[green]{m}[/green]"
+                    if m.startswith(("Cleared", "Removed", "Truncated"))
+                    else f"[yellow]{m}[/yellow]"
+                )
+            if clear_all:
+                console.print("[cyan]已清空索引和 wiki 生成页（raw 未删除）。可执行 /sync 重新构建。[/cyan]")
+            else:
+                console.print("[cyan]已清空索引。可执行 /sync 重新构建。[/cyan]")
             continue
+
 
         if cmd == "/structure":
             items = wiki_list_structure()
@@ -585,12 +656,17 @@ def chat(
                     console.print(f"- {item['parent_file']} ({item['chunk_count']} chunks)")
             continue
 
-        if cmd.startswith("/kbpath "):
-            new_path = cmd[len("/kbpath ") :].strip()
-            ok, msg = _set_kb_path(new_path)
+
+        if cmd.startswith("/vaultpath "):
+            new_path = cmd[len("/vaultpath ") :].strip()
+            ok, msg = _set_vault_path(new_path)
             if ok:
+                config = load_config()
+                ensure_workspace(config)
                 console.print(f"[green]{msg}[/green]")
-                console.print("[cyan]请执行 /sync 使新路径生效。[/cyan]")
+                console.print(f"[cyan]目录已创建：{config.wiki_strategy.vault_path}[/cyan]")
+                console.print(f"[cyan]请将知识原文件放入 RAW 子目录：{config.wiki_strategy.raw_path}[/cyan]")
+                console.print("[cyan]然后执行同步命令：/sync[/cyan]")
             else:
                 console.print(f"[red]{msg}[/red]")
             continue

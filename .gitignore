@@ -21,3 +21,9 @@ dist/
 # local raw test files
 data/raw/*.txt
 data/raw/recycle.md
+
+# local test/demo vault artifacts
+tmp_vault/
+tmp_vault2/
+data/rawtmp/
+data/test_*/

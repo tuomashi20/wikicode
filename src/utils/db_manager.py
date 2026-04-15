@@ -42,6 +42,12 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 _resolved_db_path: Path | None = None
 
 
+def configure_db_path(path: Path | str) -> None:
+    global DB_PATH, _resolved_db_path
+    DB_PATH = Path(path)
+    _resolved_db_path = None
+
+
 
 def _try_open(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -296,7 +302,8 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
         try:
             content_text = str(r["content_text"] or "")
             if not content_text and r["content_path"]:
-                p = PROJECT_ROOT / str(r["content_path"])
+                cp = str(r["content_path"])
+                p = Path(cp) if Path(cp).is_absolute() else (PROJECT_ROOT / cp)
                 if p.exists():
                     content_text = p.read_text(encoding="utf-8", errors="ignore")
             hay = f"{r['title']} {r['tags']} {r['parent_file']} {content_text}".lower()
@@ -346,12 +353,15 @@ def list_structure(db_path: Path | None = None) -> list[tuple[str, int]]:
     return [(r["parent_file"], r["chunk_count"]) for r in rows]
 
 
-def clear_index_store() -> list[str]:
+def clear_index_store(processed_path: Path | None = None) -> list[str]:
     """Clear local wiki index artifacts (db/chunks)."""
     messages: list[str] = []
 
-    # 1) clear chunks directory
-    chunks_dir = PROJECT_ROOT / "data" / "wiki_processed" / "chunks"
+    # 1) clear chunks directory (prefer configured processed_path)
+    if processed_path is None:
+        chunks_dir = PROJECT_ROOT / "data" / "wiki_processed" / "chunks"
+    else:
+        chunks_dir = Path(processed_path) / "chunks"
     if chunks_dir.exists():
         for child in chunks_dir.iterdir():
             try:
@@ -360,20 +370,47 @@ def clear_index_store() -> list[str]:
                 elif child.is_dir():
                     shutil.rmtree(child, ignore_errors=True)
             except Exception as e:  # noqa: BLE001
+                # fallback for locked file: truncate content
+                if child.is_file():
+                    try:
+                        child.write_text("", encoding="utf-8")
+                        messages.append(f"Truncated locked chunk: {child}")
+                        continue
+                    except Exception:
+                        pass
                 messages.append(f"Failed removing {child}: {e}")
         messages.append(f"Cleared chunks: {chunks_dir}")
     else:
         messages.append(f"Chunks dir not found: {chunks_dir}")
 
-    # 2) clear known sqlite files
-    candidates = {PREFERRED_DB_PATH, FALLBACK_DB_PATH, resolve_db_path()}
+    # 2) clear known sqlite files (prefer configured processed_path db first)
+    candidates = {PREFERRED_DB_PATH, FALLBACK_DB_PATH}
+    if processed_path is not None:
+        candidates.add(Path(processed_path) / "db.sqlite")
+    try:
+        candidates.add(resolve_db_path())
+    except Exception:
+        pass
+
     for base in candidates:
+        removed_any = False
         for p in base.parent.glob(f"{base.stem}.sqlite*"):
             try:
                 p.unlink()
                 messages.append(f"Removed: {p}")
+                removed_any = True
             except Exception as e:  # noqa: BLE001
                 messages.append(f"Failed removing {p}: {e}")
+        # fallback when db file is locked: clear rows in-place
+        if (not removed_any) and base.exists():
+            try:
+                with get_conn(base) as conn:
+                    conn.execute("DELETE FROM chunks_fts")
+                    conn.execute("DELETE FROM chunks")
+                    conn.commit()
+                messages.append(f"Cleared rows in locked db: {base}")
+            except Exception as e:  # noqa: BLE001
+                messages.append(f"Failed clearing rows in {base}: {e}")
 
     # reset resolved path so next use can re-detect
     global _resolved_db_path

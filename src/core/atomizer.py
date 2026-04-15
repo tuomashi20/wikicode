@@ -9,9 +9,7 @@ from pathlib import Path
 from src.utils.config import AppConfig, PROJECT_ROOT
 from src.utils.db_manager import delete_chunks_by_parent, init_db, upsert_chunk
 from src.utils.logger import get_file_logger
-
-
-CHUNKS_DIR = PROJECT_ROOT / "data" / "wiki_processed" / "chunks"
+from src.core.wiki_compiler import WikiCompiler
 
 
 @dataclass
@@ -27,7 +25,8 @@ class Atomizer:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.logger = get_file_logger("sync", "sync.log")
-        CHUNKS_DIR.mkdir(parents=True, exist_ok=True)
+        self.chunks_dir = config.wiki_strategy.processed_path / "chunks"
+        self.chunks_dir.mkdir(parents=True, exist_ok=True)
         init_db()
 
     def sync(self) -> dict[str, int]:
@@ -42,8 +41,18 @@ class Atomizer:
             processed_files += 1
             total_chunks += len(chunks)
 
+        compiled = {"pages": 0, "files": 0, "tags": 0}
+        if self.config.wiki_strategy.wiki_compile_on_sync:
+            compiled = WikiCompiler(self.config).compile()
+            self.logger.info(
+                "wiki_compile_done pages=%s files=%s tags=%s",
+                compiled["pages"],
+                compiled["files"],
+                compiled["tags"],
+            )
+
         self.logger.info("sync_done files=%s chunks=%s", processed_files, total_chunks)
-        return {"files": processed_files, "chunks": total_chunks}
+        return {"files": processed_files, "chunks": total_chunks, "wiki_pages": compiled["pages"]}
 
     def _process_file(self, md_file: Path) -> list[Chunk]:
         text = md_file.read_text(encoding="utf-8", errors="ignore")
@@ -53,16 +62,21 @@ class Atomizer:
 
         chunks = self._split_by_heading(text, rel_raw, level=self.config.wiki_strategy.heading_level)
         for c in chunks:
-            out_path = CHUNKS_DIR / f"{c.chunk_id}.md"
+            out_path = self.chunks_dir / f"{c.chunk_id}.md"
             out_path.write_text(c.content, encoding="utf-8")
             tags = self._extract_tags(c.title, c.content)
+            try:
+                content_path = str(out_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
+            except ValueError:
+                # when vault is outside project root, persist absolute path
+                content_path = str(out_path.resolve())
             upsert_chunk(
                 chunk_id=c.chunk_id,
                 title=c.title,
                 parent_file=c.parent_file,
                 raw_file_path=c.raw_file_path,
                 tags=tags,
-                content_path=str(out_path.relative_to(PROJECT_ROOT)).replace("\\", "/"),
+                content_path=content_path,
                 content_text=c.content,
                 last_modified=datetime.utcnow().isoformat(timespec="seconds") + "Z",
             )
@@ -109,26 +123,78 @@ class Atomizer:
 
     @staticmethod
     def _extract_tags(title: str, content: str) -> str:
-        text = f"{title}\n{content}".lower()
-        words = re.findall(r"[a-z0-9_]{3,}", text)
-        cn = re.findall(r"[\u4e00-\u9fff]{2,}", text)
+        stopwords = {
+            "相关",
+            "以及",
+            "如何",
+            "进行",
+            "根据",
+            "要求",
+            "规则",
+            "规范",
+            "管理",
+            "流程",
+            "标准",
+            "说明",
+            "内容",
+            "附件",
+            "其中",
+            "包括",
+            "使用",
+            "需要",
+            "可以",
+            "本次",
+            "本条",
+            "该项",
+            "如下",
+            "and",
+            "the",
+            "for",
+            "with",
+            "from",
+            "that",
+            "this",
+        }
 
-        tokens: list[str] = []
-        tokens.extend(words)
-        for seq in cn:
-            tokens.append(seq)
-            for n in (4, 3, 2):
-                if len(seq) >= n:
-                    tokens.append(seq[:n])
+        source = f"{title}\n{content[:1200]}"
+        parts = re.split(r"[，。；：、\s\-_/()（）\[\]【】<>《》\"'“”]+", source)
+
+        candidates: list[str] = []
+        for p in parts:
+            t = p.strip()
+            if not t:
+                continue
+
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,24}", t):
+                candidates.append(t.lower())
+                continue
+
+            if re.fullmatch(r"[\u4e00-\u9fff]{2,12}", t):
+                if t not in stopwords and not t.endswith(("的", "了")):
+                    candidates.append(t)
+
+        strong_terms = re.findall(
+            r"[\u4e00-\u9fff]{2,14}(?:管理|流程|规范|制度|标准|策略|机制|规则|办法|要求|定义|术语|系统|平台|终端|设备|申请|审批|回收|处置)",
+            source,
+        )
+
+        for term in strong_terms:
+            if term not in stopwords and len(term) <= 20:
+                candidates.append(term)
+
+        title_terms = [t for t in candidates if t in title]
+        others = [t for t in candidates if t not in title_terms]
 
         seen: set[str] = set()
         out: list[str] = []
-        for t in tokens:
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-            if len(out) >= 12:
+        for t in title_terms + others:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+            if len(out) >= 8:
                 break
+
         return ",".join(out)
 
     @staticmethod
