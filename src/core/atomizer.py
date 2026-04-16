@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+from src.core.wiki_compiler import WikiCompiler
 from src.utils.config import AppConfig, PROJECT_ROOT
 from src.utils.db_manager import delete_chunks_by_parent, init_db, upsert_chunk
 from src.utils.logger import get_file_logger
-from src.core.wiki_compiler import WikiCompiler
 
 
 @dataclass
@@ -25,7 +27,9 @@ class Atomizer:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.logger = get_file_logger("sync", "sync.log")
-        self.chunks_dir = config.wiki_strategy.processed_path / "chunks"
+        self.processed_root = config.wiki_strategy.processed_path
+        self.chunks_dir = self.processed_root / "chunks"
+        self.state_path = self.processed_root / "sync_state.json"
         self.chunks_dir.mkdir(parents=True, exist_ok=True)
         init_db()
 
@@ -33,13 +37,50 @@ class Atomizer:
         raw_root = self.config.wiki_strategy.raw_path
         md_files = sorted(raw_root.rglob("*.md")) if raw_root.exists() else []
 
+        prev_state = self._load_state()
+        prev_files: dict[str, dict[str, Any]] = prev_state.get("files", {})
+
         processed_files = 0
+        skipped_files = 0
+        deleted_files = 0
         total_chunks = 0
 
+        new_files_state: dict[str, dict[str, Any]] = {}
+        current_rel_paths: set[str] = set()
+
         for md_file in md_files:
-            chunks = self._process_file(md_file)
+            rel_raw = str(md_file.relative_to(raw_root)).replace("\\", "/")
+            current_rel_paths.add(rel_raw)
+            text = md_file.read_text(encoding="utf-8", errors="ignore")
+            file_hash = hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
+
+            prev_meta = prev_files.get(rel_raw, {})
+            if str(prev_meta.get("hash", "")) == file_hash:
+                skipped_files += 1
+                new_files_state[rel_raw] = prev_meta
+                continue
+
+            old_chunk_ids = [str(x) for x in (prev_meta.get("chunk_ids") or [])]
+            self._remove_chunk_files(old_chunk_ids)
+
+            chunks = self._process_file(md_file, text=text)
             processed_files += 1
             total_chunks += len(chunks)
+            new_files_state[rel_raw] = {
+                "hash": file_hash,
+                "chunk_ids": [c.chunk_id for c in chunks],
+                "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            }
+
+        removed = set(prev_files.keys()) - current_rel_paths
+        for rel_raw in sorted(removed):
+            prev_meta = prev_files.get(rel_raw, {})
+            self._remove_chunk_files([str(x) for x in (prev_meta.get("chunk_ids") or [])])
+            delete_chunks_by_parent(rel_raw)
+            deleted_files += 1
+            self.logger.info("sync_delete file=%s", rel_raw)
+
+        self._save_state({"version": 1, "files": new_files_state})
 
         compiled = {"pages": 0, "files": 0, "tags": 0}
         if self.config.wiki_strategy.wiki_compile_on_sync:
@@ -51,11 +92,24 @@ class Atomizer:
                 compiled["tags"],
             )
 
-        self.logger.info("sync_done files=%s chunks=%s", processed_files, total_chunks)
-        return {"files": processed_files, "chunks": total_chunks, "wiki_pages": compiled["pages"]}
+        self.logger.info(
+            "sync_done changed=%s skipped=%s deleted=%s chunks=%s",
+            processed_files,
+            skipped_files,
+            deleted_files,
+            total_chunks,
+        )
+        return {
+            "files": processed_files,
+            "skipped": skipped_files,
+            "deleted": deleted_files,
+            "chunks": total_chunks,
+            "wiki_pages": compiled["pages"],
+        }
 
-    def _process_file(self, md_file: Path) -> list[Chunk]:
-        text = md_file.read_text(encoding="utf-8", errors="ignore")
+    def _process_file(self, md_file: Path, *, text: str | None = None) -> list[Chunk]:
+        if text is None:
+            text = md_file.read_text(encoding="utf-8", errors="ignore")
         rel_raw = str(md_file.relative_to(self.config.wiki_strategy.raw_path)).replace("\\", "/")
 
         delete_chunks_by_parent(rel_raw)
@@ -68,7 +122,6 @@ class Atomizer:
             try:
                 content_path = str(out_path.relative_to(PROJECT_ROOT)).replace("\\", "/")
             except ValueError:
-                # when vault is outside project root, persist absolute path
                 content_path = str(out_path.resolve())
             upsert_chunk(
                 chunk_id=c.chunk_id,
@@ -83,6 +136,33 @@ class Atomizer:
 
         self.logger.info("sync_file file=%s chunks=%s", rel_raw, len(chunks))
         return chunks
+
+    def _load_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {"version": 1, "files": {}}
+        try:
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"version": 1, "files": {}}
+            files = data.get("files")
+            if not isinstance(files, dict):
+                data["files"] = {}
+            return data
+        except Exception:
+            return {"version": 1, "files": {}}
+
+    def _save_state(self, data: dict[str, Any]) -> None:
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _remove_chunk_files(self, chunk_ids: list[str]) -> None:
+        for cid in chunk_ids:
+            p = self.chunks_dir / f"{cid}.md"
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
 
     @staticmethod
     def _split_by_heading(text: str, rel_raw_path: str, level: int = 2) -> list[Chunk]:
@@ -124,40 +204,26 @@ class Atomizer:
     @staticmethod
     def _extract_tags(title: str, content: str) -> str:
         stopwords = {
-            "相关",
-            "以及",
-            "如何",
-            "进行",
-            "根据",
-            "要求",
-            "规则",
-            "规范",
-            "管理",
-            "流程",
-            "标准",
-            "说明",
-            "内容",
-            "附件",
-            "其中",
-            "包括",
-            "使用",
-            "需要",
-            "可以",
-            "本次",
-            "本条",
-            "该项",
-            "如下",
-            "and",
-            "the",
-            "for",
+            "related",
+            "about",
             "with",
             "from",
             "that",
             "this",
+            "and",
+            "the",
+            "for",
+            "requirement",
+            "rule",
+            "rules",
+            "policy",
+            "process",
+            "standard",
+            "management",
         }
 
         source = f"{title}\n{content[:1200]}"
-        parts = re.split(r"[，。；：、\s\-_/()（）\[\]【】<>《》\"'“”]+", source)
+        parts = re.split(r"[\s,.;:!?()\[\]{}<>\"'`/_\\\-]+", source)
 
         candidates: list[str] = []
         for p in parts:
@@ -166,21 +232,14 @@ class Atomizer:
                 continue
 
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,24}", t):
-                candidates.append(t.lower())
+                tl = t.lower()
+                if tl not in stopwords:
+                    candidates.append(tl)
                 continue
 
             if re.fullmatch(r"[\u4e00-\u9fff]{2,12}", t):
-                if t not in stopwords and not t.endswith(("的", "了")):
+                if not t.endswith(("的", "了")):
                     candidates.append(t)
-
-        strong_terms = re.findall(
-            r"[\u4e00-\u9fff]{2,14}(?:管理|流程|规范|制度|标准|策略|机制|规则|办法|要求|定义|术语|系统|平台|终端|设备|申请|审批|回收|处置)",
-            source,
-        )
-
-        for term in strong_terms:
-            if term not in stopwords and len(term) <= 20:
-                candidates.append(term)
 
         title_terms = [t for t in candidates if t in title]
         others = [t for t in candidates if t not in title_terms]

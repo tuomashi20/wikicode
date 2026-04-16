@@ -19,6 +19,13 @@ from rich.markdown import Markdown
 from src.core.agent import WikiFirstAgent
 from src.core.atomizer import Atomizer
 from src.core.llm_client import LLMClient
+from src.core.retrieval_eval import (
+    compare_eval_reports,
+    evaluate_retrieval,
+    load_eval_cases,
+    load_eval_report,
+    save_eval_report,
+)
 from src.skills.code_tools import (
     apply_unified_diff,
     apply_unified_diff_multi,
@@ -40,27 +47,31 @@ console = Console()
 class SlashCommandCompleter(Completer):
     def __init__(self) -> None:
         self.commands = [
-            ("/help", "查看命令帮助"),
-            ("/sync", "同步知识库（RAW -> WIKI）"),
-            ("/kbclear yes", "一键清空索引（需 yes 确认）"),
-            ("/kbclear all yes", "Clear index + wiki pages (keep raw)"),
-            ("/vaultpath ", "设置统一知识库根目录：/vaultpath <目录>"),
-            ("/ask ", "强制走 Wiki 检索提问"),
-            ("/review ", "审阅文件：/review <文件> :: <问题>"),
-            ("/patch ", "生成单文件补丁：/patch <文件> :: <需求>"),
-            ("/patchm ", "生成多文件补丁：/patchm <文件1,文件2> :: <需求>"),
-            ("/preview", "预览最近补丁影响（hunk/+/-）"),
-            ("/apply yes", "确认并应用最近补丁"),
-            ("/backups", "查看补丁应用前备份列表"),
-            ("/undo ", "按备份ID回滚：/undo <backup_id>"),
-            ("/structure", "查看知识库索引结构"),
-            ("/trace on", "开启工具调用轨迹显示"),
-            ("/trace off", "关闭工具调用轨迹显示"),
-            ("/stream on", "开启流式输出"),
-            ("/stream off", "关闭流式输出"),
+            ("/help", "??????"),
+            ("/sync", "??????RAW -> WIKI?"),
+            ("/kbclear yes", "?????? yes ???"),
+            ("/kbclear all yes", "???? + wiki ????? raw?"),
+            ("/vaultpath ", "?????????/vaultpath <??>"),
+            ("/ask ", "?? Wiki ????"),
+            ("/review ", "?????/review <??> :: <??>"),
+            ("/patch ", "?????/patch <??> :: <??>"),
+            ("/patchm ", "??????/patchm <f1,f2> :: <??>"),
+            ("/preview", "??????"),
+            ("/apply yes", "??????"),
+            ("/backups", "????"),
+            ("/undo ", "??? ID ??"),
+            ("/eval ", "?????/eval <cases.jsonl> [topk] [out.json]"),
+            ("/regress ", "??????????"),
+            ("/compare ", "?????/compare <baseline.json> <latest.json>"),
+            ("/baseline ", "???????/baseline <report.json>"),
+            ("/structure", "??????"),
+            ("/trace on", "?? trace"),
+            ("/trace off", "?? trace"),
+            ("/stream on", "??????"),
+            ("/stream off", "??????"),
             ("/mode ", "?????/mode auto|wiki_only|general_only"),
-            ("/reset", "清空会话上下文记忆"),
-            ("/exit", "退出 CLI"),
+            ("/reset", "??????"),
+            ("/exit", "?? CLI"),
         ]
 
     def get_completions(self, document: Document, complete_event):
@@ -319,7 +330,12 @@ def sync() -> None:
     ensure_workspace()
     result = run_sync()
     wp = result.get("wiki_pages", 0)
-    console.print(f"[green]Sync completed[/green]: files={result['files']} chunks={result['chunks']} wiki_pages={wp}")
+    sk = result.get("skipped", 0)
+    dl = result.get("deleted", 0)
+    console.print(
+        f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
+        f"chunks={result['chunks']} wiki_pages={wp}"
+    )
 
 
 @app.command()
@@ -339,6 +355,145 @@ def structure() -> None:
         return
     for item in items:
         console.print(f"- {item['parent_file']} ({item['chunk_count']} chunks)")
+
+
+@app.command(name="eval-retrieval")
+def eval_retrieval(
+    cases: str = typer.Option("data/eval/retrieval_cases.jsonl", help="Path to JSONL eval cases"),
+    topk: int = typer.Option(8, help="Top-k retrieval depth"),
+    out: str = typer.Option("", help="Optional output report path (.json)"),
+) -> None:
+    """Run retrieval baseline evaluation against local wiki index."""
+    ensure_workspace()
+    cfg = load_config()
+    path = Path(cases)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    try:
+        eval_cases = load_eval_cases(path)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Failed loading cases:[/red] {e}")
+        return
+
+    summary, details = evaluate_retrieval(
+        cases=eval_cases,
+        topk=topk,
+        synonyms_path=cfg.wiki_strategy.synonyms_path,
+    )
+    console.print(
+        f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
+        f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
+        f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
+    )
+    for d in details:
+        status = "[green]HIT[/green]" if d.hit else "[red]MISS[/red]"
+        extra = f" field={d.matched_field}" if d.matched_field else ""
+        top = f" top='{d.top_hit}'" if d.top_hit else ""
+        rk = f" rank={d.rank}" if d.rank else ""
+        console.print(f"- {status} query={d.query!r}{extra}{rk}{top}")
+    if out.strip():
+        out_path = Path(out)
+        if not out_path.is_absolute():
+            out_path = (Path.cwd() / out_path).resolve()
+        written = save_eval_report(summary, details, out_path)
+        console.print(f"[cyan]Report saved:[/cyan] {written}")
+
+
+@app.command()
+def regress(
+    cases: str = typer.Option("data/eval/retrieval_cases.jsonl", help="Path to JSONL eval cases"),
+    topk: int = typer.Option(8, help="Top-k retrieval depth"),
+    out: str = typer.Option("data/eval/reports/latest.json", help="Output report path"),
+) -> None:
+    """One-click regression: sync then run retrieval eval."""
+    ensure_workspace()
+    sync_result = run_sync()
+    wp = sync_result.get("wiki_pages", 0)
+    sk = sync_result.get("skipped", 0)
+    dl = sync_result.get("deleted", 0)
+    console.print(
+        f"[green]Sync completed[/green]: changed={sync_result['files']} skipped={sk} deleted={dl} "
+        f"chunks={sync_result['chunks']} wiki_pages={wp}"
+    )
+
+    cfg = load_config()
+    cases_path = Path(cases)
+    if not cases_path.is_absolute():
+        cases_path = (Path.cwd() / cases_path).resolve()
+    eval_cases = load_eval_cases(cases_path)
+    summary, details = evaluate_retrieval(
+        cases=eval_cases,
+        topk=topk,
+        synonyms_path=cfg.wiki_strategy.synonyms_path,
+    )
+    console.print(
+        f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
+        f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
+        f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
+    )
+    out_path = Path(out)
+    if not out_path.is_absolute():
+        out_path = (Path.cwd() / out_path).resolve()
+    written = save_eval_report(summary, details, out_path)
+    console.print(f"[cyan]Regression report:[/cyan] {written}")
+
+
+@app.command(name="compare-eval")
+def compare_eval(
+    base: str = typer.Option("data/eval/reports/baseline.json", help="Baseline report path"),
+    current: str = typer.Option("data/eval/reports/latest.json", help="Current report path"),
+) -> None:
+    """Compare two retrieval eval reports and show metric deltas and query-level changes."""
+    ensure_workspace()
+    bp = Path(base)
+    cp = Path(current)
+    if not bp.is_absolute():
+        bp = (Path.cwd() / bp).resolve()
+    if not cp.is_absolute():
+        cp = (Path.cwd() / cp).resolve()
+
+    try:
+        b = load_eval_report(bp)
+        c = load_eval_report(cp)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Failed loading reports:[/red] {e}")
+        return
+
+    comp = compare_eval_reports(b, c)
+    d = comp["delta"]
+    console.print(
+        f"[green]Eval compare[/green]: "
+        f"Δrecall={d.get('recall_at_k')} Δtop1={d.get('top1_accuracy')} Δmrr={d.get('mrr')} "
+        f"Δhit={d.get('hit')} Δmiss={d.get('miss')}"
+    )
+    console.print(f"- fixed: {len(comp['fixed_queries'])}")
+    for q in comp["fixed_queries"][:20]:
+        console.print(f"  [green]+[/green] {q}")
+    console.print(f"- regressed: {len(comp['regressed_queries'])}")
+    for q in comp["regressed_queries"][:20]:
+        console.print(f"  [red]-[/red] {q}")
+    console.print(f"- still miss: {len(comp['still_miss_queries'])}")
+
+
+@app.command(name="set-baseline")
+def set_baseline(
+    source: str = typer.Option("data/eval/reports/latest.json", help="Source report path"),
+    target: str = typer.Option("data/eval/reports/baseline.json", help="Baseline report path"),
+) -> None:
+    """Copy a report to baseline."""
+    ensure_workspace()
+    sp = Path(source)
+    tp = Path(target)
+    if not sp.is_absolute():
+        sp = (Path.cwd() / sp).resolve()
+    if not tp.is_absolute():
+        tp = (Path.cwd() / tp).resolve()
+    if not sp.exists():
+        console.print(f"[red]Source report not found:[/red] {sp}")
+        return
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text(sp.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    console.print(f"[green]Baseline updated[/green]: {tp}")
 
 
 
@@ -594,7 +749,12 @@ def chat(
     if config.sync.auto_on_startup:
         result = run_sync()
         wp = result.get("wiki_pages", 0)
-        console.print(f"[cyan]Auto sync[/cyan]: files={result['files']} chunks={result['chunks']} wiki_pages={wp}")
+        sk = result.get("skipped", 0)
+        dl = result.get("deleted", 0)
+        console.print(
+            f"[cyan]Auto sync[/cyan]: changed={result['files']} skipped={sk} deleted={dl} "
+            f"chunks={result['chunks']} wiki_pages={wp}"
+        )
 
     agent = build_agent(config)
     session = PromptSession(
@@ -631,32 +791,41 @@ def chat(
 
         if cmd == "/help":
             console.print(
-                "命令列表：\n"
-                "/sync 同步知识库\n"
-                "/kbclear yes 清空索引（chunks+sqlite）\n"
-                "/kbclear all yes 清空索引+wiki页面（保留raw）\n"
-                "/vaultpath <目录> 设置统一知识库根目录（自动创建 raw/wiki/wiki_processed）\n"
-                "/ask <问题> 强制Wiki问答\n"
-                "/review <文件> :: <问题> 文件审阅\n"
-                "/patch <文件> :: <需求> 生成单文件补丁\n"
-                "/patchm <文件1,文件2> :: <需求> 生成多文件补丁\n"
-                "/preview 预览最近补丁\n"
-                "/apply yes 确认应用最近补丁\n"
-                "/backups 查看备份\n"
-                "/undo [backup_id] 回滚备份（不传则用最近一次）\n"
-                "/structure 查看知识库结构\n"
-                "/trace on|off 轨迹开关\n"
-                "/stream on|off 流式输出开关\n"
-                "/mode auto|wiki_only|general_only ??????\n"
-                "/reset 清空会话上下文记忆\n"
-                "/exit 退出"
+                "Commands:\n"
+                "/sync\n"
+                "/vaultpath <dir>\n"
+                "/kbclear yes\n"
+                "/kbclear all yes\n"
+                "/mode auto|wiki_only|general_only\n"
+                "/eval <cases.jsonl> [topk] [out.json]\n"
+                "/regress <cases.jsonl> [topk] [out.json]\n"
+                "/compare <baseline.json> <latest.json>\n"
+                "/baseline <report.json> [baseline.json]\n"
+                "/ask <query>\n"
+                "/review <file> :: <query>\n"
+                "/patch <file> :: <query>\n"
+                "/patchm <file1,file2> :: <query>\n"
+                "/preview\n"
+                "/apply yes\n"
+                "/backups\n"
+                "/undo [backup_id]\n"
+                "/structure\n"
+                "/trace on|off\n"
+                "/stream on|off\n"
+                "/reset\n"
+                "/exit"
             )
             continue
 
         if cmd == "/sync":
             result = run_sync()
             wp = result.get("wiki_pages", 0)
-            console.print(f"[green]Sync completed[/green]: files={result['files']} chunks={result['chunks']} wiki_pages={wp}")
+            sk = result.get("skipped", 0)
+            dl = result.get("deleted", 0)
+            console.print(
+                f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
+                f"chunks={result['chunks']} wiki_pages={wp}"
+            )
             continue
 
         if cmd in {"/kbclear", "/kbclear yes", "/kbclear all yes"}:
@@ -688,6 +857,158 @@ def chat(
             else:
                 for item in items:
                     console.print(f"- {item['parent_file']} ({item['chunk_count']} chunks)")
+            continue
+
+        if cmd == "/eval" or cmd.startswith("/eval "):
+            parts = cmd.split()
+            cases_path = "data/eval/retrieval_cases.jsonl"
+            topk_n = 8
+            out_path = ""
+            if len(parts) >= 2:
+                cases_path = parts[1]
+            if len(parts) >= 3:
+                try:
+                    topk_n = max(1, int(parts[2]))
+                except Exception:
+                    console.print("[yellow]Usage: /eval <cases.jsonl> [topk] [out.json][/yellow]")
+                    continue
+            if len(parts) >= 4:
+                out_path = parts[3]
+            pth = Path(cases_path)
+            if not pth.is_absolute():
+                pth = (Path.cwd() / pth).resolve()
+            try:
+                eval_cases = load_eval_cases(pth)
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]Failed loading cases:[/red] {e}")
+                continue
+            summary, details = evaluate_retrieval(
+                cases=eval_cases,
+                topk=topk_n,
+                synonyms_path=config.wiki_strategy.synonyms_path,
+            )
+            console.print(
+                f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
+                f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
+                f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
+            )
+            for d in details:
+                status = "[green]HIT[/green]" if d.hit else "[red]MISS[/red]"
+                extra = f" field={d.matched_field}" if d.matched_field else ""
+                rk = f" rank={d.rank}" if d.rank else ""
+                top = f" top='{d.top_hit}'" if d.top_hit else ""
+                console.print(f"- {status} query={d.query!r}{extra}{rk}{top}")
+            if out_path.strip():
+                op = Path(out_path)
+                if not op.is_absolute():
+                    op = (Path.cwd() / op).resolve()
+                written = save_eval_report(summary, details, op)
+                console.print(f"[cyan]Report saved:[/cyan] {written}")
+            continue
+
+        if cmd == "/regress" or cmd.startswith("/regress "):
+            parts = cmd.split()
+            cases_path = "data/eval/retrieval_cases.jsonl"
+            topk_n = 8
+            out_path = "data/eval/reports/latest.json"
+            if len(parts) >= 2:
+                cases_path = parts[1]
+            if len(parts) >= 3:
+                try:
+                    topk_n = max(1, int(parts[2]))
+                except Exception:
+                    console.print("[yellow]Usage: /regress <cases.jsonl> [topk] [out.json][/yellow]")
+                    continue
+            if len(parts) >= 4:
+                out_path = parts[3]
+
+            result = run_sync()
+            wp = result.get("wiki_pages", 0)
+            sk = result.get("skipped", 0)
+            dl = result.get("deleted", 0)
+            console.print(
+                f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
+                f"chunks={result['chunks']} wiki_pages={wp}"
+            )
+
+            pth = Path(cases_path)
+            if not pth.is_absolute():
+                pth = (Path.cwd() / pth).resolve()
+            try:
+                eval_cases = load_eval_cases(pth)
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]Failed loading cases:[/red] {e}")
+                continue
+
+            summary, details = evaluate_retrieval(
+                cases=eval_cases,
+                topk=topk_n,
+                synonyms_path=config.wiki_strategy.synonyms_path,
+            )
+            console.print(
+                f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
+                f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
+                f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
+            )
+            op = Path(out_path)
+            if not op.is_absolute():
+                op = (Path.cwd() / op).resolve()
+            written = save_eval_report(summary, details, op)
+            console.print(f"[cyan]Regression report:[/cyan] {written}")
+            continue
+
+        if cmd == "/compare" or cmd.startswith("/compare "):
+            parts = cmd.split()
+            base_path = "data/eval/reports/baseline.json"
+            current_path = "data/eval/reports/latest.json"
+            if len(parts) >= 2:
+                base_path = parts[1]
+            if len(parts) >= 3:
+                current_path = parts[2]
+            bp = Path(base_path)
+            cp = Path(current_path)
+            if not bp.is_absolute():
+                bp = (Path.cwd() / bp).resolve()
+            if not cp.is_absolute():
+                cp = (Path.cwd() / cp).resolve()
+            try:
+                b = load_eval_report(bp)
+                c = load_eval_report(cp)
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]Failed loading reports:[/red] {e}")
+                continue
+
+            comp = compare_eval_reports(b, c)
+            d = comp["delta"]
+            console.print(
+                f"[green]Eval compare[/green]: "
+                f"Δrecall={d.get('recall_at_k')} Δtop1={d.get('top1_accuracy')} Δmrr={d.get('mrr')} "
+                f"Δhit={d.get('hit')} Δmiss={d.get('miss')}"
+            )
+            console.print(f"- fixed={len(comp['fixed_queries'])} regressed={len(comp['regressed_queries'])} "
+                          f"still_miss={len(comp['still_miss_queries'])}")
+            continue
+
+        if cmd == "/baseline" or cmd.startswith("/baseline "):
+            parts = cmd.split()
+            src = "data/eval/reports/latest.json"
+            dst = "data/eval/reports/baseline.json"
+            if len(parts) >= 2:
+                src = parts[1]
+            if len(parts) >= 3:
+                dst = parts[2]
+            sp = Path(src)
+            tp = Path(dst)
+            if not sp.is_absolute():
+                sp = (Path.cwd() / sp).resolve()
+            if not tp.is_absolute():
+                tp = (Path.cwd() / tp).resolve()
+            if not sp.exists():
+                console.print(f"[red]Source report not found:[/red] {sp}")
+                continue
+            tp.parent.mkdir(parents=True, exist_ok=True)
+            tp.write_text(sp.read_text(encoding="utf-8-sig"), encoding="utf-8")
+            console.print(f"[green]Baseline updated[/green]: {tp}")
             continue
 
 

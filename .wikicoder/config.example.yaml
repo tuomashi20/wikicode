@@ -1,4 +1,4 @@
-llm:
+﻿llm:
   provider: "jiutian"
   model: "jiutian-think-v3"
   api_key: "YOUR_JIUTIAN_API_KEY"
@@ -17,7 +17,7 @@ wiki_strategy:
   wiki_dir: "wiki"
   processed_dir: "wiki_processed"
 
-  # raw 下自动创建的子目录（可按团队业务修改）
+  # raw 下自动创建的子目录（可按团队业务调整）
   raw_subdirs: ["终端", "运维", "随笔", "邮件", "技术", "生活", "项目", "学习", "笔记"]
 
   # wiki 下自动创建的知识维度目录

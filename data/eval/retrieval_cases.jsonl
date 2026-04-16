@@ -1,0 +1,3 @@
+﻿{"query":"old terminal definition","expect_any":["terminal","definition"],"expect_in":"any"}
+{"query":"refurbish value criteria","expect_any":["criteria","repair","value"],"expect_in":"any"}
+{"query":"compare A and B","expect_any":["compare","difference"],"expect_in":"any"}

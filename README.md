@@ -1,6 +1,6 @@
-# WikiCoder
+﻿# WikiCoder
 
-支持：Wiki 优先检索、九天模型接入、CLI 交互、补丁建议/应用/回滚。
+Wiki-first 知识问答/代码助手：先检索本地 Wiki，未命中再回退通用大模型。
 
 ## 安装
 
@@ -24,7 +24,6 @@ llm:
   provider: "jiutian"
   model: "jiutian-think-v3"
   api_key: "YOUR_JIUTIAN_API_KEY"
-  base_url: null
 
 wiki_strategy:
   vault_path: "D:/my-vault"
@@ -32,45 +31,55 @@ wiki_strategy:
   wiki_dir: "wiki"
   processed_dir: "wiki_processed"
 
-  # 自动创建细分子目录（存在则跳过）
-  raw_subdirs: ["inbox", "drafts", "archive"]
+  raw_subdirs: ["终端", "技术", "项目", "学习"]
   wiki_subdirs: ["entities", "concepts", "comparisons", "queries"]
   raw_to_wiki_map:
     "终端": "entities"
     "技术": "concepts"
     "项目": "comparisons"
     "学习": "queries"
-  wiki_compile_on_sync: true
 
+  wiki_compile_on_sync: true
   synonyms_path: "./data/dictionaries/synonyms_zh.yaml"
   split_mode: "heading"
   heading_level: 2
 ```
 
-> 设置 `vault_path` 后，程序会自动派生并创建：
-> - `<vault>/raw`
-> - `<vault>/wiki`
-> - `<vault>/wiki_processed`
-> 以及你配置的 `raw_subdirs/wiki_subdirs`。
-> 同步时会自动在 `wiki/` 下生成可读页面、文件索引页、标签页与 `index.md`，便于 Obsidian 图谱查看。
-> 若配置了 `raw_to_wiki_map`，会按 RAW 子目录自动映射到 wiki 分类目录。
+设置 `vault_path` 后，程序会自动创建：
 
-## 常用命令
+- `<vault>/raw`
+- `<vault>/wiki`
+- `<vault>/wiki_processed`
+
+并按配置创建子目录。
+
+## 常用命令（CLI）
 
 ```bash
 wikicoderctl vaultpath "D:/my-vault"
 wikicoderctl sync
 wikicoderctl chat --trace --stream
-wikicoderctl ask "废旧终端如何定义？" --trace
+wikicoderctl ask "废旧终端如何定义" --trace
 wikicoderctl kbclear --yes
+wikicoderctl kbclear --all --yes
+wikicoderctl eval-retrieval --cases data/eval/retrieval_cases_zh.jsonl --topk 8 --out data/eval/reports/latest.json
+wikicoderctl regress --cases data/eval/retrieval_cases_zh.jsonl --topk 8 --out data/eval/reports/latest.json
+wikicoderctl compare-eval --base data/eval/reports/baseline.json --current data/eval/reports/latest.json
+wikicoderctl set-baseline --source data/eval/reports/latest.json --target data/eval/reports/baseline.json
 ```
 
 ## REPL 命令
 
 - `/help`
 - `/sync`
-- `/vaultpath <目录>`（统一设置知识库根目录）
-- `/kbclear yes`（清空索引）
+- `/vaultpath <目录>`
+- `/kbclear yes`
+- `/kbclear all yes`
+- `/mode auto|wiki_only|general_only`
+- `/eval <cases.jsonl> [topk] [out.json]`
+- `/regress <cases.jsonl> [topk] [out.json]`
+- `/compare <baseline.json> <latest.json>`
+- `/baseline <report.json> [baseline.json]`
 - `/ask <query>`
 - `/review <file> :: <query>`
 - `/patch <file> :: <query>`
@@ -82,4 +91,11 @@ wikicoderctl kbclear --yes
 - `/structure`
 - `/trace on|off`
 - `/stream on|off`
+- `/reset`
 - `/exit`
+
+## 评测说明
+
+- 评测样例：`data/eval/retrieval_cases.jsonl`、`data/eval/retrieval_cases_zh.jsonl`
+- 指标：`recall@k`、`top1_accuracy`、`mrr`
+- 报告包含 miss 查询与明细 rank，便于回归对比。

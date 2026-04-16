@@ -22,7 +22,7 @@ class AgentResponse:
 
 
 class WikiFirstAgent:
-    """Wiki-first ReAct: try Wiki grounding first, fallback to general LLM when no reliable Wiki hit."""
+    """Wiki-first ReAct: search wiki first, fallback to general model when no reliable hit."""
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -43,7 +43,7 @@ class WikiFirstAgent:
         query = user_input.strip()
 
         if not query and not force_wiki:
-            return AgentResponse(thought="empty-input", actions=actions, output="请输入问题。")
+            return AgentResponse(thought="empty-input", actions=actions, output="Please enter a question.")
 
         if mode == "general_only":
             thought = "General-only: skip wiki and answer directly."
@@ -92,7 +92,7 @@ class WikiFirstAgent:
             )
 
         if not chunks and mode == "wiki_only":
-            output = "未命中 Wiki 内容（wiki_only 模式不启用通用大模型回退）。可切换 /mode auto 后重试。"
+            output = "No wiki content matched (wiki_only mode does not fallback to general LLM)."
             self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
             return AgentResponse(thought=thought + " (wiki-only-nohit)", actions=actions, output=output)
 
@@ -106,7 +106,7 @@ class WikiFirstAgent:
                 history=history,
             )
             if rw is not None and rw.suggest_terms:
-                output += "\n\n建议关键词：" + "、".join(rw.suggest_terms[:6])
+                output += "\n\nSuggested keywords: " + ", ".join(rw.suggest_terms[:6])
             self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
             return AgentResponse(thought=thought + " (fallback-general)", actions=actions, output=output)
 
@@ -133,10 +133,9 @@ class WikiFirstAgent:
         out: list[str] = []
         seen: set[str] = set()
         for t in raw_terms:
-            for part in re.split(r"[\s,，。；;:：、!?？()（）\[\]{}]+", t.strip().lower()):
-                if not part:
-                    continue
-                if len(part) < 2:
+            parts = re.split(r"[\s,.;:!?()\[\]{}<>\"'`]+", t.strip().lower())
+            for part in parts:
+                if not part or len(part) < 2:
                     continue
                 if part in seen:
                     continue
@@ -146,9 +145,7 @@ class WikiFirstAgent:
 
     @staticmethod
     def _filter_reliable_results(results: list[dict], terms: list[str]) -> list[dict]:
-        if not results:
-            return []
-        if not terms:
+        if not results or not terms:
             return []
 
         reliable: list[dict] = []
@@ -162,7 +159,6 @@ class WikiFirstAgent:
                 ]
             ).lower()
             hit = sum(1 for t in terms if t and t in text)
-            # keep if at least 1 clear term hit; 2+ for very short terms
             if hit >= 2:
                 reliable.append(r)
                 continue
@@ -198,34 +194,33 @@ class WikiFirstAgent:
 
         if response_mode == "patch":
             system_prompt = (
-                "你是资深代码审阅助手。优先遵循提供的 Wiki 规范。"
-                "输出必须是 unified diff（git diff 风格），必须包含 "
-                "'--- a/<file>' 和 '+++ b/<file>' 以及 '@@' hunk。不要输出解释。"
-                "如果不需要改动，输出 NO_CHANGES。"
+                "You are a senior code review assistant. Prioritize provided wiki policy. "
+                "Output MUST be unified diff (git diff style) with '--- a/<file>', '+++ b/<file>', and '@@' hunks. "
+                "Do not explain. If no change is needed, output NO_CHANGES."
             )
-            code_part = f"\n\n目标文件: {target_file}\n代码:\n{code_context[:9000]}" if code_context else ""
+            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:9000]}" if code_context else ""
             user_prompt = (
-                f"需求: {query}\n\n"
-                "Wiki 规范:\n"
+                f"Requirement: {query}\n\n"
+                "Wiki policy:\n"
                 + "\n\n".join(context_blocks)
                 + history_block
                 + code_part
-                + "\n\n仅返回 unified diff。"
+                + "\n\nReturn unified diff only."
             )
         else:
             system_prompt = (
-                "你是 WikiCoder 助手。必须优先遵循提供的 Wiki 规范。"
-                "若规范与常识冲突，以规范为准；若规范不足，请明确假设。"
-                f"风格约束: {style_text}。"
+                "You are WikiCoder assistant. Follow provided wiki policy first. "
+                "If policy conflicts with common practice, policy wins; if policy is insufficient, state assumptions. "
+                f"Style constraints: {style_text}."
             )
-            code_part = f"\n\n当前代码上下文:\n{code_context[:6000]}" if code_context else ""
+            code_part = f"\n\nCurrent code context:\n{code_context[:6000]}" if code_context else ""
             user_prompt = (
-                f"用户问题:\n{query}\n\n"
-                "相关 Wiki 规范片段:\n"
+                f"User question:\n{query}\n\n"
+                "Relevant wiki snippets:\n"
                 + "\n\n".join(context_blocks)
                 + history_block
                 + code_part
-                + "\n\n请基于这些规范回答，并在末尾给出“参考片段”（title + source）。"
+                + "\n\nAnswer based on policy and cite evidence with [1]/[2]/[3] when possible."
             )
 
         try:
@@ -233,14 +228,17 @@ class WikiFirstAgent:
             actions.append(
                 f"llm_generate(provider={self.config.llm.provider}, model={self.config.llm.model}, mode=wiki:{response_mode})"
             )
-            return llm_text or "LLM 返回为空，请检查模型配置。"
+            output = llm_text or "LLM returned empty output."
+            if response_mode == "answer":
+                output = self._ensure_citations(output, chunks)
+            return output
         except Exception as e:  # noqa: BLE001
             actions.append(f"llm_generate(failed, mode=wiki:{response_mode})")
             snippet_text = "\n".join([f"- {c['title']} ({c['parent_file']})" for c in chunks])
             return (
-                f"LLM 调用失败：{e}\n\n"
-                f"已检索规范片段：\n{snippet_text}\n\n"
-                "请检查 llm.provider / api_key 配置，或改用 ollama 本地模型。"
+                f"LLM call failed: {e}\n\n"
+                f"Retrieved wiki snippets:\n{snippet_text}\n\n"
+                "Please verify llm.provider / api_key configuration."
             )
 
     def _general_chat(
@@ -256,38 +254,37 @@ class WikiFirstAgent:
 
         if response_mode == "patch":
             system_prompt = (
-                "你是资深代码助手。当前没有命中 Wiki 规范。"
-                "请直接根据需求生成 unified diff（git diff 风格），必须包含 "
-                "'--- a/<file>' 和 '+++ b/<file>' 以及 '@@' hunk。不要解释。"
-                "如果不需要修改，输出 NO_CHANGES。"
+                "You are a senior code assistant. No wiki policy matched. "
+                "Generate unified diff (git diff style) with '--- a/<file>', '+++ b/<file>', and '@@' hunks. "
+                "No explanation. If no change is needed, output NO_CHANGES."
             )
-            code_part = f"\n\n目标文件: {target_file}\n代码:\n{code_context[:9000]}" if code_context else ""
-            user_prompt = f"需求:\n{query}{history_block}{code_part}\n\n仅返回 unified diff。"
+            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:9000]}" if code_context else ""
+            user_prompt = f"Requirement:\n{query}{history_block}{code_part}\n\nReturn unified diff only."
         else:
             system_prompt = (
-                "你是 WikiCoder 助手。当前没有命中 Wiki 规范。"
-                "请直接回答用户问题，不要把回答限制在知识库主题。"
-                "可以回答任意通用问题；如果不确定请明确说明。"
+                "You are WikiCoder assistant. No wiki policy matched. "
+                "Answer user questions directly; do NOT limit to wiki-domain topics. "
+                "If uncertain, state uncertainty clearly."
             )
-            code_part = f"\n\n当前代码上下文:\n{code_context[:6000]}" if code_context else ""
-            user_prompt = f"用户问题:\n{query}{history_block}{code_part}"
+            code_part = f"\n\nCurrent code context:\n{code_context[:6000]}" if code_context else ""
+            user_prompt = f"User question:\n{query}{history_block}{code_part}"
 
         try:
             llm_text = self.llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
             actions.append(
                 f"llm_generate(provider={self.config.llm.provider}, model={self.config.llm.model}, mode=general:{response_mode})"
             )
-            return llm_text or "LLM 返回为空，请检查模型配置。"
+            return llm_text or "LLM returned empty output."
         except Exception as e:  # noqa: BLE001
             actions.append(f"llm_generate(failed, mode=general:{response_mode})")
-            return f"未命中 Wiki，且通用 LLM 调用失败：{e}\n请检查 llm.api_key / provider 配置后重试。"
+            return f"Wiki miss and general LLM call failed: {e}\nPlease verify llm.api_key / provider config."
 
     @staticmethod
     def _format_history_block(history: list[tuple[str, str]] | None, max_turns: int = 6, max_chars: int = 2400) -> str:
         if not history:
             return ""
         turns = history[-max_turns:]
-        lines = ["\n\n对话上下文（最近几轮）:"]
+        lines = ["\n\nRecent conversation context:"]
         for idx, (q, a) in enumerate(turns, start=1):
             q1 = (q or "").strip()
             a1 = (a or "").strip()
@@ -299,3 +296,110 @@ class WikiFirstAgent:
         if len(out) > max_chars:
             out = out[-max_chars:]
         return out
+
+    @staticmethod
+    def _render_citations(chunks: list[dict[str, str]]) -> str:
+        lines = ["References:"]
+        for i, c in enumerate(chunks[:3], start=1):
+            line_range = WikiFirstAgent._chunk_local_line_range(c.get("content", ""))
+            snippet = WikiFirstAgent._evidence_snippet(c.get("content", ""))
+            anchor = f"chunk://{c['chunk_id']}#L{line_range}"
+            lines.append(
+                f"- [{i}] {c['title']} | source={c['parent_file']} | chunk_id={c['chunk_id']} | anchor={anchor}"
+            )
+            if snippet:
+                lines.append(f"  snippet: {snippet}")
+        return "\n".join(lines)
+
+    def _ensure_citations(self, answer: str, chunks: list[dict[str, str]]) -> str:
+        if not chunks:
+            return answer
+        citations = self._render_citations(chunks)
+        if "References:" in answer or "参考片段" in answer:
+            return answer
+        out = answer.rstrip()
+        if "[1]" not in out and "[2]" not in out and "[3]" not in out:
+            out = self._auto_attach_citation_markers(out, chunks)
+            out += "\n\n(Evidence markers: [1]/[2]/[3] correspond to References below.)"
+        return out + "\n\n" + citations
+
+    @staticmethod
+    def _auto_attach_citation_markers(answer: str, chunks: list[dict[str, str]]) -> str:
+        lines = answer.splitlines()
+        out: list[str] = []
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                out.append(ln)
+                continue
+            if not WikiFirstAgent._should_cite_line(s):
+                out.append(ln)
+                continue
+            idx = WikiFirstAgent._best_chunk_index(s, chunks)
+            if idx > 0 and f"[{idx}]" not in s:
+                out.append(f"{ln} [{idx}]")
+            else:
+                out.append(ln)
+        return "\n".join(out)
+
+    @staticmethod
+    def _should_cite_line(text: str) -> bool:
+        s = text.strip()
+        if len(s) < 12:
+            return False
+        # skip pure heading / divider / obvious non-factual lines
+        if s.startswith(("#", "---", "```")):
+            return False
+        if s.lower().startswith(("summary", "结论", "建议", "tips", "注意")) and len(s) < 24:
+            return False
+        # questions are usually not factual assertions
+        if "?" in s or "？" in s:
+            return False
+        # require some lexical substance
+        has_en = bool(re.search(r"[a-zA-Z]{3,}", s))
+        has_cjk = bool(re.search(r"[\u4e00-\u9fff]{4,}", s))
+        has_num = bool(re.search(r"\d", s))
+        return has_en or has_cjk or has_num
+
+    @staticmethod
+    def _best_chunk_index(text: str, chunks: list[dict[str, str]]) -> int:
+        q_terms = WikiFirstAgent._lex_terms(text)
+        if not q_terms:
+            return 0
+        best_idx = 0
+        best_score = 0
+        for i, c in enumerate(chunks[:3], start=1):
+            c_terms = WikiFirstAgent._lex_terms(
+                f"{c.get('title', '')} {c.get('parent_file', '')} {c.get('content', '')[:800]}"
+            )
+            if not c_terms:
+                continue
+            score = len(q_terms & c_terms)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        return best_idx if best_score > 0 else 0
+
+    @staticmethod
+    def _lex_terms(text: str) -> set[str]:
+        t = text.lower()
+        terms = set(re.findall(r"[a-z0-9_]{2,}", t))
+        cjk = "".join(re.findall(r"[一-鿿]+", text))
+        for i in range(0, max(0, len(cjk) - 1)):
+            terms.add(cjk[i : i + 2])
+        return {x for x in terms if x}
+
+    @staticmethod
+    def _chunk_local_line_range(content: str) -> str:
+        lines = content.splitlines()
+        if not lines:
+            return "1-1"
+        return f"1-{len(lines)}"
+
+    @staticmethod
+    def _evidence_snippet(content: str, max_len: int = 140) -> str:
+        lines = [x.strip() for x in content.splitlines() if x.strip()]
+        body = " ".join(lines[1:] if len(lines) > 1 else lines)
+        if not body:
+            return ""
+        return body if len(body) <= max_len else (body[:max_len].rstrip() + "...")

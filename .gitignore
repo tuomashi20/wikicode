@@ -27,3 +27,5 @@ tmp_vault/
 tmp_vault2/
 data/rawtmp/
 data/test_*/
+data/inc_test/
+data/eval/reports/
