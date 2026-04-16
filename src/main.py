@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import re
+import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +20,12 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 
-from src.core.agent import WikiFirstAgent
+try:
+    import msvcrt  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover
+    msvcrt = None
+
+from src.core.agent import AgentResponse, WikiFirstAgent
 from src.core.atomizer import Atomizer
 from src.core.llm_client import LLMClient
 from src.core.retrieval_eval import (
@@ -34,44 +43,44 @@ from src.skills.code_tools import (
     read_file,
     restore_backup,
     summarize_unified_diff,
+    write_file,
 )
 from src.skills.wiki_tools import wiki_list_structure
 from src.utils.config import AppConfig, DEFAULT_CONFIG_PATH, ensure_workspace, load_config
+from src.utils.kb_backup import list_kb_backups, restore_kb_backup, save_kb_backup
 from src.utils.db_manager import clear_index_store, resolve_db_path
 
 
 app = typer.Typer(help="WikiCoder CLI")
 console = Console()
 
+CLI_BANNER = r"""
+██╗    ██╗██╗██╗  ██╗██╗ ██████╗ ██████╗ ██████╗ ███████╗██████╗
+██║    ██║██║██║ ██╔╝██║██╔════╝██╔═══██╗██╔══██╗██╔════╝██╔══██╗
+██║ █╗ ██║██║█████╔╝ ██║██║     ██║   ██║██║  ██║█████╗  ██████╔╝
+██║███╗██║██║██╔═██╗ ██║██║     ██║   ██║██║  ██║██╔══╝  ██╔══██╗
+╚███╔███╔╝██║██║  ██╗██║╚██████╗╚██████╔╝██████╔╝███████╗██║  ██║
+ ╚══╝╚══╝ ╚═╝╚═╝  ╚═╝╚═╝ ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝
+"""
+
 
 class SlashCommandCompleter(Completer):
     def __init__(self) -> None:
         self.commands = [
-            ("/help", "??????"),
-            ("/sync", "??????RAW -> WIKI?"),
-            ("/kbclear yes", "?????? yes ???"),
-            ("/kbclear all yes", "???? + wiki ????? raw?"),
-            ("/vaultpath ", "?????????/vaultpath <??>"),
-            ("/ask ", "?? Wiki ????"),
-            ("/review ", "?????/review <??> :: <??>"),
-            ("/patch ", "?????/patch <??> :: <??>"),
-            ("/patchm ", "??????/patchm <f1,f2> :: <??>"),
-            ("/preview", "??????"),
-            ("/apply yes", "??????"),
-            ("/backups", "????"),
-            ("/undo ", "??? ID ??"),
-            ("/eval ", "?????/eval <cases.jsonl> [topk] [out.json]"),
-            ("/regress ", "??????????"),
-            ("/compare ", "?????/compare <baseline.json> <latest.json>"),
-            ("/baseline ", "???????/baseline <report.json>"),
-            ("/structure", "??????"),
-            ("/trace on", "?? trace"),
-            ("/trace off", "?? trace"),
-            ("/stream on", "??????"),
-            ("/stream off", "??????"),
-            ("/mode ", "?????/mode auto|wiki_only|general_only"),
-            ("/reset", "??????"),
-            ("/exit", "?? CLI"),
+            ("/help", "查看命令帮助"),
+            ("/sync", "同步知识库（RAW -> WIKI）"),
+            ("/kbclear yes", "清空索引（需确认）"),
+            ("/kbclear all yes", "清空索引 + Wiki 页面（保留 Raw）"),
+            ("/kbsave ", "备份知识库（raw/wiki/processed）"),
+            ("/kbbackups", "查看知识库备份列表"),
+            ("/kbrestore ", "恢复知识库备份"),
+            ("/vaultpath ", "设置知识库根目录"),
+            ("/ask ", "强制 Wiki 模式提问"),
+            ("/structure", "查看索引结构"),
+            ("/mode ", "切换会话模式"),
+            ("/reset", "清空会话记忆"),
+            ("/exit", "退出 CLI"),
+            ("/help advanced", "查看高级命令"),
         ]
 
     def get_completions(self, document: Document, complete_event):
@@ -107,6 +116,336 @@ def build_key_bindings() -> KeyBindings:
         buf.validate_and_handle()
 
     return kb
+
+
+def _escape_pressed() -> bool:
+    if msvcrt is None:
+        return False
+    pressed = False
+    while msvcrt.kbhit():
+        ch = msvcrt.getch()
+        if ch in (b"\x00", b"\xe0"):
+            if msvcrt.kbhit():
+                msvcrt.getch()
+            continue
+        if ch == b"\x1b":
+            pressed = True
+    return pressed
+
+
+def _print_startup_banner() -> None:
+    console.clear()
+    console.print(f"[bold cyan]{CLI_BANNER}[/bold cyan]")
+    console.print("[bold cyan]wikicoder[/bold cyan]")
+    console.print("[bold]wikicoder cli[/bold]  输入 /help 查看详细命令")
+
+
+def _extract_python_code(text: str) -> str:
+    s = text.strip()
+    blocks = re.findall(r"```python\s*\n([\s\S]*?)\n```", s, flags=re.IGNORECASE)
+    if not blocks:
+        blocks = re.findall(r"```\s*\n([\s\S]*?)\n```", s, flags=re.IGNORECASE)
+    if not blocks:
+        return ""
+    code = blocks[0].strip("\n")
+    if "import " in code or "def " in code or "class " in code:
+        return code
+    return ""
+
+
+def _looks_like_script_request(text: str) -> bool:
+    t = text.lower()
+    keys = [
+        "python",
+        "py脚本",
+        "脚本",
+        "自动化",
+        "批量",
+        "合并",
+        ".xlsx",
+        ".csv",
+        "修复bug",
+        "debug",
+    ]
+    return any(k in t for k in keys)
+
+
+def _extract_existing_py_context(user_text: str, max_files: int = 2) -> str:
+    patt = r"([A-Za-z]:\\[^\s\"'<>|?*]+\.py|(?:\.{0,2}[\\/])?[^\s\"'<>|?*]+\.py)"
+    found = re.findall(patt, user_text)
+    contexts: list[str] = []
+    seen: set[str] = set()
+    for raw in found:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = (Path.cwd() / p).resolve()
+        rp = str(p)
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            content = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        rel = p.relative_to(Path.cwd()).as_posix() if str(p).startswith(str(Path.cwd())) else str(p)
+        contexts.append(f"file: {rel}\n```\\n{content[:12000]}\\n```")
+        if len(contexts) >= max_files:
+            break
+    return "\n\n".join(contexts)
+
+
+def _extract_path_hints(user_text: str, max_items: int = 4) -> list[str]:
+    pats = [
+        r"[A-Za-z]:\\[^\s\"'<>|?*]+",
+        r"(?:\.{1,2}[\\/])[^\s\"'<>|?*]+",
+    ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for pat in pats:
+        for m in re.findall(pat, user_text):
+            if m in seen:
+                continue
+            seen.add(m)
+            out.append(m)
+            if len(out) >= max_items:
+                return out
+    return out
+
+
+def _run_python_script_detailed(script_path: Path, timeout_sec: int = 120) -> tuple[bool, str, str, int]:
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script_path)],
+            cwd=str(Path.cwd()),
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, "", f"执行失败: {e}", -1
+    return proc.returncode == 0, (proc.stdout or "").strip(), (proc.stderr or "").strip(), int(proc.returncode)
+
+
+def _run_python_script(script_path: Path, timeout_sec: int = 120) -> tuple[bool, str]:
+    ok, out, err, rc = _run_python_script_detailed(script_path, timeout_sec=timeout_sec)
+    if ok:
+        msg = f"脚本执行成功（exit=0）"
+        if out:
+            msg += f"\n\n标准输出:\n{out}"
+        return True, msg
+    msg = f"脚本执行失败（exit={rc})"
+    if err:
+        msg += f"\n\n错误输出:\n{err}"
+    if out:
+        msg += f"\n\n标准输出:\n{out}"
+    return False, msg
+
+
+def _extract_probe_json(stdout_text: str) -> str:
+    marker = "WIKICODER_PROBE_JSON="
+    for line in stdout_text.splitlines():
+        if line.startswith(marker):
+            return line[len(marker) :].strip()
+    return ""
+
+
+def _confirm_local_operation(consent_state: dict[str, str], action_desc: str) -> bool:
+    mode = consent_state.get("mode", "ask")
+    if mode == "all":
+        return True
+    if mode == "deny":
+        return False
+
+    console.print(
+        f"[yellow]即将执行本地操作：{action_desc}[/yellow]\n"
+        "[cyan]请选择：[/cyan] [green]y[/green]=同意本次  "
+        "[green]a[/green]=同意本次会话所有操作  "
+        "[red]n[/red]=不同意"
+    )
+    ans = input("授权(y/a/n): ").strip().lower()
+    if ans == "a":
+        consent_state["mode"] = "all"
+        return True
+    if ans == "y":
+        return True
+    return False
+
+
+def _auto_script_pipeline(
+    *,
+    agent: WikiFirstAgent,
+    user_query: str,
+    resp: AgentResponse,
+    history: list[tuple[str, str]],
+    consent_state: dict[str, str],
+) -> AgentResponse:
+    if not _looks_like_script_request(user_query):
+        return resp
+    path_hints = _extract_path_hints(user_query)
+    hint_text = ", ".join(path_hints) if path_hints else "(未显式给出路径，默认当前目录)"
+
+    plan_prompt = (
+        "你是自动化工程助手。请根据用户需求给出简短执行计划（3-6步），"
+        "重点说明先探测文件结构再生成脚本的步骤。只输出纯文本。\n\n"
+        f"用户需求：{user_query}\n"
+        f"路径线索：{hint_text}"
+    )
+    plan_resp = _run_agent_with_thinking(
+        agent,
+        user_input=plan_prompt,
+        force_wiki=False,
+        mode="general_only",
+        history=history,
+    )
+
+    probe_prompt = (
+        "请生成一个只读的 Python 探测脚本，用于分析用户需求涉及的数据结构。"
+        "要求：\n"
+        "1) 不可写文件、不可删除、不可联网\n"
+        "2) 仅扫描必要目录并抽样读取结构\n"
+        "3) 最后在 stdout 输出一行：WIKICODER_PROBE_JSON=<json>\n"
+        "4) 仅输出 Python 代码，不要解释\n\n"
+        f"用户需求：{user_query}\n"
+        f"路径线索：{hint_text}"
+    )
+    probe_resp = _run_agent_with_thinking(
+        agent,
+        user_input=probe_prompt,
+        force_wiki=False,
+        mode="general_only",
+        history=history,
+    )
+    probe_code = _extract_python_code(probe_resp.output)
+    if not probe_code:
+        return resp
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    probe_name = f"wikicoder_probe_{ts}.py"
+    probe_path = (Path.cwd() / probe_name).resolve()
+    if not _confirm_local_operation(consent_state, f"写入探测脚本 {probe_name} 并执行（只读探测）"):
+        return AgentResponse(
+            thought=resp.thought,
+            actions=resp.actions + ["local-op:denied-by-user"],
+            output=f"{resp.output}\n\n---\n[本地操作]\n用户拒绝执行探测，未进入自动化实现。",
+        )
+    write_file(probe_name, probe_code)
+    ok_probe, probe_out, probe_err, probe_rc = _run_python_script_detailed(probe_path)
+    probe_json = _extract_probe_json(probe_out)
+    probe_summary = probe_json if probe_json else json.dumps(
+        {"stdout": probe_out[:2000], "stderr": probe_err[:2000], "exit": probe_rc}, ensure_ascii=False
+    )
+    probe_status = "成功" if ok_probe else "失败（继续按已有信息尝试）"
+
+    script_prompt = (
+        "你将根据探测结果实现自动化脚本。请仅输出完整 Python 代码，不要解释。\n"
+        "要求：\n"
+        "1) 对输入异常做健壮处理\n"
+        "2) 打印关键进度和最终结果\n"
+        "3) 若是表格处理，先对列名/类型对齐后再合并\n\n"
+        f"用户需求：{user_query}\n"
+        f"路径线索：{hint_text}\n"
+        f"探测状态：{probe_status}\n"
+        f"探测结果(JSON)：\n{probe_summary[:12000]}"
+    )
+    script_resp = _run_agent_with_thinking(
+        agent,
+        user_input=script_prompt,
+        force_wiki=False,
+        mode="general_only",
+        history=history,
+    )
+    code = _extract_python_code(script_resp.output)
+    if not code:
+        return AgentResponse(
+            thought=resp.thought,
+            actions=resp.actions + [f"write_file({probe_name})", f"run_python({probe_name})", "gen_script:failed"],
+            output=f"{resp.output}\n\n---\n[探测]\n{probe_status}\n\n[自动化脚本生成]\n模型未返回可执行 Python 代码。",
+        )
+
+    script_name = f"wikicoder_task_{ts}.py"
+    script_path = (Path.cwd() / script_name).resolve()
+    if not _confirm_local_operation(consent_state, f"写入业务脚本 {script_name} 并执行"):
+        return AgentResponse(
+            thought=resp.thought,
+            actions=resp.actions + [f"write_file({probe_name})", f"run_python({probe_name})", "local-op:denied-by-user"],
+            output=f"{resp.output}\n\n---\n[探测]\n{probe_status}\n\n[本地操作]\n用户拒绝写入/执行业务脚本。",
+        )
+    write_file(script_name, code)
+    console.print(f"[green]已生成脚本：{script_path}[/green]")
+
+    ok, run_msg = _run_python_script(script_path)
+    actions = resp.actions + [
+        f"write_file({probe_name})",
+        f"run_python({probe_name})",
+        f"write_file({script_name})",
+        f"run_python({script_name})",
+    ]
+    all_msgs = [
+        f"[规划]\n{plan_resp.output[:1200]}",
+        f"[探测状态]\n{probe_status}",
+        f"[自动执行结果]\n{run_msg}",
+    ]
+    if ok:
+        return AgentResponse(
+            thought=resp.thought,
+            actions=actions,
+            output=f"{resp.output}\n\n---\n" + "\n\n".join(all_msgs),
+        )
+
+    current_code = code
+    attempt = 1
+    while True:
+        fix_prompt = (
+            "你需要修复一个执行失败的 Python 自动化脚本。请只输出完整 Python 代码，不要解释。\n\n"
+            f"用户原始需求：{user_query}\n"
+            f"脚本文件名：{script_name}\n"
+            f"修复轮次：{attempt}\n"
+            f"探测结果(JSON)：\n{probe_summary[:10000]}\n\n"
+            "当前脚本：\n"
+            f"```python\n{current_code}\n```\n\n"
+            f"最近报错：\n```\n{all_msgs[-1][:7000]}\n```"
+        )
+        fix_resp = _run_agent_with_thinking(
+            agent,
+            user_input=fix_prompt,
+            force_wiki=False,
+            mode="general_only",
+            history=history,
+        )
+        fix_code = _extract_python_code(fix_resp.output)
+        if not fix_code:
+            all_msgs.append(f"[第{attempt}轮自动修复] 模型未返回可执行代码。")
+            break
+
+        if not _confirm_local_operation(consent_state, f"覆盖脚本 {script_name} 并再次执行（第{attempt}轮修复）"):
+            all_msgs.append(f"[第{attempt}轮自动修复] 用户拒绝继续本地写入/执行。")
+            actions.append(f"auto_fix:{attempt}:denied")
+            break
+
+        write_file(script_name, fix_code)
+        current_code = fix_code
+        ok_i, run_msg_i = _run_python_script(script_path)
+        actions.extend([f"auto_fix:{attempt}", f"run_python({script_name})"])
+        all_msgs.append(f"[第{attempt}轮自动修复执行结果]\n{run_msg_i}")
+        if ok_i:
+            all_msgs.append(f"[自动修复状态] 已在第{attempt}轮修复成功。")
+            return AgentResponse(
+                thought=resp.thought,
+                actions=actions,
+                output=f"{resp.output}\n\n---\n" + "\n\n".join(all_msgs),
+            )
+        attempt += 1
+        if attempt > 50:
+            all_msgs.append("[自动修复状态] 已达到安全上限(50轮)，仍未成功。")
+            break
+
+    return AgentResponse(
+        thought=resp.thought,
+        actions=actions,
+        output=f"{resp.output}\n\n---\n" + "\n\n".join(all_msgs),
+    )
 
 
 
@@ -153,21 +492,54 @@ def _run_agent_with_thinking(
     target_file: str = "",
     history: list[tuple[str, str]] | None = None,
 ):
-    status_text = "[bold cyan]Thinking... searching Wiki and calling model[/bold cyan]"
-    if mode == "general_only":
-        status_text = "[bold cyan]Thinking... calling model directly (general_only)[/bold cyan]"
-    elif mode == "wiki_only":
-        status_text = "[bold cyan]Thinking... searching Wiki only (wiki_only)[/bold cyan]"
-    with console.status(status_text, spinner="dots"):
-        return agent.run(
-            user_input,
-            force_wiki=force_wiki,
-            mode=mode,  # type: ignore[arg-type]
-            code_context=code_context,
-            response_mode=response_mode,  # type: ignore[arg-type]
-            target_file=target_file,
-            history=history,
-        )
+    state: dict[str, object] = {}
+
+    def _work() -> None:
+        try:
+            state["resp"] = agent.run(
+                user_input,
+                force_wiki=force_wiki,
+                mode=mode,  # type: ignore[arg-type]
+                code_context=code_context,
+                response_mode=response_mode,  # type: ignore[arg-type]
+                target_file=target_file,
+                history=history,
+            )
+        except Exception as exc:  # noqa: BLE001
+            state["err"] = exc
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    idx = 0
+    start = time.perf_counter()
+
+    with Live("", console=console, refresh_per_second=12, transient=True) as live:
+        while t.is_alive():
+            elapsed = time.perf_counter() - start
+            phase = "检索 Wiki + 调用模型"
+            if mode == "general_only":
+                phase = "调用通用模型"
+            elif mode == "wiki_only":
+                phase = "仅检索 Wiki"
+            live.update(
+                f"[bold cyan]{frames[idx % len(frames)]} 思考中 {elapsed:.1f}s[/bold cyan] "
+                f"[dim]（{phase}，按 ESC 取消本次提问）[/dim]"
+            )
+            idx += 1
+
+            if _escape_pressed():
+                return AgentResponse(
+                    thought="cancelled-by-user",
+                    actions=["cancelled: ESC pressed"],
+                    output="已取消本次提问。",
+                )
+            time.sleep(0.1)
+
+    if "err" in state:
+        raise state["err"]  # type: ignore[misc]
+    return state["resp"]  # type: ignore[return-value]
 
 
 def _print_trace(resp_thought: str, resp_actions: list[str]) -> None:
@@ -343,6 +715,43 @@ def where_db() -> None:
     """Show active sqlite path."""
     ensure_workspace()
     console.print(str(resolve_db_path()))
+
+
+@app.command(name="kb-save")
+def kb_save(name: str = typer.Option("", help="Optional backup name suffix")) -> None:
+    """Backup knowledge base (raw/wiki/processed)."""
+    ensure_workspace()
+    cfg = load_config()
+    bid, msgs = save_kb_backup(cfg, name=name or None)
+    console.print(f"[green]KB backup created:[/green] {bid}")
+    for m in msgs:
+        console.print(f"[yellow]{m}[/yellow]")
+
+
+@app.command(name="kb-backups")
+def kb_backups(limit: int = typer.Option(20, help="Max backup items")) -> None:
+    """List knowledge base backups."""
+    ensure_workspace()
+    items = list_kb_backups(limit=limit)
+    if not items:
+        console.print("No KB backups found.")
+        return
+    for it in items:
+        console.print(f"- {it['id']} | {it['created_at']}")
+
+
+@app.command(name="kb-restore")
+def kb_restore(backup_id: str) -> None:
+    """Restore knowledge base from backup id."""
+    ensure_workspace()
+    cfg = load_config()
+    ok, msgs = restore_kb_backup(cfg, backup_id)
+    for m in msgs:
+        console.print(f"[green]{m}[/green]" if m.startswith("Restored") else f"[yellow]{m}[/yellow]")
+    if ok:
+        console.print("[cyan]KB restore completed.[/cyan]")
+    else:
+        console.print("[yellow]KB restore completed with warnings/errors.[/yellow]")
 
 
 @app.command()
@@ -745,6 +1154,7 @@ def chat(
     """Start Claude-like REPL."""
     ensure_workspace()
     config = load_config()
+    _print_startup_banner()
 
     if config.sync.auto_on_startup:
         result = run_sync()
@@ -763,7 +1173,6 @@ def chat(
         complete_while_typing=True,
         key_bindings=build_key_bindings(),
     )
-    console.print("[bold]WikiCoder REPL started[/bold]. Type /help for commands.")
 
     show_trace = trace
     show_stream = stream
@@ -773,6 +1182,7 @@ def chat(
     last_patch_allowed: set[str] | None = None
     last_backup_id = ""
     session_history: list[tuple[str, str]] = []
+    local_op_consent: dict[str, str] = {"mode": "ask"}
 
     while True:
         try:
@@ -784,6 +1194,20 @@ def chat(
         cmd = text.strip()
         if not cmd:
             continue
+        # tolerate commands without leading slash
+        if cmd in {
+            "sync",
+            "help",
+            "reset",
+            "exit",
+            "quit",
+            "kbclear",
+            "kbclear yes",
+            "kbclear all yes",
+            "kbbackups",
+            "kbsave",
+        }:
+            cmd = f"/{cmd}"
 
         if cmd in {"/exit", "/quit"}:
             console.print("Bye.")
@@ -791,29 +1215,64 @@ def chat(
 
         if cmd == "/help":
             console.print(
-                "Commands:\n"
-                "/sync\n"
-                "/vaultpath <dir>\n"
-                "/kbclear yes\n"
-                "/kbclear all yes\n"
-                "/mode auto|wiki_only|general_only\n"
-                "/eval <cases.jsonl> [topk] [out.json]\n"
-                "/regress <cases.jsonl> [topk] [out.json]\n"
-                "/compare <baseline.json> <latest.json>\n"
-                "/baseline <report.json> [baseline.json]\n"
-                "/ask <query>\n"
-                "/review <file> :: <query>\n"
-                "/patch <file> :: <query>\n"
-                "/patchm <file1,file2> :: <query>\n"
+                "[bold]WikiCoder 命令帮助[/bold]\n\n"
+                "[cyan]一、知识库与同步[/cyan]\n"
+                "/vaultpath <目录>  设置知识库根目录（自动派生 raw/wiki/wiki_processed）\n"
+                "/sync               执行同步（增量）：RAW -> 索引 -> WIKI 页面\n"
+                "/structure          查看当前索引结构（文件与 chunk 数）\n"
+                "/kbclear yes        清空索引（chunks + sqlite）\n"
+                "/kbclear all yes    清空索引 + wiki 页面（保留 raw 原文件）\n\n"
+                "/kbsave [name]      备份知识库（raw/wiki/processed）\n"
+                "/kbbackups          查看知识库备份列表\n"
+                "/kbrestore <id>     恢复指定知识库备份\n\n"
+                "[cyan]二、问答与模式[/cyan]\n"
+                "/mode auto|wiki_only|general_only  切换会话模式\n"
+                "  - auto: 先检索 wiki，未命中回退通用模型\n"
+                "  - wiki_only: 仅 wiki，不回退\n"
+                "  - general_only: 直接通用模型\n"
+                "/ask <问题>         强制 Wiki 模式提问\n"
+                "/reset              清空当前会话记忆\n\n"
+                "[cyan]三、评测与回归[/cyan]\n"
+                "/eval <cases> [topk] [out]         运行检索评测（recall/top1/mrr）\n"
+                "/regress <cases> [topk] [out]      一键同步 + 评测\n"
+                "/compare <base> <latest>           对比两份评测报告（delta/fixed/regressed）\n"
+                "/baseline <report> [baseline]      将报告设为基线\n\n"
+                "[cyan]四、代码审阅与补丁[/cyan]\n"
+                "/review <文件> :: <问题>            按知识库规则审阅文件\n"
+                "/patch <文件> :: <需求>             生成单文件补丁\n"
+                "/patchm <f1,f2> :: <需求>           生成多文件补丁\n"
+                "/preview                            预览最近补丁摘要\n"
+                "/apply yes                          应用最近补丁\n"
+                "/backups                            查看备份列表\n"
+                "/undo [backup_id]                   回滚备份\n\n"
+                "[cyan]五、显示与会话[/cyan]\n"
+                "提问处理中会显示耗时秒数，可按 ESC 取消本次提问\n"
+                "普通对话中如为脚本类需求：先结构探测 -> 再生成脚本 -> 执行并持续自动修复\n"
+                "本地写入/执行前会询问授权：y(本次) / a(本会话全部同意) / n(拒绝)\n"
+                "高级命令请执行：/help advanced\n"
+                "/exit               退出 CLI"
+            )
+            continue
+
+        if cmd == "/help advanced":
+            console.print(
+                "[bold]WikiCoder 高级命令[/bold]\n\n"
+                "[cyan]评测与回归[/cyan]\n"
+                "/eval <cases> [topk] [out]\n"
+                "/regress <cases> [topk] [out]\n"
+                "/compare <base> <latest>\n"
+                "/baseline <report> [baseline]\n\n"
+                "[cyan]代码补丁工作流[/cyan]\n"
+                "/review <文件> :: <问题>\n"
+                "/patch <文件> :: <需求>\n"
+                "/patchm <f1,f2> :: <需求>\n"
                 "/preview\n"
                 "/apply yes\n"
                 "/backups\n"
-                "/undo [backup_id]\n"
-                "/structure\n"
+                "/undo <backup_id>\n\n"
+                "[cyan]显示控制[/cyan]\n"
                 "/trace on|off\n"
-                "/stream on|off\n"
-                "/reset\n"
-                "/exit"
+                "/stream on|off"
             )
             continue
 
@@ -847,6 +1306,39 @@ def chat(
                 console.print("[cyan]已清空索引和 wiki 生成页（raw 未删除）。可执行 /sync 重新构建。[/cyan]")
             else:
                 console.print("[cyan]已清空索引。可执行 /sync 重新构建。[/cyan]")
+            continue
+
+        if cmd == "/kbbackups":
+            items = list_kb_backups(limit=30)
+            if not items:
+                console.print("No KB backups found.")
+            else:
+                for it in items:
+                    console.print(f"- {it['id']} | {it['created_at']}")
+            continue
+
+        if cmd == "/kbsave" or cmd.startswith("/kbsave "):
+            name = cmd.split(" ", 1)[1].strip() if cmd.startswith("/kbsave ") else ""
+            cfg = load_config()
+            bid, msgs = save_kb_backup(cfg, name=name or None)
+            console.print(f"[green]KB backup created:[/green] {bid}")
+            for m in msgs:
+                console.print(f"[yellow]{m}[/yellow]")
+            continue
+
+        if cmd.startswith("/kbrestore "):
+            backup_id = cmd.split(" ", 1)[1].strip()
+            if not backup_id:
+                console.print("[yellow]Usage: /kbrestore <backup_id>[/yellow]")
+                continue
+            cfg = load_config()
+            ok, msgs = restore_kb_backup(cfg, backup_id)
+            for m in msgs:
+                console.print(f"[green]{m}[/green]" if m.startswith("Restored") else f"[yellow]{m}[/yellow]")
+            if ok:
+                console.print("[cyan]KB restore completed.[/cyan]")
+            else:
+                console.print("[yellow]KB restore completed with warnings/errors.[/yellow]")
             continue
 
 
@@ -1107,6 +1599,7 @@ def chat(
             continue
 
         remember_turn = False
+        plain_chat_turn = False
         if cmd.startswith("/ask "):
             query = cmd[5:].strip()
             console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
@@ -1201,24 +1694,39 @@ def chat(
             last_patch_allowed = set(file_list)
         else:
             console.print(f"[black on bright_cyan] You: {cmd} [/black on bright_cyan]")
+            auto_ctx = _extract_existing_py_context(cmd)
             resp = _run_agent_with_thinking(
                 agent,
                 user_input=cmd,
                 force_wiki=False,
+                code_context=auto_ctx,
                 history=session_history,
                 mode=session_mode,
             )
             remember_turn = True
+            plain_chat_turn = True
+
+        if plain_chat_turn and resp.thought != "cancelled-by-user":
+            resp = _auto_script_pipeline(
+                agent=agent,
+                user_query=cmd,
+                resp=resp,
+                history=session_history,
+                consent_state=local_op_consent,
+            )
 
         if show_trace:
             _print_trace(resp.thought, resp.actions)
+
+        if resp.thought == "cancelled-by-user":
+            remember_turn = False
 
         _stream_markdown(resp.output, enabled=show_stream)
         if remember_turn:
             session_history.append((cmd, resp.output))
             if len(session_history) > 12:
                 session_history = session_history[-12:]
-        if cmd.startswith("/patch ") or cmd.startswith("/patchm "):
+        if resp.thought != "cancelled-by-user" and (cmd.startswith("/patch ") or cmd.startswith("/patchm ")):
             _print_patch_preview(resp.output)
 
 

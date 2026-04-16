@@ -44,5 +44,61 @@ wiki_strategy:
     priority: ["MUST", "REQUIRED"]
     language: "Chinese"
 
+  # 分类与标签规则（建议在这里维护，不要改代码）
+  rules:
+    concept_cues: ["定义", "术语", "是指", "指的是", "本办法所称", "本规范所称", "含义", "定义为"]
+    comparison_hints: ["对比", "比较", "差异", "区别", "优缺点", "选型", "vs"]
+    entity_org_suffixes: ["公司", "集团", "部门", "中心", "分公司", "委员会", "办公室", "项目组"]
+    entity_type_hints: ["系统", "平台", "终端", "设备", "岗位", "角色", "单位", "组织"]
+    entity_exclude_terms: ["管理办法", "规范", "细则", "标准", "目录", "附件", "附录"]
+    entity_content_cues: ["责任主体", "执行主体", "适用对象", "维护对象"]
+    entity_ignore_terms: ["甲方", "乙方", "双方", "本办法", "本规范", "本细则", "本制度"]
+    entity_card_min_mentions: 2
+    entity_card_max_pages: 200
+    entity_card_name_max_len: 40
+    chapter_title_patterns:
+      - "第[一二三四五六七八九十百千0-9]+(章|节|部分)"
+      - "[一二三四五六七八九十]+、.+"
+    chapter_exact_terms: ["目录", "附件", "附录", "总则"]
+    tag_stopwords:
+      - "相关"
+      - "以及"
+      - "如何"
+      - "进行"
+      - "为了"
+      - "可以"
+      - "需要"
+      - "管理"
+      - "规范"
+      - "要求"
+      - "流程"
+      - "标准"
+      - "办法"
+      - "说明"
+      - "附件"
+      - "目录"
+      - "内容"
+      - "部分"
+      - "有关"
+      - "根据"
+      - "通过"
+      - "关于"
+      - "sheet1"
+      - "unnamed"
+      - "附录"
+      - "总则"
+      - "备注"
+      - "类型"
+      - "项目"
+      - "制度基础信息表"
+    tag_block_patterns:
+      - "第[一二三四五六七八九十百千0-9]+(章|节|部分)"
+      - "[一二三四五六七八九十]+、.+"
+      - "sheet\\d+"
+      - "chapter\\d+"
+    tag_block_prefixes: ["sheet", "chapter"]
+    tag_min_len: 2
+    tag_max_len: 20
+
 sync:
   auto_on_startup: true

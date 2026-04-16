@@ -201,26 +201,29 @@ class Atomizer:
             )
         return chunks
 
-    @staticmethod
-    def _extract_tags(title: str, content: str) -> str:
-        stopwords = {
-            "related",
-            "about",
-            "with",
-            "from",
-            "that",
-            "this",
-            "and",
-            "the",
-            "for",
-            "requirement",
-            "rule",
-            "rules",
-            "policy",
-            "process",
-            "standard",
-            "management",
-        }
+    def _extract_tags(self, title: str, content: str) -> str:
+        ws = self.config.wiki_strategy
+        stopwords = set(str(x).strip().lower() for x in ws.tag_stopwords if str(x).strip())
+        block_patterns = [str(x) for x in ws.tag_block_patterns if str(x).strip()]
+        block_prefixes = [str(x).strip().lower() for x in ws.tag_block_prefixes if str(x).strip()]
+
+        def is_noise_term(term: str) -> bool:
+            t = term.strip()
+            if not t:
+                return True
+            tl = t.lower()
+            for p in block_prefixes:
+                if tl.startswith(p):
+                    return True
+            for pat in block_patterns:
+                try:
+                    if re.fullmatch(pat, t, flags=re.IGNORECASE):
+                        return True
+                except re.error:
+                    continue
+            if tl in stopwords:
+                return True
+            return False
 
         source = f"{title}\n{content[:1200]}"
         parts = re.split(r"[\s,.;:!?()\[\]{}<>\"'`/_\\\-]+", source)
@@ -233,12 +236,12 @@ class Atomizer:
 
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{2,24}", t):
                 tl = t.lower()
-                if tl not in stopwords:
+                if not is_noise_term(tl):
                     candidates.append(tl)
                 continue
 
             if re.fullmatch(r"[\u4e00-\u9fff]{2,12}", t):
-                if not t.endswith(("的", "了")):
+                if not t.endswith(("的", "了")) and not is_noise_term(t):
                     candidates.append(t)
 
         title_terms = [t for t in candidates if t in title]
@@ -255,6 +258,7 @@ class Atomizer:
                 break
 
         return ",".join(out)
+
 
     @staticmethod
     def _build_chunk_id(rel_path: str, index: int, title: str) -> str:

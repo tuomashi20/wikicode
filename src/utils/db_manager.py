@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import sqlite3
@@ -383,6 +384,22 @@ def clear_index_store(processed_path: Path | None = None) -> list[str]:
     else:
         messages.append(f"Chunks dir not found: {chunks_dir}")
 
+    # 1.5) clear incremental sync state so next /sync can rebuild from RAW
+    if processed_path is None:
+        state_file = PROJECT_ROOT / "data" / "wiki_processed" / "sync_state.json"
+    else:
+        state_file = Path(processed_path) / "sync_state.json"
+    if state_file.exists():
+        try:
+            state_file.unlink()
+            messages.append(f"Removed: {state_file}")
+        except Exception as e:  # noqa: BLE001
+            try:
+                state_file.write_text(json.dumps({"version": 1, "files": {}}, ensure_ascii=False), encoding="utf-8")
+                messages.append(f"Reset state file: {state_file}")
+            except Exception as e2:  # noqa: BLE001
+                messages.append(f"Failed removing {state_file}: {e}; reset failed: {e2}")
+
     # 2) clear known sqlite files (prefer configured processed_path db first)
     candidates = {PREFERRED_DB_PATH, FALLBACK_DB_PATH}
     if processed_path is not None:
@@ -393,16 +410,14 @@ def clear_index_store(processed_path: Path | None = None) -> list[str]:
         pass
 
     for base in candidates:
-        removed_any = False
         for p in base.parent.glob(f"{base.stem}.sqlite*"):
             try:
                 p.unlink()
                 messages.append(f"Removed: {p}")
-                removed_any = True
             except Exception as e:  # noqa: BLE001
                 messages.append(f"Failed removing {p}: {e}")
-        # fallback when db file is locked: clear rows in-place
-        if (not removed_any) and base.exists():
+        # always try in-place row clear for any remaining/locked db file
+        if base.exists():
             try:
                 with get_conn(base) as conn:
                     conn.execute("DELETE FROM chunks_fts")

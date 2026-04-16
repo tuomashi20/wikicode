@@ -10,6 +10,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / ".wikicoder" / "config.yaml"
+DEFAULT_CONFIG_EXAMPLE_PATH = PROJECT_ROOT / ".wikicoder" / "config.example.yaml"
 
 
 @dataclass
@@ -40,6 +41,23 @@ class WikiStrategyConfig:
     heading_level: int
     wiki_compile_on_sync: bool
     style_guidelines: dict[str, Any]
+    concept_cues: list[str]
+    comparison_hints: list[str]
+    entity_org_suffixes: list[str]
+    entity_type_hints: list[str]
+    entity_exclude_terms: list[str]
+    entity_content_cues: list[str]
+    entity_ignore_terms: list[str]
+    entity_card_min_mentions: int
+    entity_card_max_pages: int
+    entity_card_name_max_len: int
+    chapter_title_patterns: list[str]
+    chapter_exact_terms: list[str]
+    tag_stopwords: list[str]
+    tag_block_patterns: list[str]
+    tag_block_prefixes: list[str]
+    tag_min_len: int
+    tag_max_len: int
 
 
 @dataclass
@@ -60,6 +78,18 @@ def _resolve_path(value: str | Path) -> Path:
     if not p.is_absolute():
         p = (PROJECT_ROOT / p).resolve()
     return p
+
+
+def _load_default_rules_from_yaml() -> dict[str, Any]:
+    try:
+        if not DEFAULT_CONFIG_EXAMPLE_PATH.exists():
+            return {}
+        data = yaml.safe_load(DEFAULT_CONFIG_EXAMPLE_PATH.read_text(encoding="utf-8")) or {}
+        ws = data.get("wiki_strategy") or {}
+        rules = ws.get("rules") or {}
+        return rules if isinstance(rules, dict) else {}
+    except Exception:
+        return {}
 
 
 
@@ -132,6 +162,24 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
     if not raw_to_wiki_map and raw_subdirs:
         raw_to_wiki_map = {x: _infer_wiki_category(x) for x in raw_subdirs}
 
+    rules_data = wiki_data.get("rules") or {}
+    if not isinstance(rules_data, dict):
+        rules_data = {}
+    default_rules = _load_default_rules_from_yaml()
+
+    def _rule_list(key: str) -> list[str]:
+        v = rules_data.get(key, default_rules.get(key, []))
+        if not isinstance(v, list):
+            return [str(x) for x in default_rules.get(key, [])]
+        return [str(x) for x in v if str(x).strip()]
+
+    def _rule_int(key: str, fallback: int = 0) -> int:
+        default = int(default_rules.get(key, fallback))
+        try:
+            return int(rules_data.get(key, default))
+        except Exception:
+            return default
+
     return WikiStrategyConfig(
         vault_path=vault_path,
         raw_path=raw_path,
@@ -145,6 +193,23 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
         heading_level=int(wiki_data.get("heading_level", 2)),
         wiki_compile_on_sync=bool(wiki_data.get("wiki_compile_on_sync", True)),
         style_guidelines=wiki_data.get("style_guidelines", {}),
+        concept_cues=_rule_list("concept_cues"),
+        comparison_hints=_rule_list("comparison_hints"),
+        entity_org_suffixes=_rule_list("entity_org_suffixes"),
+        entity_type_hints=_rule_list("entity_type_hints"),
+        entity_exclude_terms=_rule_list("entity_exclude_terms"),
+        entity_content_cues=_rule_list("entity_content_cues"),
+        entity_ignore_terms=_rule_list("entity_ignore_terms"),
+        entity_card_min_mentions=max(1, _rule_int("entity_card_min_mentions", 2)),
+        entity_card_max_pages=max(1, _rule_int("entity_card_max_pages", 200)),
+        entity_card_name_max_len=max(8, _rule_int("entity_card_name_max_len", 40)),
+        chapter_title_patterns=_rule_list("chapter_title_patterns"),
+        chapter_exact_terms=_rule_list("chapter_exact_terms"),
+        tag_stopwords=_rule_list("tag_stopwords"),
+        tag_block_patterns=_rule_list("tag_block_patterns"),
+        tag_block_prefixes=_rule_list("tag_block_prefixes"),
+        tag_min_len=max(1, _rule_int("tag_min_len", 2)),
+        tag_max_len=max(2, _rule_int("tag_max_len", 20)),
     )
 
 
