@@ -59,6 +59,9 @@ from src.skills.code_tools import (
     summarize_unified_diff,
     write_file,
 )
+from src.skills.docx_tools import convert_docx_path
+from src.skills.pdf_tools import convert_pdf_path
+from src.skills.xlsx_tools import convert_xlsx_path
 from src.skills.wiki_tools import wiki_list_structure
 from src.utils.config import AppConfig, DEFAULT_CONFIG_PATH, PROJECT_ROOT, ensure_workspace, load_config
 from src.utils.kb_backup import list_kb_backups, restore_kb_backup, save_kb_backup
@@ -98,6 +101,9 @@ class SlashCommandCompleter(Completer):
             ("/reset", "清空会话记忆"),
             ("/memdraft ", "将最近对话整理为wiki草稿"),
             ("/memsave ", "保存wiki草稿到raw/faq"),
+            ("/xlsx2md ", "xlsx 转 markdown（文件或目录）"),
+            ("/pdf2md ", "pdf 转 markdown（文件或目录）"),
+            ("/docx2md ", "word 转 markdown（文件或目录）"),
             ("/exit", "退出 CLI"),
             ("/help advanced", "查看高级命令"),
         ]
@@ -1473,6 +1479,54 @@ def image_generate(
         _stream_markdown(result, enabled=False)
 
 
+@app.command(name="xlsx2md")
+def xlsx2md(
+    path: str = typer.Argument(..., help="xlsx 文件路径，或包含 xlsx 的目录路径"),
+    recursive: bool = typer.Option(False, "--recursive", help="目录模式下递归处理子目录"),
+) -> None:
+    """Convert xlsx file(s) to markdown in the same directory."""
+    ensure_workspace()
+    outs, errs = convert_xlsx_path(path, recursive=recursive)
+    for o in outs:
+        console.print(f"[green]已生成：{o}[/green]")
+    for e in errs:
+        console.print(f"[yellow]{e}[/yellow]")
+    if outs and not errs:
+        console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
+
+
+@app.command(name="pdf2md")
+def pdf2md(
+    path: str = typer.Argument(..., help="pdf 文件路径，或包含 pdf 的目录路径"),
+    recursive: bool = typer.Option(False, "--recursive", help="目录模式下递归处理子目录"),
+) -> None:
+    """Convert pdf file(s) to markdown in the same directory."""
+    ensure_workspace()
+    outs, errs = convert_pdf_path(path, recursive=recursive)
+    for o in outs:
+        console.print(f"[green]已生成：{o}[/green]")
+    for e in errs:
+        console.print(f"[yellow]{e}[/yellow]")
+    if outs and not errs:
+        console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
+
+
+@app.command(name="docx2md")
+def docx2md(
+    path: str = typer.Argument(..., help="docx 文件路径，或包含 docx 的目录路径"),
+    recursive: bool = typer.Option(False, "--recursive", help="目录模式下递归处理子目录"),
+) -> None:
+    """Convert docx file(s) to markdown in the same directory."""
+    ensure_workspace()
+    outs, errs = convert_docx_path(path, recursive=recursive)
+    for o in outs:
+        console.print(f"[green]已生成：{o}[/green]")
+    for e in errs:
+        console.print(f"[yellow]{e}[/yellow]")
+    if outs and not errs:
+        console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
+
+
 @app.command()
 def review(
     file: str,
@@ -1674,6 +1728,9 @@ def chat(
             "memdraft",
             "memsave",
             "model",
+            "xlsx2md",
+            "pdf2md",
+            "docx2md",
         }:
             cmd = f"/{cmd}"
 
@@ -1703,6 +1760,9 @@ def chat(
                 "/ask <问题>         强制 Wiki 模式提问\n"
                 "/memdraft [标题]    将本轮会话整理为 wiki 文档草稿\n"
                 "/memsave [标题]     将草稿保存到 raw/faq 目录\n"
+                "/xlsx2md <路径>     将 xlsx 转为同目录同名 md（支持文件或目录）\n"
+                "/pdf2md <路径>      将 pdf 转为同目录同名 md（支持文件或目录）\n"
+                "/docx2md <路径>     将 word(docx) 转为同目录同名 md（支持文件或目录）\n"
                 "/reset              清空当前会话记忆\n\n"
                 "[cyan]三、评测与回归[/cyan]\n"
                 "/eval <cases> [topk] [out]         运行检索评测（recall/top1/mrr）\n"
@@ -1757,6 +1817,60 @@ def chat(
                 f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
                 f"chunks={result['chunks']} wiki_pages={wp}"
             )
+            continue
+
+        if cmd == "/xlsx2md" or cmd.startswith("/xlsx2md "):
+            if cmd == "/xlsx2md":
+                console.print("[yellow]用法：/xlsx2md <文件或目录路径>[/yellow]")
+                continue
+            arg = cmd.split(" ", 1)[1].strip()
+            recursive = False
+            if arg.endswith(" -r") or arg.endswith(" --recursive"):
+                recursive = True
+                arg = arg.rsplit(" ", 1)[0].strip()
+            outs, errs = convert_xlsx_path(arg, recursive=recursive)
+            for o in outs:
+                console.print(f"[green]已生成：{o}[/green]")
+            for e in errs:
+                console.print(f"[yellow]{e}[/yellow]")
+            if outs and not errs:
+                console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
+            continue
+
+        if cmd == "/pdf2md" or cmd.startswith("/pdf2md "):
+            if cmd == "/pdf2md":
+                console.print("[yellow]用法：/pdf2md <文件或目录路径>[/yellow]")
+                continue
+            arg = cmd.split(" ", 1)[1].strip()
+            recursive = False
+            if arg.endswith(" -r") or arg.endswith(" --recursive"):
+                recursive = True
+                arg = arg.rsplit(" ", 1)[0].strip()
+            outs, errs = convert_pdf_path(arg, recursive=recursive)
+            for o in outs:
+                console.print(f"[green]已生成：{o}[/green]")
+            for e in errs:
+                console.print(f"[yellow]{e}[/yellow]")
+            if outs and not errs:
+                console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
+            continue
+
+        if cmd == "/docx2md" or cmd.startswith("/docx2md "):
+            if cmd == "/docx2md":
+                console.print("[yellow]用法：/docx2md <文件或目录路径>[/yellow]")
+                continue
+            arg = cmd.split(" ", 1)[1].strip()
+            recursive = False
+            if arg.endswith(" -r") or arg.endswith(" --recursive"):
+                recursive = True
+                arg = arg.rsplit(" ", 1)[0].strip()
+            outs, errs = convert_docx_path(arg, recursive=recursive)
+            for o in outs:
+                console.print(f"[green]已生成：{o}[/green]")
+            for e in errs:
+                console.print(f"[yellow]{e}[/yellow]")
+            if outs and not errs:
+                console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
             continue
 
         if cmd in {"/kbclear", "/kbclear yes", "/kbclear all yes"}:
