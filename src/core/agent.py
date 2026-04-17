@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -38,15 +39,24 @@ class WikiFirstAgent:
         response_mode: ResponseMode = "answer",
         target_file: str = "",
         history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> AgentResponse:
         actions: list[str] = []
         query = user_input.strip()
+
+        def _act(msg: str) -> None:
+            actions.append(msg)
+            if on_status is not None:
+                on_status(msg)
 
         if not query and not force_wiki:
             return AgentResponse(thought="empty-input", actions=actions, output="Please enter a question.")
 
         if mode == "general_only":
             thought = "General-only: skip wiki and answer directly."
+            if on_status is not None:
+                on_status("mode=general_only: skip wiki retrieval")
             output = self._general_chat(
                 query=query,
                 actions=actions,
@@ -54,34 +64,38 @@ class WikiFirstAgent:
                 response_mode=response_mode,
                 target_file=target_file,
                 history=history,
+                on_token=on_token,
+                on_status=on_status,
             )
             self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
             return AgentResponse(thought=thought, actions=actions, output=output)
 
         thought = "Wiki-first: search wiki before final response."
+        if on_status is not None:
+            on_status("wiki_search: started")
 
         results, rw = (
             wiki_search_v2(query, limit=8, synonyms_path=self.config.wiki_strategy.synonyms_path) if query else ([], None)
         )
         if rw is not None:
-            actions.append(f"query_rewrite(keywords={rw.keywords[:6]}, expanded={rw.expanded_terms[:6]})")
-        actions.append(f"wiki_search_v2(query={query!r}) -> {len(results)}")
+            _act(f"query_rewrite(keywords={rw.keywords[:6]}, expanded={rw.expanded_terms[:6]})")
+        _act(f"wiki_search_v2(query={query!r}) -> {len(results)}")
 
         terms = self._build_query_terms(query, rw)
         reliable = self._filter_reliable_results(results, terms)
         if results and not reliable:
-            actions.append("wiki_relevance_filter: drop_all_low_relevance")
+            _act("wiki_relevance_filter: drop_all_low_relevance")
         elif reliable and len(reliable) < len(results):
-            actions.append(f"wiki_relevance_filter: keep={len(reliable)}/{len(results)}")
+            _act(f"wiki_relevance_filter: keep={len(reliable)}/{len(results)}")
 
         if reliable:
             reasons = [str(r.get("_hit_reason", "")) for r in reliable[:3]]
-            actions.append(f"wiki_hit_reason(top3={reasons})")
+            _act(f"wiki_hit_reason(top3={reasons})")
 
         chunks: list[dict[str, str]] = []
         for r in reliable[:3]:
             content = wiki_read_chunk(r["chunk_id"])
-            actions.append(f"wiki_read_chunk(chunk_id={r['chunk_id']})")
+            _act(f"wiki_read_chunk(chunk_id={r['chunk_id']})")
             chunks.append(
                 {
                     "chunk_id": str(r["chunk_id"]),
@@ -104,6 +118,8 @@ class WikiFirstAgent:
                 response_mode=response_mode,
                 target_file=target_file,
                 history=history,
+                on_token=on_token,
+                on_status=on_status,
             )
             if rw is not None and rw.suggest_terms:
                 output += "\n\nSuggested keywords: " + ", ".join(rw.suggest_terms[:6])
@@ -118,6 +134,8 @@ class WikiFirstAgent:
             response_mode=response_mode,
             target_file=target_file,
             history=history,
+            on_token=on_token,
+            on_status=on_status,
         )
         self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
         return AgentResponse(thought=thought, actions=actions, output=output)
@@ -177,6 +195,8 @@ class WikiFirstAgent:
         response_mode: ResponseMode = "answer",
         target_file: str = "",
         history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> str:
         context_blocks = []
         for idx, c in enumerate(chunks, start=1):
@@ -224,16 +244,36 @@ class WikiFirstAgent:
             )
 
         try:
-            llm_text = self.llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+            if on_status is not None:
+                on_status("llm_generate: wiki-grounded started")
+            parts: list[str] = []
+            for tok in self.llm.generate_stream(system_prompt=system_prompt, user_prompt=user_prompt):
+                if not tok:
+                    continue
+                parts.append(tok)
+                if on_token is not None:
+                    on_token(tok)
+            llm_text = "".join(parts).strip()
+            if not llm_text:
+                llm_text = self.llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
             actions.append(
                 f"llm_generate(provider={self.config.llm.provider}, model={self.config.llm.model}, mode=wiki:{response_mode})"
             )
+            if on_status is not None:
+                on_status("llm_generate: wiki-grounded completed")
             output = llm_text or "LLM returned empty output."
             if response_mode == "answer":
-                output = self._ensure_citations(output, chunks)
+                output2 = self._ensure_citations(output, chunks)
+                if on_token is not None and output2.startswith(output):
+                    tail = output2[len(output):]
+                    if tail:
+                        on_token(tail)
+                output = output2
             return output
         except Exception as e:  # noqa: BLE001
             actions.append(f"llm_generate(failed, mode=wiki:{response_mode})")
+            if on_status is not None:
+                on_status(f"llm_generate: failed ({e})")
             snippet_text = "\n".join([f"- {c['title']} ({c['parent_file']})" for c in chunks])
             return (
                 f"LLM call failed: {e}\n\n"
@@ -249,6 +289,8 @@ class WikiFirstAgent:
         response_mode: ResponseMode = "answer",
         target_file: str = "",
         history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ) -> str:
         history_block = self._format_history_block(history)
 
@@ -270,13 +312,28 @@ class WikiFirstAgent:
             user_prompt = f"User question:\n{query}{history_block}{code_part}"
 
         try:
-            llm_text = self.llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+            if on_status is not None:
+                on_status("llm_generate: general started")
+            parts: list[str] = []
+            for tok in self.llm.generate_stream(system_prompt=system_prompt, user_prompt=user_prompt):
+                if not tok:
+                    continue
+                parts.append(tok)
+                if on_token is not None:
+                    on_token(tok)
+            llm_text = "".join(parts).strip()
+            if not llm_text:
+                llm_text = self.llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
             actions.append(
                 f"llm_generate(provider={self.config.llm.provider}, model={self.config.llm.model}, mode=general:{response_mode})"
             )
+            if on_status is not None:
+                on_status("llm_generate: general completed")
             return llm_text or "LLM returned empty output."
         except Exception as e:  # noqa: BLE001
             actions.append(f"llm_generate(failed, mode=general:{response_mode})")
+            if on_status is not None:
+                on_status(f"llm_generate: failed ({e})")
             return f"Wiki miss and general LLM call failed: {e}\nPlease verify llm.api_key / provider config."
 
     @staticmethod

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -13,6 +14,8 @@ from src.utils.config import LLMConfig
 class LLMClient:
     JIUTIAN_CHAT_URL = "https://jiutian.10086.cn/largemodel/moma/api/v3/chat/completions"
     JIUTIAN_BASE_URL = "https://jiutian.10086.cn/largemodel/moma/api/v3"
+    JIUTIAN_IMAGE_UNDERSTAND_URL = "https://jiutian.10086.cn/largemodel/moma/api/v3/image/text"
+    JIUTIAN_IMAGE_GENERATE_URL = "https://jiutian.10086.cn/largemodel/moma/api/v3/images/generations"
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
@@ -26,6 +29,15 @@ class LLMClient:
         if self.provider in {"google_api_studio", "google", "gemini"}:
             return self._call_google(system_prompt, user_prompt)
         return self._call_openai(system_prompt, user_prompt)
+
+    def generate_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        if self.provider == "jiutian":
+            yield from self._call_jiutian_chat_stream(system_prompt, user_prompt)
+            return
+        # fallback: non-stream providers emit once
+        text = self.generate(system_prompt, user_prompt)
+        if text:
+            yield text
 
     def image_understand(self, prompt: str, image_url: str) -> str:
         if self.provider != "jiutian":
@@ -147,6 +159,41 @@ class LLMClient:
             data = self._post_json_jiutian(self._jiutian_chat_url(), payload, headers)
             return self._extract_text_response(data)
 
+    def _call_jiutian_chat_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        if not self.config.api_key:
+            raise RuntimeError("Missing Jiutian API key. Set llm.api_key or JIUTIAN_API_KEY.")
+        try:
+            from openai import OpenAI  # type: ignore
+
+            client = OpenAI(
+                base_url=self._jiutian_base_url(),
+                api_key=self.config.api_key,
+            )
+            stream = client.chat.completions.create(
+                model=self.config.model or "jiutian-think-v3",
+                temperature=self.config.temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=True,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                piece = ""
+                if hasattr(delta, "content") and delta.content:
+                    piece = str(delta.content)
+                if piece:
+                    yield piece
+            return
+        except Exception:
+            # fallback to one-shot request
+            text = self._call_jiutian_chat(system_prompt, user_prompt)
+            if text:
+                yield text
+
     def _call_google(self, system_prompt: str, user_prompt: str) -> str:
         if not self.config.api_key:
             raise RuntimeError("Missing Google API key. Set llm.api_key or GOOGLE_API_KEY.")
@@ -231,13 +278,13 @@ class LLMClient:
         raw = (self.config.image_understand_url or "").strip()
         if raw:
             return raw.rstrip("/")
-        return self._jiutian_chat_url()
+        return self.JIUTIAN_IMAGE_UNDERSTAND_URL
 
     def _jiutian_image_generate_url(self) -> str:
         raw = (self.config.image_generate_url or "").strip()
         if raw:
             return raw.rstrip("/")
-        return self._jiutian_chat_url()
+        return self.JIUTIAN_IMAGE_GENERATE_URL
 
     def _post_json_jiutian(self, url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         try:

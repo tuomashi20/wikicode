@@ -19,6 +19,7 @@ class LLMConfig:
     model: str
     api_key: str
     base_url: str | None
+    image_asset_host: str | None
     image_understand_model: str | None
     image_generate_model: str | None
     image_understand_url: str | None
@@ -257,6 +258,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             model=str(llm_data.get("model", "jiutian-think-v3")),
             api_key=_read_api_key(llm_data),
             base_url=llm_data.get("base_url"),
+            image_asset_host=llm_data.get("image_asset_host"),
             image_understand_model=llm_data.get("image_understand_model"),
             image_generate_model=llm_data.get("image_generate_model"),
             image_understand_url=llm_data.get("image_understand_url"),

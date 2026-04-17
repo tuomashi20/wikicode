@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import queue
 import re
 import subprocess
 import sys
@@ -24,6 +26,18 @@ try:
     import msvcrt  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover
     msvcrt = None
+try:
+    import ctypes  # type: ignore
+except Exception:  # pragma: no cover
+    ctypes = None
+try:
+    import select
+    import termios
+    import tty
+except Exception:  # pragma: no cover
+    select = None
+    termios = None
+    tty = None
 
 from src.core.agent import AgentResponse, WikiFirstAgent
 from src.core.atomizer import Atomizer
@@ -46,13 +60,14 @@ from src.skills.code_tools import (
     write_file,
 )
 from src.skills.wiki_tools import wiki_list_structure
-from src.utils.config import AppConfig, DEFAULT_CONFIG_PATH, ensure_workspace, load_config
+from src.utils.config import AppConfig, DEFAULT_CONFIG_PATH, PROJECT_ROOT, ensure_workspace, load_config
 from src.utils.kb_backup import list_kb_backups, restore_kb_backup, save_kb_backup
 from src.utils.db_manager import clear_index_store, resolve_db_path
 
 
 app = typer.Typer(help="WikiCoder CLI")
 console = Console()
+SESSION_STATE_PATH = PROJECT_ROOT / ".wikicoder" / "session_state.json"
 
 CLI_BANNER = r"""
 ██╗    ██╗██╗██╗  ██╗██╗ ██████╗ ██████╗ ██████╗ ███████╗██████╗
@@ -77,8 +92,12 @@ class SlashCommandCompleter(Completer):
             ("/vaultpath ", "设置知识库根目录"),
             ("/ask ", "强制 Wiki 模式提问"),
             ("/structure", "查看索引结构"),
+            ("/model", "查看/切换模型配置"),
             ("/mode ", "切换会话模式"),
+            ("/resume", "继续上次会话上下文"),
             ("/reset", "清空会话记忆"),
+            ("/memdraft ", "将最近对话整理为wiki草稿"),
+            ("/memsave ", "保存wiki草稿到raw/faq"),
             ("/exit", "退出 CLI"),
             ("/help advanced", "查看高级命令"),
         ]
@@ -110,27 +129,96 @@ def build_key_bindings() -> KeyBindings:
     def _(event):
         buf = event.app.current_buffer
         if buf.complete_state and buf.complete_state.current_completion is not None:
-            # 回车优先选中当前下拉项（贴近常见 CLI 习惯）
+            # 回车：选中当前下拉项后直接发送命令
             buf.apply_completion(buf.complete_state.current_completion)
+            buf.validate_and_handle()
             return
+        # 若已弹出补全但未显式选中，回车默认选择第一项并执行
+        if buf.complete_state and getattr(buf.complete_state, "completions", None):
+            first = buf.complete_state.completions[0]
+            if first is not None:
+                buf.apply_completion(first)
+                buf.validate_and_handle()
+                return
+        # 若没有弹层但输入是斜杠命令前缀，自动补全唯一命令并执行（如 /e -> /exit）
+        text = (buf.text or "").strip()
+        comp = getattr(buf, "completer", None)
+        cmd_list = getattr(comp, "commands", None)
+        if text.startswith("/") and isinstance(cmd_list, list):
+            matches = [c for c, _ in cmd_list if c.startswith(text)]
+            if len(matches) == 1:
+                buf.text = matches[0]
+                buf.cursor_position = len(matches[0])
+                buf.validate_and_handle()
+                return
         buf.validate_and_handle()
 
     return kb
 
 
 def _escape_pressed() -> bool:
-    if msvcrt is None:
-        return False
-    pressed = False
-    while msvcrt.kbhit():
-        ch = msvcrt.getch()
-        if ch in (b"\x00", b"\xe0"):
-            if msvcrt.kbhit():
-                msvcrt.getch()
-            continue
-        if ch == b"\x1b":
-            pressed = True
-    return pressed
+    # Windows
+    if os.name == "nt":
+        # 1) 直接查键盘状态（更稳定）
+        try:
+            if ctypes is not None and bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000):  # VK_ESCAPE
+                return True
+        except Exception:
+            pass
+
+        # 2) 读取控制台缓冲区按键（兼容不同输入法/终端）
+        if msvcrt is None:
+            return False
+        pressed = False
+        while msvcrt.kbhit():
+            ch = msvcrt.getch()
+            if ch in (b"\x00", b"\xe0"):
+                if msvcrt.kbhit():
+                    msvcrt.getch()
+                continue
+            if ch in (b"\x1b",):
+                pressed = True
+        return pressed
+
+    # Linux/macOS (needs stdin in cbreak/raw mode to be truly immediate)
+    if os.name != "nt" and select is not None and sys.stdin and sys.stdin.isatty():
+        pressed = False
+        try:
+            while True:
+                r, _, _ = select.select([sys.stdin], [], [], 0)
+                if not r:
+                    break
+                ch = os.read(sys.stdin.fileno(), 1)
+                if ch == b"\x1b":
+                    pressed = True
+            return pressed
+        except Exception:
+            return False
+    return False
+
+
+def _enable_posix_cbreak_if_needed():
+    if os.name == "nt" or termios is None or tty is None:
+        return None
+    try:
+        if not sys.stdin or not sys.stdin.isatty():
+            return None
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return (fd, old)
+    except Exception:
+        return None
+
+
+def _restore_posix_terminal(state) -> None:
+    if not state or termios is None:
+        return
+    try:
+        fd, old = state
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        pass
 
 
 def _print_startup_banner() -> None:
@@ -138,6 +226,111 @@ def _print_startup_banner() -> None:
     console.print(f"[bold cyan]{CLI_BANNER}[/bold cyan]")
     console.print("[bold cyan]wikicoder[/bold cyan]")
     console.print("[bold]wikicoder cli[/bold]  输入 /help 查看详细命令")
+
+
+def _safe_filename(name: str, default: str = "memory_note") -> str:
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", (name or "").strip())
+    s = re.sub(r"\s+", "_", s).strip("._")
+    return s or default
+
+
+def _save_memory_markdown(config: AppConfig, title: str, markdown_text: str) -> Path:
+    raw_root = config.wiki_strategy.raw_path
+    faq_dir = raw_root / "faq"
+    faq_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{ts}_{_safe_filename(title)}.md"
+    out = faq_dir / filename
+    out.write_text(markdown_text, encoding="utf-8")
+    return out
+
+
+def _looks_like_image_generate_request(text: str) -> bool:
+    t = text.strip().lower()
+    keys = ["生成图片", "画一张", "帮我画", "生成一张", "做一张图", "出一张图", "image generate", "draw"]
+    if any(k in t for k in keys):
+        return True
+    return False
+
+
+def _extract_image_generate_prompt(text: str) -> str:
+    s = text.strip()
+    s = re.sub(r"^(请|麻烦|帮我|请帮我)\s*", "", s)
+    s = re.sub(r"(生成|画|绘制)(一张|个|幅)?", "", s)
+    s = s.replace("图片", "").replace("图像", "").strip(" ：:，,。")
+    return s or text.strip()
+
+
+def _extract_first_image_url(text: str) -> str:
+    m = re.search(r"https?://[^\s]+", text, flags=re.IGNORECASE)
+    return m.group(0).strip() if m else ""
+
+
+def _looks_like_image_understand_request(text: str) -> bool:
+    t = text.strip().lower()
+    if not _extract_first_image_url(t):
+        return False
+    keys = ["识别", "看图", "读图", "图里", "这张图", "图片内容", "ocr", "提取文字", "描述图片"]
+    return any(k in t for k in keys)
+
+
+def _extract_image_understand_prompt(text: str) -> tuple[str, str]:
+    url = _extract_first_image_url(text)
+    q = text.replace(url, "").strip(" ：:，,。") if url else text.strip()
+    return (q or "请描述这张图并提取关键信息"), url
+
+
+def _save_session_state(history: list[tuple[str, str]], *, mode: str) -> None:
+    try:
+        SESSION_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "mode": mode,
+            "history": [{"q": q, "a": a} for q, a in history[-30:]],
+        }
+        SESSION_STATE_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_session_state() -> tuple[list[tuple[str, str]], str]:
+    if not SESSION_STATE_PATH.exists():
+        return [], "auto"
+    try:
+        data = json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
+        rows = data.get("history") or []
+        mode = str(data.get("mode", "auto")).strip().lower()
+        if mode not in {"auto", "wiki_only", "general_only"}:
+            mode = "auto"
+        out: list[tuple[str, str]] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            q = str(r.get("q", "")).strip()
+            a = str(r.get("a", "")).strip()
+            if q and a:
+                out.append((q, a))
+        return out[-30:], mode
+    except Exception:
+        return [], "auto"
+
+
+def _clear_session_state_file() -> None:
+    try:
+        if SESSION_STATE_PATH.exists():
+            SESSION_STATE_PATH.unlink()
+    except Exception:
+        pass
+
+
+def _replay_session_on_screen(history: list[tuple[str, str]]) -> None:
+    if not history:
+        return
+    console.print("[cyan]—— 已恢复历史对话 ——[/cyan]")
+    for q, a in history:
+        console.print(f"[black on bright_cyan] You: {q} [/black on bright_cyan]")
+        _stream_markdown(a, enabled=False)
+    console.print("[cyan]—— 历史对话结束 ——[/cyan]")
 
 
 def _extract_python_code(text: str) -> str:
@@ -493,6 +686,9 @@ def _run_agent_with_thinking(
     history: list[tuple[str, str]] | None = None,
 ):
     state: dict[str, object] = {}
+    token_q: "queue.Queue[str]" = queue.Queue()
+    status_q: "queue.Queue[str]" = queue.Queue()
+    seen_status: set[str] = set()
 
     def _work() -> None:
         try:
@@ -504,6 +700,8 @@ def _run_agent_with_thinking(
                 response_mode=response_mode,  # type: ignore[arg-type]
                 target_file=target_file,
                 history=history,
+                on_token=lambda s: token_q.put(s),
+                on_status=lambda s: status_q.put(s),
             )
         except Exception as exc:  # noqa: BLE001
             state["err"] = exc
@@ -514,32 +712,203 @@ def _run_agent_with_thinking(
     frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     idx = 0
     start = time.perf_counter()
+    streamed = False
 
-    with Live("", console=console, refresh_per_second=12, transient=True) as live:
-        while t.is_alive():
-            elapsed = time.perf_counter() - start
-            phase = "检索 Wiki + 调用模型"
-            if mode == "general_only":
-                phase = "调用通用模型"
-            elif mode == "wiki_only":
-                phase = "仅检索 Wiki"
-            live.update(
-                f"[bold cyan]{frames[idx % len(frames)]} 思考中 {elapsed:.1f}s[/bold cyan] "
-                f"[dim]（{phase}，按 ESC 取消本次提问）[/dim]"
-            )
-            idx += 1
+    term_state = _enable_posix_cbreak_if_needed()
+    try:
+        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+            while t.is_alive() or (not token_q.empty()):
+                while True:
+                    try:
+                        st = status_q.get_nowait()
+                    except Exception:
+                        break
+                    if st in seen_status:
+                        continue
+                    seen_status.add(st)
+                    console.print(f"[dim]step: {st}[/dim]")
 
-            if _escape_pressed():
-                return AgentResponse(
-                    thought="cancelled-by-user",
-                    actions=["cancelled: ESC pressed"],
-                    output="已取消本次提问。",
-                )
-            time.sleep(0.1)
+                chunks: list[str] = []
+                while True:
+                    try:
+                        chunks.append(token_q.get_nowait())
+                    except Exception:
+                        break
+                if chunks:
+                    if not streamed:
+                        streamed = True
+                        live.stop()
+                    console.print("".join(chunks), end="")
+
+                elapsed = time.perf_counter() - start
+                phase = "检索 Wiki + 调用模型"
+                if mode == "general_only":
+                    phase = "调用通用模型"
+                elif mode == "wiki_only":
+                    phase = "仅检索 Wiki"
+                if not streamed:
+                    live.update(
+                        f"[bold cyan]{frames[idx % len(frames)]} 思考中 {elapsed:.1f}s[/bold cyan] "
+                        f"[dim]（{phase}，按 ESC 取消本次提问；Windows 可用 Ctrl+C）[/dim]"
+                    )
+                idx += 1
+
+                if _escape_pressed():
+                    return AgentResponse(
+                        thought="cancelled-by-user",
+                        actions=["cancelled: ESC pressed"],
+                        output="已取消本次提问。",
+                    )
+                time.sleep(0.1)
+    finally:
+        _restore_posix_terminal(term_state)
+
+    if streamed:
+        console.print()
 
     if "err" in state:
         raise state["err"]  # type: ignore[misc]
-    return state["resp"]  # type: ignore[return-value]
+    resp = state["resp"]  # type: ignore[assignment]
+    try:
+        setattr(resp, "_already_streamed", streamed)
+    except Exception:
+        pass
+    return resp  # type: ignore[return-value]
+
+
+def _run_llm_with_thinking(llm: LLMClient, *, system_prompt: str, user_prompt: str, phase: str = "整理中") -> str:
+    state: dict[str, object] = {}
+
+    def _work() -> None:
+        try:
+            state["text"] = llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+        except Exception as exc:  # noqa: BLE001
+            state["err"] = exc
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    idx = 0
+    start = time.perf_counter()
+    cancelled = False
+
+    term_state = _enable_posix_cbreak_if_needed()
+    try:
+        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+            while t.is_alive():
+                elapsed = time.perf_counter() - start
+                live.update(
+                    f"[bold cyan]{frames[idx % len(frames)]} {phase} {elapsed:.1f}s[/bold cyan] "
+                    "[dim]（按 ESC 取消；Windows 可用 Ctrl+C）[/dim]"
+                )
+                idx += 1
+                if _escape_pressed():
+                    cancelled = True
+                    break
+                time.sleep(0.1)
+    finally:
+        _restore_posix_terminal(term_state)
+
+    if cancelled:
+        return ""
+    if "err" in state:
+        raise state["err"]  # type: ignore[misc]
+    return str(state.get("text", "")).strip()
+
+
+def _run_image_generate_with_thinking(
+    llm: LLMClient,
+    *,
+    prompt: str,
+    size: str = "1024x1024",
+    phase: str = "图片生成中",
+) -> str:
+    state: dict[str, object] = {}
+
+    def _work() -> None:
+        try:
+            state["text"] = llm.image_generate(prompt=prompt, size=size)
+        except Exception as exc:  # noqa: BLE001
+            state["err"] = exc
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    idx = 0
+    start = time.perf_counter()
+    cancelled = False
+
+    term_state = _enable_posix_cbreak_if_needed()
+    try:
+        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+            while t.is_alive():
+                elapsed = time.perf_counter() - start
+                live.update(
+                    f"[bold cyan]{frames[idx % len(frames)]} {phase} {elapsed:.1f}s[/bold cyan] "
+                    "[dim]（按 ESC 取消；Windows 可用 Ctrl+C）[/dim]"
+                )
+                idx += 1
+                if _escape_pressed():
+                    cancelled = True
+                    break
+                time.sleep(0.1)
+    finally:
+        _restore_posix_terminal(term_state)
+
+    if cancelled:
+        return ""
+    if "err" in state:
+        raise state["err"]  # type: ignore[misc]
+    return str(state.get("text", "")).strip()
+
+
+def _run_image_understand_with_thinking(
+    llm: LLMClient,
+    *,
+    prompt: str,
+    image_url: str,
+    phase: str = "图片理解中",
+) -> str:
+    state: dict[str, object] = {}
+
+    def _work() -> None:
+        try:
+            state["text"] = llm.image_understand(prompt=prompt, image_url=image_url)
+        except Exception as exc:  # noqa: BLE001
+            state["err"] = exc
+
+    t = threading.Thread(target=_work, daemon=True)
+    t.start()
+
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    idx = 0
+    start = time.perf_counter()
+    cancelled = False
+
+    term_state = _enable_posix_cbreak_if_needed()
+    try:
+        with Live("", console=console, refresh_per_second=12, transient=True) as live:
+            while t.is_alive():
+                elapsed = time.perf_counter() - start
+                live.update(
+                    f"[bold cyan]{frames[idx % len(frames)]} {phase} {elapsed:.1f}s[/bold cyan] "
+                    "[dim]（按 ESC 取消；Windows 可用 Ctrl+C）[/dim]"
+                )
+                idx += 1
+                if _escape_pressed():
+                    cancelled = True
+                    break
+                time.sleep(0.1)
+    finally:
+        _restore_posix_terminal(term_state)
+
+    if cancelled:
+        return ""
+    if "err" in state:
+        raise state["err"]  # type: ignore[misc]
+    return str(state.get("text", "")).strip()
 
 
 def _print_trace(resp_thought: str, resp_actions: list[str]) -> None:
@@ -586,6 +955,66 @@ def _set_vault_path(path_str: str) -> tuple[bool, str]:
     return True, f"已更新 vault_path 为: {path_str}（raw/wiki/processed 将自动在该目录下构建）"
 
 
+def _set_model_config(model_cmd: str) -> tuple[bool, str]:
+    cmd = model_cmd.strip()
+    cfg_path = DEFAULT_CONFIG_PATH
+    data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    if not isinstance(data, dict):
+        data = {}
+    llm = data.get("llm") or {}
+    if not isinstance(llm, dict):
+        llm = {}
+    key = cmd.lower()
+    if key in {"jiutian-think-v3", "think"}:
+        llm["provider"] = "jiutian"
+        llm["model"] = "jiutian-think-v3"
+        msg = "已切换文本模型为：jiutian-think-v3（思考模型）"
+    elif key in {"jiutian-lan-comv3", "chat", "dialog"}:
+        llm["provider"] = "jiutian"
+        llm["model"] = "jiutian-lan-comv3"
+        msg = "已切换文本模型为：jiutian-lan-comv3（对话模型）"
+    else:
+        return False, (
+            "用法：/model <name>\n"
+            "可选：jiutian-think-v3 | jiutian-lan-comv3\n"
+            "别名：think/chat\n"
+            "说明：图片理解/图片生成模型会根据问题自动切换。"
+        )
+
+    data["llm"] = llm
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return True, msg
+
+
+def _print_runtime_settings(config: AppConfig, *, session_mode: str) -> None:
+    llm = config.llm
+    ws = config.wiki_strategy
+    console.print(
+        "[dim]"
+        f"provider={llm.provider} | text_model={llm.model} | session_mode={session_mode}\n"
+        f"img2text_model={llm.image_understand_model or '-'} | imggen_model={llm.image_generate_model or '-'}\n"
+        f"raw={ws.raw_path}\nwiki={ws.wiki_path}\nprocessed={ws.processed_path}"
+        "[/dim]"
+    )
+
+
+def _ensure_auto_image_models(config: AppConfig) -> None:
+    # 自动兜底：不要求用户手动设置图片模型
+    if config.llm.provider.strip().lower() != "jiutian":
+        return
+    if not (config.llm.image_understand_model or "").strip():
+        config.llm.image_understand_model = "LLMImage2Text"
+    if not (config.llm.image_understand_url or "").strip():
+        config.llm.image_understand_url = LLMClient.JIUTIAN_IMAGE_UNDERSTAND_URL
+    if not (config.llm.image_generate_model or "").strip():
+        config.llm.image_generate_model = "cntxt2image"
+    if not (config.llm.image_generate_url or "").strip():
+        config.llm.image_generate_url = LLMClient.JIUTIAN_IMAGE_GENERATE_URL
+    if not (config.llm.image_asset_host or "").strip():
+        config.llm.image_asset_host = "https://jiutian.10086.cn"
+
+
 def _extract_image_fields(obj: object) -> tuple[list[str], list[str], list[str]]:
     urls: list[str] = []
     b64s: list[str] = []
@@ -596,8 +1025,8 @@ def _extract_image_fields(obj: object) -> tuple[list[str], list[str], list[str]]
             for k, v in x.items():
                 lk = str(k).lower()
                 if isinstance(v, str):
-                    if lk in {"url", "image_url"} and (v.startswith("http://") or v.startswith("https://")):
-                        urls.append(v)
+                    if lk in {"url", "image_url"} and v.strip():
+                        urls.append(v.strip())
                     elif "base64" in lk or lk in {"b64_json", "image"}:
                         # simple heuristic: long base64-like string
                         if len(v) > 100 and all(ch.isalnum() or ch in "+/=\n\r" for ch in v[:200]):
@@ -618,7 +1047,26 @@ def _extract_image_fields(obj: object) -> tuple[list[str], list[str], list[str]]
     return urls, b64s, texts
 
 
-def _save_image_result(raw_result: str, save_dir: str, prefix: str) -> tuple[list[str], list[str], str]:
+def _normalize_image_url(url: str, image_asset_host: str | None = None) -> str:
+    u = (url or "").strip()
+    if not u:
+        return u
+    if u.startswith("http://") or u.startswith("https://"):
+        return u
+    host = (image_asset_host or "https://jiutian.10086.cn").strip().rstrip("/")
+    if not host.startswith("http://") and not host.startswith("https://"):
+        host = f"https://{host}"
+    if u.startswith("/"):
+        return f"{host}{u}"
+    return f"{host}/{u}"
+
+
+def _save_image_result(
+    raw_result: str,
+    save_dir: str,
+    prefix: str,
+    image_asset_host: str | None = None,
+) -> tuple[list[str], list[str], str]:
     out_dir = Path(save_dir)
     if not out_dir.is_absolute():
         out_dir = (Path.cwd() / out_dir).resolve()
@@ -633,6 +1081,7 @@ def _save_image_result(raw_result: str, save_dir: str, prefix: str) -> tuple[lis
     try:
         payload = json.loads(raw_result)
         urls, b64s, _ = _extract_image_fields(payload)
+        urls = [_normalize_image_url(u, image_asset_host=image_asset_host) for u in urls if u.strip()]
         for idx, b64 in enumerate(b64s, start=1):
             try:
                 data = base64.b64decode(b64, validate=False)
@@ -967,7 +1416,9 @@ def image_understand(
 ) -> None:
     """Use Jiutian image understanding model."""
     ensure_workspace()
-    llm = build_llm()
+    cfg = load_config()
+    _ensure_auto_image_models(cfg)
+    llm = build_llm(cfg)
     try:
         result = llm.image_understand(prompt=query, image_url=image_url)
     except Exception as e:  # noqa: BLE001
@@ -994,13 +1445,20 @@ def image_generate(
 ) -> None:
     """Use Jiutian image generation model."""
     ensure_workspace()
-    llm = build_llm()
+    cfg = load_config()
+    _ensure_auto_image_models(cfg)
+    llm = build_llm(cfg)
     try:
         result = llm.image_generate(prompt=prompt, size=size)
     except Exception as e:  # noqa: BLE001
         console.print(f"[red]{e}[/red]")
         return
-    urls, saved_files, meta_file = _save_image_result(result, save_dir=save_dir, prefix=prefix)
+    urls, saved_files, meta_file = _save_image_result(
+        result,
+        save_dir=save_dir,
+        prefix=prefix,
+        image_asset_host=cfg.llm.image_asset_host,
+    )
 
     if saved_files:
         console.print("[green]Saved images:[/green]")
@@ -1183,6 +1641,12 @@ def chat(
     last_backup_id = ""
     session_history: list[tuple[str, str]] = []
     local_op_consent: dict[str, str] = {"mode": "ask"}
+    memory_draft = ""
+    memory_title = ""
+    _print_runtime_settings(config, session_mode=session_mode)
+    console.print(f"[dim]当前会话模式: mode={session_mode}[/dim]")
+    if SESSION_STATE_PATH.exists():
+        console.print("[dim]检测到上次会话记录，可输入 /resume 继续上下文。[/dim]")
 
     while True:
         try:
@@ -1206,6 +1670,10 @@ def chat(
             "kbclear all yes",
             "kbbackups",
             "kbsave",
+            "resume",
+            "memdraft",
+            "memsave",
+            "model",
         }:
             cmd = f"/{cmd}"
 
@@ -1220,6 +1688,7 @@ def chat(
                 "/vaultpath <目录>  设置知识库根目录（自动派生 raw/wiki/wiki_processed）\n"
                 "/sync               执行同步（增量）：RAW -> 索引 -> WIKI 页面\n"
                 "/structure          查看当前索引结构（文件与 chunk 数）\n"
+                "/model [name]       查看/切换文本模型（think/chat）\n"
                 "/kbclear yes        清空索引（chunks + sqlite）\n"
                 "/kbclear all yes    清空索引 + wiki 页面（保留 raw 原文件）\n\n"
                 "/kbsave [name]      备份知识库（raw/wiki/processed）\n"
@@ -1230,7 +1699,10 @@ def chat(
                 "  - auto: 先检索 wiki，未命中回退通用模型\n"
                 "  - wiki_only: 仅 wiki，不回退\n"
                 "  - general_only: 直接通用模型\n"
+                "/resume             恢复上次会话上下文（最近30轮）\n"
                 "/ask <问题>         强制 Wiki 模式提问\n"
+                "/memdraft [标题]    将本轮会话整理为 wiki 文档草稿\n"
+                "/memsave [标题]     将草稿保存到 raw/faq 目录\n"
                 "/reset              清空当前会话记忆\n\n"
                 "[cyan]三、评测与回归[/cyan]\n"
                 "/eval <cases> [topk] [out]         运行检索评测（recall/top1/mrr）\n"
@@ -1591,11 +2063,107 @@ def chat(
                 continue
             session_mode = val
             console.print(f"[cyan]session mode = {session_mode}[/cyan]")
+            _save_session_state(session_history, mode=session_mode)
+            continue
+
+        if cmd == "/model":
+            config = load_config()
+            _print_runtime_settings(config, session_mode=session_mode)
+            console.print(
+                "[cyan]可切换：/model jiutian-think-v3 | /model jiutian-lan-comv3[/cyan]\n"
+                "[dim]图片理解/图片生成模型会根据问题自动切换。[/dim]"
+            )
+            continue
+
+        if cmd.startswith("/model "):
+            model_name = cmd.split(" ", 1)[1].strip()
+            ok, msg = _set_model_config(model_name)
+            if not ok:
+                console.print(f"[yellow]{msg}[/yellow]")
+                continue
+            console.print(f"[green]{msg}[/green]")
+            config = load_config()
+            agent = build_agent(config)
+            _print_runtime_settings(config, session_mode=session_mode)
+            continue
+
+        if cmd == "/resume":
+            old_hist, old_mode = _load_session_state()
+            if not old_hist:
+                console.print("[yellow]没有可恢复的上次会话记录。[/yellow]")
+                continue
+            session_history = old_hist
+            session_mode = old_mode
+            console.print(f"[green]已恢复上次会话[/green]：{len(session_history)} 轮，mode={session_mode}")
+            _replay_session_on_screen(session_history)
             continue
 
         if cmd == "/reset":
             session_history = []
             console.print("[cyan]已清空会话上下文记忆。[/cyan]")
+            _clear_session_state_file()
+            continue
+
+        if cmd == "/memdraft" or cmd.startswith("/memdraft "):
+            title_hint = cmd.split(" ", 1)[1].strip() if cmd.startswith("/memdraft ") else ""
+            if not session_history:
+                console.print("[yellow]当前会话暂无可整理内容。请先进行几轮问答。[/yellow]")
+                continue
+            llm = build_llm(config)
+            hist_text = "\n\n".join(
+                [f"### 用户问题\n{q}\n\n### 助手回答\n{a}" for q, a in session_history[-12:]]
+            )
+            system_prompt = (
+                "你是知识工程师。请把给定对话整理为可直接入库的中文 Wiki Markdown 文档。"
+                "要求：结构清晰、可复用、避免口语、不要编造事实。"
+            )
+            user_prompt = (
+                f"文档标题建议：{title_hint or '自动整理会话'}\n\n"
+                "请严格按以下结构输出 Markdown：\n"
+                "# 标题\n"
+                "## 背景\n"
+                "## 结论\n"
+                "## 详细说明\n"
+                "## 操作步骤\n"
+                "## 注意事项\n"
+                "## 标签\n"
+                "对话内容如下：\n\n"
+                f"{hist_text}"
+            )
+            try:
+                draft = _run_llm_with_thinking(
+                    llm,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    phase="整理会话为Wiki文档中",
+                ).strip()
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]生成草稿失败：{e}[/red]")
+                continue
+            if not draft:
+                console.print("[yellow]已取消或草稿为空，请重试。[/yellow]")
+                continue
+            memory_draft = draft
+            m = re.search(r"^#\s+(.+)$", draft, flags=re.MULTILINE)
+            memory_title = (m.group(1).strip() if m else title_hint or "会话整理")
+            console.print(f"[green]已生成草稿[/green]：{memory_title}")
+            _stream_markdown(draft, enabled=False)
+            console.print("[cyan]可执行 /memsave [标题] 保存到 raw/faq，并随后 /sync[/cyan]")
+            continue
+
+        if cmd == "/memsave" or cmd.startswith("/memsave "):
+            if not memory_draft:
+                console.print("[yellow]当前没有草稿。请先执行 /memdraft[/yellow]")
+                continue
+            title = cmd.split(" ", 1)[1].strip() if cmd.startswith("/memsave ") else memory_title
+            title = title or memory_title or "会话整理"
+            try:
+                out = _save_memory_markdown(config, title, memory_draft)
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[red]保存失败：{e}[/red]")
+                continue
+            console.print(f"[green]已保存：{out}[/green]")
+            console.print("[cyan]请执行 /sync 将该记忆纳入检索。[/cyan]")
             continue
 
         remember_turn = False
@@ -1694,17 +2262,108 @@ def chat(
             last_patch_allowed = set(file_list)
         else:
             console.print(f"[black on bright_cyan] You: {cmd} [/black on bright_cyan]")
-            auto_ctx = _extract_existing_py_context(cmd)
-            resp = _run_agent_with_thinking(
-                agent,
-                user_input=cmd,
-                force_wiki=False,
-                code_context=auto_ctx,
-                history=session_history,
-                mode=session_mode,
-            )
-            remember_turn = True
-            plain_chat_turn = True
+            if _looks_like_image_understand_request(cmd):
+                config = load_config()
+                _ensure_auto_image_models(config)
+                llm = build_llm(config)
+                q, img_url = _extract_image_understand_prompt(cmd)
+                try:
+                    result = _run_image_understand_with_thinking(
+                        llm,
+                        prompt=q,
+                        image_url=img_url,
+                        phase="图片理解中",
+                    )
+                    if not result:
+                        resp = AgentResponse(
+                            thought="cancelled-by-user",
+                            actions=["cancelled: ESC pressed"],
+                            output="已取消本次图片理解。",
+                        )
+                        remember_turn = False
+                    else:
+                        text_out = result
+                        try:
+                            payload = json.loads(result)
+                            _, _, texts = _extract_image_fields(payload)
+                            if texts:
+                                text_out = "\n\n".join(texts[:5])
+                        except Exception:
+                            pass
+                        resp = AgentResponse(
+                            thought=f"image_understand(provider={config.llm.provider}, model={config.llm.image_understand_model})",
+                            actions=[f"image_understand(url='{img_url[:60]}...')"],
+                            output=text_out or "图片理解完成，但未返回可读文本。",
+                        )
+                        remember_turn = True
+                except Exception as e:  # noqa: BLE001
+                    resp = AgentResponse(
+                        thought="image_understand:failed",
+                        actions=["image_understand:error"],
+                        output=f"图片理解失败：{e}",
+                    )
+                    remember_turn = True
+                plain_chat_turn = False
+            elif _looks_like_image_generate_request(cmd):
+                config = load_config()
+                _ensure_auto_image_models(config)
+                llm = build_llm(config)
+                img_prompt = _extract_image_generate_prompt(cmd)
+                try:
+                    result = _run_image_generate_with_thinking(
+                        llm,
+                        prompt=img_prompt,
+                        size="1024x1024",
+                        phase="图片生成中",
+                    )
+                    if not result:
+                        resp = AgentResponse(
+                            thought="cancelled-by-user",
+                            actions=["cancelled: ESC pressed"],
+                            output="已取消本次图片生成。",
+                        )
+                        remember_turn = False
+                    else:
+                        urls, saved_files, meta_file = _save_image_result(
+                            result,
+                            save_dir="data/generated_images",
+                            prefix="imggen",
+                            image_asset_host=config.llm.image_asset_host,
+                        )
+                        lines = [f"已完成图片生成（模型：{config.llm.image_generate_model}）。"]
+                        if saved_files:
+                            lines.append("\n保存文件：")
+                            lines.extend([f"- {p}" for p in saved_files])
+                        if urls:
+                            lines.append("\n图片链接：")
+                            lines.extend([f"- {u}" for u in urls])
+                        lines.append(f"\n原始响应保存：{meta_file}")
+                        resp = AgentResponse(
+                            thought=f"image_generate(provider={config.llm.provider}, model={config.llm.image_generate_model})",
+                            actions=[f"image_generate(prompt='{img_prompt[:60]}...')"],
+                            output="\n".join(lines),
+                        )
+                        remember_turn = True
+                except Exception as e:  # noqa: BLE001
+                    resp = AgentResponse(
+                        thought="image_generate:failed",
+                        actions=["image_generate:error"],
+                        output=f"图片生成失败：{e}",
+                    )
+                    remember_turn = True
+                plain_chat_turn = False
+            else:
+                auto_ctx = _extract_existing_py_context(cmd)
+                resp = _run_agent_with_thinking(
+                    agent,
+                    user_input=cmd,
+                    force_wiki=False,
+                    code_context=auto_ctx,
+                    history=session_history,
+                    mode=session_mode,
+                )
+                remember_turn = True
+                plain_chat_turn = True
 
         if plain_chat_turn and resp.thought != "cancelled-by-user":
             resp = _auto_script_pipeline(
@@ -1721,11 +2380,13 @@ def chat(
         if resp.thought == "cancelled-by-user":
             remember_turn = False
 
-        _stream_markdown(resp.output, enabled=show_stream)
+        if not getattr(resp, "_already_streamed", False):
+            _stream_markdown(resp.output, enabled=show_stream)
         if remember_turn:
             session_history.append((cmd, resp.output))
             if len(session_history) > 12:
                 session_history = session_history[-12:]
+            _save_session_state(session_history, mode=session_mode)
         if resp.thought != "cancelled-by-user" and (cmd.startswith("/patch ") or cmd.startswith("/patchm ")):
             _print_patch_preview(resp.output)
 

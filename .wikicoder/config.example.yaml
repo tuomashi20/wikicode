@@ -3,6 +3,7 @@
   model: "jiutian-think-v3"
   api_key: "YOUR_JIUTIAN_API_KEY"
   base_url: null
+  image_asset_host: "https://jiutian.10086.cn"
   image_understand_model: null
   image_generate_model: null
   image_understand_url: null
