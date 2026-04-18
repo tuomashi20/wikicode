@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shutil
@@ -50,6 +51,27 @@ def write_file(path: str, content: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
 
+
+
+def _validate_python_syntax(path: str, content: str) -> tuple[bool, str]:
+    if not path.lower().endswith(".py"):
+        return True, ""
+    try:
+        ast.parse(content, filename=path)
+        return True, ""
+    except SyntaxError as e:
+        return False, f"Python syntax check failed: {e}"
+
+
+def extract_search_replace_blocks(text: str) -> list[tuple[str, str]]:
+    s = text.strip()
+    if not s:
+        return []
+    pattern = r"<<<<\s*SEARCH\s*\n([\s\S]*?)\n====\n([\s\S]*?)\n>>>>"
+    out: list[tuple[str, str]] = []
+    for m in re.finditer(pattern, s, flags=re.IGNORECASE):
+        out.append((m.group(1), m.group(2)))
+    return out
 
 
 def patch_apply(path: str, old: str, new: str) -> bool:
@@ -141,9 +163,7 @@ def _apply_unified_diff_block(path: str, block_text: str) -> tuple[bool, str]:
         return False, "No hunk found in diff."
 
     original_text = target.read_text(encoding="utf-8", errors="ignore")
-    orig = original_text.splitlines()
-    out: list[str] = []
-    src_idx = 0
+    current = original_text.splitlines()
 
     def parse_old_start(hdr: str) -> int:
         m = re.match(r"@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@", hdr)
@@ -151,55 +171,165 @@ def _apply_unified_diff_block(path: str, block_text: str) -> tuple[bool, str]:
             raise ValueError(f"Invalid hunk header: {hdr}")
         return int(m.group(1))
 
+    def normalize_loose(s: str) -> str:
+        return re.sub(r"\s+", " ", s.strip())
+
+    def parse_fragments(hunk_lines: list[str]) -> tuple[list[str], list[str]]:
+        old_frag: list[str] = []
+        new_frag: list[str] = []
+        for hl in hunk_lines:
+            if hl.startswith("\\ No newline at end of file"):
+                continue
+            if not hl:
+                marker, payload = " ", ""
+            else:
+                marker, payload = hl[0], hl[1:]
+            if marker == " ":
+                old_frag.append(payload)
+                new_frag.append(payload)
+            elif marker == "-":
+                old_frag.append(payload)
+            elif marker == "+":
+                new_frag.append(payload)
+        return old_frag, new_frag
+
+    def find_fragment(lines: list[str], frag: list[str], hint_idx: int) -> tuple[int, str]:
+        if not frag:
+            return max(0, min(len(lines), hint_idx)), "insert"
+
+        n = len(frag)
+        if n <= len(lines):
+            if lines[hint_idx : hint_idx + n] == frag:
+                return hint_idx, "exact_hint"
+
+        window = 120
+        lo = max(0, hint_idx - window)
+        hi = min(len(lines) - n, hint_idx + window) if len(lines) - n >= 0 else -1
+        if hi >= lo:
+            for i in range(lo, hi + 1):
+                if lines[i : i + n] == frag:
+                    return i, "exact_near"
+
+        for i in range(0, max(0, len(lines) - n) + 1):
+            if lines[i : i + n] == frag:
+                return i, "exact_global"
+
+        frag_loose = [normalize_loose(x) for x in frag]
+        if n <= len(lines):
+            if [normalize_loose(x) for x in lines[hint_idx : hint_idx + n]] == frag_loose:
+                return hint_idx, "loose_hint"
+        if hi >= lo:
+            for i in range(lo, hi + 1):
+                if [normalize_loose(x) for x in lines[i : i + n]] == frag_loose:
+                    return i, "loose_near"
+        for i in range(0, max(0, len(lines) - n) + 1):
+            if [normalize_loose(x) for x in lines[i : i + n]] == frag_loose:
+                return i, "loose_global"
+        return -1, "not_found"
+
+    fuzzy_modes: list[str] = []
     for hs_i, hs in enumerate(hunk_starts):
         old_start = parse_old_start(lines[hs])
         next_hs = hunk_starts[hs_i + 1] if hs_i + 1 < len(hunk_starts) else len(lines)
         hunk_lines = lines[hs + 1 : next_hs]
+        old_frag, new_frag = parse_fragments(hunk_lines)
 
-        copy_until = old_start - 1
-        if copy_until < src_idx:
-            return False, "Overlapping hunks or invalid patch positions."
+        hint_idx = max(0, old_start - 1)
+        found_idx, mode = find_fragment(current, old_frag, hint_idx)
+        if found_idx < 0:
+            sample = old_frag[0][:80] if old_frag else "(add-only hunk)"
+            return False, f"Cannot locate hunk context near: {sample}"
+        if mode.startswith("loose") or mode.endswith("global"):
+            fuzzy_modes.append(mode)
+        repl_end = found_idx + len(old_frag)
+        current = current[:found_idx] + new_frag + current[repl_end:]
 
-        out.extend(orig[src_idx:copy_until])
-        src_idx = copy_until
+    keep_trailing_newline = original_text.endswith("\n")
+    new_text = "\n".join(current)
+    if keep_trailing_newline:
+        new_text += "\n"
+    ok_py, py_msg = _validate_python_syntax(path, new_text)
+    if not ok_py:
+        return False, py_msg
+    target.write_text(new_text, encoding="utf-8")
+    if fuzzy_modes:
+        return True, f"Applied patch to {path} (fuzzy={','.join(sorted(set(fuzzy_modes)))})"
+    return True, f"Applied patch to {path}"
 
+
+
+def _collect_block_new_content(block_text: str) -> tuple[bool, str]:
+    lines = block_text.splitlines()
+    hunk_starts = [i for i, ln in enumerate(lines) if ln.startswith("@@")]
+    if not hunk_starts:
+        return False, "No hunk found in diff."
+    out: list[str] = []
+    for hs_i, hs in enumerate(hunk_starts):
+        next_hs = hunk_starts[hs_i + 1] if hs_i + 1 < len(hunk_starts) else len(lines)
+        hunk_lines = lines[hs + 1 : next_hs]
         for hl in hunk_lines:
+            if hl.startswith("\\ No newline at end of file"):
+                continue
             if not hl:
-                marker = " "
-                payload = ""
-            else:
-                marker, payload = hl[0], hl[1:]
-
-            if marker == " ":
-                if src_idx >= len(orig) or orig[src_idx] != payload:
-                    return False, f"Context mismatch near: {payload[:80]}"
-                out.append(orig[src_idx])
-                src_idx += 1
-            elif marker == "-":
-                if src_idx >= len(orig) or orig[src_idx] != payload:
-                    return False, f"Delete mismatch near: {payload[:80]}"
-                src_idx += 1
-            elif marker == "+":
+                out.append("")
+                continue
+            marker, payload = hl[0], hl[1:]
+            if marker in {" ", "+"}:
                 out.append(payload)
-            elif hl.startswith("\\ No newline at end of file"):
+            elif marker == "-":
                 continue
             else:
                 return False, f"Unsupported diff line: {hl[:80]}"
+    return True, "\n".join(out)
 
-    out.extend(orig[src_idx:])
-    keep_trailing_newline = original_text.endswith("\n")
-    new_text = "\n".join(out)
-    if keep_trailing_newline:
-        new_text += "\n"
-    target.write_text(new_text, encoding="utf-8")
-    return True, f"Applied patch to {path}"
 
+def _apply_create_block(path: str, block_text: str) -> tuple[bool, str]:
+    target = _safe_path(path)
+    if target.exists():
+        return False, f"Target already exists: {path}"
+    ok, content = _collect_block_new_content(block_text)
+    if not ok:
+        return False, content
+    final_content = (content + "\n") if content else ""
+    ok_py, py_msg = _validate_python_syntax(path, final_content)
+    if not ok_py:
+        return False, py_msg
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(final_content, encoding="utf-8")
+    return True, f"Created file: {path}"
+
+
+def _apply_delete_block(path: str) -> tuple[bool, str]:
+    target = _safe_path(path)
+    if not target.exists():
+        return True, f"Delete no-op (not found): {path}"
+    target.unlink()
+    return True, f"Deleted file: {path}"
+
+
+def apply_search_replace(path: str, patch_text: str) -> tuple[bool, str]:
+    blocks = extract_search_replace_blocks(patch_text)
+    if not blocks:
+        return False, "No search-replace block found."
+    p = _safe_path(path)
+    if not p.exists():
+        return False, f"Target file not found: {path}"
+    text = p.read_text(encoding="utf-8", errors="ignore")
+    for old, new in blocks:
+        if old not in text:
+            return False, f"SEARCH block not found in target: {old[:80]}"
+        text = text.replace(old, new, 1)
+    ok_py, py_msg = _validate_python_syntax(path, text)
+    if not ok_py:
+        return False, py_msg
+    p.write_text(text, encoding="utf-8")
+    return True, f"Applied search-replace to {path} ({len(blocks)} block(s))"
 
 
 def apply_unified_diff(path: str, patch_text: str) -> tuple[bool, str]:
     diff = extract_unified_diff(patch_text)
     if not diff:
-        return False, "No unified diff content found."
+        return apply_search_replace(path, patch_text)
 
     blocks = _split_diff_blocks(diff)
     if not blocks:
@@ -210,10 +340,19 @@ def apply_unified_diff(path: str, patch_text: str) -> tuple[bool, str]:
     for old_path, new_path, block in blocks:
         candidates = {_normalize_diff_path(old_path), _normalize_diff_path(new_path)}
         if norm_target in candidates:
+            if old_path.strip() == "/dev/null":
+                return _apply_create_block(path, block)
+            if new_path.strip() == "/dev/null":
+                return _apply_delete_block(path)
             return _apply_unified_diff_block(path, block)
 
     if len(blocks) == 1:
-        return _apply_unified_diff_block(path, blocks[0][2])
+        old_path, new_path, block = blocks[0]
+        if old_path.strip() == "/dev/null":
+            return _apply_create_block(path, block)
+        if new_path.strip() == "/dev/null":
+            return _apply_delete_block(path)
+        return _apply_unified_diff_block(path, block)
 
     return False, f"Patch has {len(blocks)} files but none matches target: {path}"
 
@@ -232,7 +371,9 @@ def apply_unified_diff_multi(patch_text: str, allowed_files: set[str] | None = N
     all_ok = True
 
     for old_path, new_path, block in blocks:
-        target = _normalize_diff_path(new_path or old_path)
+        is_create = old_path.strip() == "/dev/null"
+        is_delete = new_path.strip() == "/dev/null"
+        target = _normalize_diff_path((new_path if not is_delete else old_path) or old_path)
         if not target or target == "/dev/null":
             all_ok = False
             messages.append("Skip unsupported create/delete file block.")
@@ -243,7 +384,12 @@ def apply_unified_diff_multi(patch_text: str, allowed_files: set[str] | None = N
             messages.append(f"Skip not-allowed file: {target}")
             continue
 
-        ok, msg = _apply_unified_diff_block(target, block)
+        if is_create:
+            ok, msg = _apply_create_block(target, block)
+        elif is_delete:
+            ok, msg = _apply_delete_block(target)
+        else:
+            ok, msg = _apply_unified_diff_block(target, block)
         all_ok = all_ok and ok
         messages.append(msg)
 

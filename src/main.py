@@ -267,6 +267,71 @@ def _extract_image_generate_prompt(text: str) -> str:
     return s or text.strip()
 
 
+def _looks_like_kb_save_request(text: str) -> bool:
+    t = text.strip().lower()
+    keys = [
+        "写入本地知识库",
+        "写入知识库",
+        "保存到知识库",
+        "存入知识库",
+        "写入wiki",
+        "保存到wiki",
+    ]
+    return any(k in t for k in keys)
+
+
+def _extract_kb_title(text: str) -> str:
+    s = text.strip()
+    m = re.search(r"(标题|title)\s*[:：]\s*(.+)$", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(2).strip()
+    return ""
+
+
+def _extract_kb_content(text: str) -> str:
+    s = text.strip()
+    # 优先提取代码块中的正文
+    m_block = re.search(r"```(?:markdown|md|text)?\s*([\s\S]*?)\s*```", s, flags=re.IGNORECASE)
+    if m_block:
+        return m_block.group(1).strip()
+
+    # 其次提取“内容: ...”
+    m = re.search(r"(内容|正文|content)\s*[:：]\s*([\s\S]+)$", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(2).strip()
+    return ""
+
+
+def _build_kb_markdown_from_last_turn(history: list[tuple[str, str]], title_hint: str = "") -> tuple[str, str]:
+    if not history:
+        return "", ""
+    q, a = history[-1]
+    title = title_hint.strip() or _safe_filename(q[:30], default="会话总结")
+    md = (
+        f"# {title}\n\n"
+        "## 背景问题\n\n"
+        f"{q}\n\n"
+        "## 总结内容\n\n"
+        f"{a}\n\n"
+        "## 标签\n\n"
+        "- 会话沉淀\n"
+        "- 自动入库\n"
+    )
+    return title, md
+
+
+def _normalize_kb_markdown(content: str, title_hint: str = "") -> tuple[str, str]:
+    raw = (content or "").strip()
+    if not raw:
+        return "", ""
+    m = re.search(r"^#\s+(.+)$", raw, flags=re.MULTILINE)
+    title = (m.group(1).strip() if m else title_hint.strip() or "会话沉淀")
+    if m:
+        return title, raw
+    md = f"# {title}\n\n{raw}\n"
+    return title, md
+
+
 def _extract_first_image_url(text: str) -> str:
     m = re.search(r"https?://[^\s]+", text, flags=re.IGNORECASE)
     return m.group(0).strip() if m else ""
@@ -413,6 +478,124 @@ def _extract_path_hints(user_text: str, max_items: int = 4) -> list[str]:
     return out
 
 
+def _extract_query_symbols(text: str, max_items: int = 16) -> list[str]:
+    raw = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", text or "")
+    stop = {
+        "python",
+        "please",
+        "file",
+        "path",
+        "true",
+        "false",
+        "none",
+        "class",
+        "def",
+        "import",
+        "from",
+        "return",
+    }
+    out: list[str] = []
+    seen: set[str] = set()
+    for r in raw:
+        k = r.strip()
+        if not k or k.lower() in stop:
+            continue
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _extract_relevant_snippet(text: str, symbols: list[str], max_chars: int = 2400) -> str:
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    hits: list[int] = []
+    lower_lines = [ln.lower() for ln in lines]
+    for sym in symbols:
+        s = sym.lower()
+        for i, ln in enumerate(lower_lines):
+            if f"def {s}(" in ln or f"class {s}" in ln or s in ln:
+                hits.append(i)
+                break
+        if len(hits) >= 3:
+            break
+    if not hits:
+        return "\n".join(lines[: min(len(lines), 80)])[:max_chars]
+
+    ranges: list[tuple[int, int]] = []
+    for h in hits:
+        ranges.append((max(0, h - 12), min(len(lines), h + 13)))
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for st, ed in ranges:
+        if not merged or st > merged[-1][1]:
+            merged.append((st, ed))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], ed))
+
+    out_lines: list[str] = []
+    for st, ed in merged:
+        out_lines.extend(lines[st:ed])
+        out_lines.append("...")
+    out = "\n".join(out_lines).strip()
+    return out[:max_chars]
+
+
+def _build_cross_file_context(
+    query: str,
+    *,
+    exclude_files: set[str] | None = None,
+    max_files: int = 3,
+) -> str:
+    symbols = _extract_query_symbols(query)
+    if not symbols:
+        return ""
+
+    exclude = {x.replace("\\", "/") for x in (exclude_files or set())}
+    root = Path.cwd()
+    skip_dirs = {".git", ".wikicoder", "logs", "data", "__pycache__", "wikicoder.egg-info", ".vscode"}
+    candidates: list[tuple[int, str, str]] = []  # score, rel, snippet
+
+    for p in root.rglob("*.py"):
+        rel = p.relative_to(root).as_posix()
+        if rel in exclude:
+            continue
+        if any(part in skip_dirs for part in p.parts):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if not text.strip():
+            continue
+        low = text.lower()
+        score = 0
+        for s in symbols:
+            ls = s.lower()
+            if f"def {ls}(" in low or f"class {ls}" in low:
+                score += 3
+            if ls in low:
+                score += 1
+        if score <= 0:
+            continue
+        snippet = _extract_relevant_snippet(text, symbols)
+        if not snippet.strip():
+            continue
+        candidates.append((score, rel, snippet))
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    blocks: list[str] = []
+    for score, rel, snippet in candidates[:max_files]:
+        blocks.append(f"file: {rel} (score={score})\n```\\n{snippet}\\n```")
+    return "\n\n".join(blocks)
+
+
 def _run_python_script_detailed(script_path: Path, timeout_sec: int = 120) -> tuple[bool, str, str, int]:
     try:
         proc = subprocess.run(
@@ -422,23 +605,103 @@ def _run_python_script_detailed(script_path: Path, timeout_sec: int = 120) -> tu
             text=True,
             timeout=timeout_sec,
         )
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "").strip() if isinstance(e.stdout, str) else ""
+        err = (e.stderr or "").strip() if isinstance(e.stderr, str) else ""
+        detail = f"执行超时：超过 {timeout_sec}s（cwd={Path.cwd()} | script={script_path.name}）"
+        if err:
+            detail += f"\n{err}"
+        return False, out, detail, 124
     except Exception as e:  # noqa: BLE001
-        return False, "", f"执行失败: {e}", -1
+        return False, "", f"执行失败（cwd={Path.cwd()} | script={script_path.name}）: {e}", -1
     return proc.returncode == 0, (proc.stdout or "").strip(), (proc.stderr or "").strip(), int(proc.returncode)
+
+
+def _write_script_file(script_path: Path, content: str) -> None:
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(content, encoding="utf-8")
 
 
 def _run_python_script(script_path: Path, timeout_sec: int = 120) -> tuple[bool, str]:
     ok, out, err, rc = _run_python_script_detailed(script_path, timeout_sec=timeout_sec)
+    prefix = f"执行命令: {sys.executable} {script_path.name}\n工作目录: {Path.cwd()}\n"
     if ok:
-        msg = f"脚本执行成功（exit=0）"
+        msg = prefix + f"脚本执行成功（exit=0）"
         if out:
             msg += f"\n\n标准输出:\n{out}"
         return True, msg
-    msg = f"脚本执行失败（exit={rc})"
+    msg = prefix + f"脚本执行失败（exit={rc})"
     if err:
         msg += f"\n\n错误输出:\n{err}"
     if out:
         msg += f"\n\n标准输出:\n{out}"
+    return False, msg
+
+
+def _classify_script_failure(stderr_text: str, stdout_text: str, exit_code: int) -> tuple[str, str]:
+    err = f"{stderr_text}\n{stdout_text}".lower()
+    if exit_code == 124 or "执行超时" in err:
+        return "timeout", "建议：缩小处理范围、减少输入数据，或把脚本拆分为多阶段执行。"
+    if "modulenotfounderror" in err or "no module named" in err:
+        return "dependency_missing", "建议：安装缺失依赖后重试（如 pip install <包名>）。"
+    if "permissionerror" in err or "access is denied" in err or "拒绝访问" in err:
+        return "permission", "建议：检查文件占用/权限，关闭占用程序后重试。"
+    if "filenotfounderror" in err or "no such file or directory" in err:
+        return "path_not_found", "建议：确认输入路径和文件名是否存在，优先使用绝对路径。"
+    if "unicode" in err or "codec" in err or "gbk" in err or "utf-8" in err:
+        return "encoding", "建议：统一使用 UTF-8 编码读写，读取时增加 errors='ignore' 兜底。"
+    return "runtime_error", "建议：根据报错堆栈定位具体行，优先修复输入校验与异常处理。"
+
+
+def _extract_missing_modules(err_text: str) -> list[str]:
+    text = err_text or ""
+    names = re.findall(r"No module named ['\"]([A-Za-z0-9_.-]+)['\"]", text)
+    out: list[str] = []
+    for n in names:
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def _normalize_pip_package(mod_name: str) -> str:
+    m = (mod_name or "").strip()
+    mapping = {
+        "cv2": "opencv-python",
+        "sklearn": "scikit-learn",
+        "pil": "Pillow",
+        "yaml": "PyYAML",
+        "docx": "python-docx",
+    }
+    low = m.lower()
+    return mapping.get(low, m)
+
+
+def _install_python_packages(packages: list[str], timeout_sec: int = 180) -> tuple[bool, str]:
+    if not packages:
+        return True, "无缺失依赖需要安装。"
+    cmd = [sys.executable, "-m", "pip", "install", *packages]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(Path.cwd()),
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, f"依赖安装失败：{e}"
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode == 0:
+        msg = "依赖安装成功。"
+        if out:
+            msg += f"\n\n安装输出:\n{out[-2000:]}"
+        return True, msg
+    msg = f"依赖安装失败（exit={proc.returncode}）"
+    if err:
+        msg += f"\n\n错误输出:\n{err[-2000:]}"
+    if out:
+        msg += f"\n\n标准输出:\n{out[-2000:]}"
     return False, msg
 
 
@@ -448,6 +711,60 @@ def _extract_probe_json(stdout_text: str) -> str:
         if line.startswith(marker):
             return line[len(marker) :].strip()
     return ""
+
+
+def _extract_marker_json(stdout_text: str, marker: str) -> str:
+    for line in (stdout_text or "").splitlines():
+        if line.startswith(marker):
+            return line[len(marker) :].strip()
+    return ""
+
+
+def _extract_excel_constraints(user_text: str) -> dict[str, object]:
+    text = user_text or ""
+    out: dict[str, object] = {}
+    m = re.search(r"第\s*(\d+)\s*行", text)
+    if m:
+        try:
+            human_row = int(m.group(1))
+            if human_row >= 1:
+                out["header_row_human"] = human_row
+                out["header_index_zero_based"] = human_row - 1
+        except Exception:
+            pass
+    if "第二行" in text and ("表头" in text or "标题" in text or "header" in text.lower()):
+        out["header_row_human"] = 2
+        out["header_index_zero_based"] = 1
+    if any(k in text.lower() for k in [".xlsx", "excel", "openpyxl", "sheet", "合并"]):
+        out["excel_task"] = True
+    return out
+
+
+def _verify_excel_result_quality(stdout_text: str) -> tuple[bool, str]:
+    raw = _extract_marker_json(stdout_text, "WIKICODER_RESULT_JSON=")
+    if not raw:
+        return False, "缺少结果质量报告（未输出 WIKICODER_RESULT_JSON）。"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False, "结果质量报告不是合法 JSON。"
+
+    row_count = int(data.get("row_count", 0) or 0)
+    col_count = int(data.get("col_count", 0) or 0)
+    nan_ratio = float(data.get("nan_ratio", 0) or 0)
+    out_file = str(data.get("output_file", "")).strip()
+
+    if not out_file:
+        return False, "结果质量报告缺少 output_file。"
+    if row_count <= 0:
+        return False, "合并结果行数为 0。"
+    if col_count <= 0:
+        return False, "合并结果列数为 0。"
+    if col_count > 300:
+        return False, f"列数异常偏大（{col_count}），疑似表头错位。"
+    if nan_ratio >= 0.85:
+        return False, f"空值占比过高（{nan_ratio:.2%}），疑似列对齐失败。"
+    return True, f"质量校验通过：rows={row_count}, cols={col_count}, nan_ratio={nan_ratio:.2%}"
 
 
 def _confirm_local_operation(consent_state: dict[str, str], action_desc: str) -> bool:
@@ -482,6 +799,9 @@ def _auto_script_pipeline(
 ) -> AgentResponse:
     if not _looks_like_script_request(user_query):
         return resp
+    console.print("[dim]编码流程: 1/4 需求分析[/dim]")
+    excel_constraints = _extract_excel_constraints(user_query)
+    is_excel_task = bool(excel_constraints.get("excel_task"))
     path_hints = _extract_path_hints(user_query)
     hint_text = ", ".join(path_hints) if path_hints else "(未显式给出路径，默认当前目录)"
 
@@ -499,6 +819,7 @@ def _auto_script_pipeline(
         history=history,
     )
 
+    console.print("[dim]编码流程: 2/4 数据结构探测[/dim]")
     probe_prompt = (
         "请生成一个只读的 Python 探测脚本，用于分析用户需求涉及的数据结构。"
         "要求：\n"
@@ -507,7 +828,8 @@ def _auto_script_pipeline(
         "3) 最后在 stdout 输出一行：WIKICODER_PROBE_JSON=<json>\n"
         "4) 仅输出 Python 代码，不要解释\n\n"
         f"用户需求：{user_query}\n"
-        f"路径线索：{hint_text}"
+        f"路径线索：{hint_text}\n"
+        f"硬约束：{json.dumps(excel_constraints, ensure_ascii=False)}"
     )
     probe_resp = _run_agent_with_thinking(
         agent,
@@ -529,7 +851,7 @@ def _auto_script_pipeline(
             actions=resp.actions + ["local-op:denied-by-user"],
             output=f"{resp.output}\n\n---\n[本地操作]\n用户拒绝执行探测，未进入自动化实现。",
         )
-    write_file(probe_name, probe_code)
+    _write_script_file(probe_path, probe_code)
     ok_probe, probe_out, probe_err, probe_rc = _run_python_script_detailed(probe_path)
     probe_json = _extract_probe_json(probe_out)
     probe_summary = probe_json if probe_json else json.dumps(
@@ -537,15 +859,19 @@ def _auto_script_pipeline(
     )
     probe_status = "成功" if ok_probe else "失败（继续按已有信息尝试）"
 
+    console.print("[dim]编码流程: 3/4 生成执行脚本[/dim]")
     script_prompt = (
         "你将根据探测结果实现自动化脚本。请仅输出完整 Python 代码，不要解释。\n"
         "要求：\n"
         "1) 对输入异常做健壮处理\n"
         "2) 打印关键进度和最终结果\n"
-        "3) 若是表格处理，先对列名/类型对齐后再合并\n\n"
+        "3) 若是表格处理，先对列名/类型对齐后再合并\n"
+        "4) 若为 Excel 任务，优先使用 pandas + engine='openpyxl'，并对列名执行 strip()\n"
+        "5) 若为 Excel 任务，最终输出一行：WIKICODER_RESULT_JSON=<json>，包含 output_file,row_count,col_count,nan_ratio\n\n"
         f"用户需求：{user_query}\n"
         f"路径线索：{hint_text}\n"
         f"探测状态：{probe_status}\n"
+        f"硬约束：{json.dumps(excel_constraints, ensure_ascii=False)}\n"
         f"探测结果(JSON)：\n{probe_summary[:12000]}"
     )
     script_resp = _run_agent_with_thinking(
@@ -571,16 +897,45 @@ def _auto_script_pipeline(
             actions=resp.actions + [f"write_file({probe_name})", f"run_python({probe_name})", "local-op:denied-by-user"],
             output=f"{resp.output}\n\n---\n[探测]\n{probe_status}\n\n[本地操作]\n用户拒绝写入/执行业务脚本。",
         )
-    write_file(script_name, code)
+    _write_script_file(script_path, code)
     console.print(f"[green]已生成脚本：{script_path}[/green]")
 
-    ok, run_msg = _run_python_script(script_path)
     actions = resp.actions + [
         f"write_file({probe_name})",
         f"run_python({probe_name})",
         f"write_file({script_name})",
         f"run_python({script_name})",
     ]
+
+    console.print("[dim]编码流程: 4/4 运行与自动修复[/dim]")
+    ok, run_msg = _run_python_script(script_path)
+    if ok and is_excel_task:
+        q_ok, q_msg = _verify_excel_result_quality(run_msg)
+        run_msg += f"\n\n[语义校验]\n{q_msg}"
+        if not q_ok:
+            ok = False
+    if not ok:
+        category, advice = _classify_script_failure(run_msg, "", 1)
+        run_msg = f"{run_msg}\n\n故障分类: {category}\n{advice}"
+        missing = _extract_missing_modules(run_msg)
+        if missing:
+            pkgs = [_normalize_pip_package(x) for x in missing]
+            pkgs = list(dict.fromkeys([p for p in pkgs if p.strip()]))
+            if _confirm_local_operation(consent_state, f"安装缺失依赖并重试：{', '.join(pkgs)}"):
+                console.print(f"[yellow]检测到缺失依赖，准备安装：{', '.join(pkgs)}[/yellow]")
+                ok_i, msg_i = _install_python_packages(pkgs)
+                run_msg += f"\n\n[依赖安装]\n{msg_i}"
+                actions.append(f"pip_install({','.join(pkgs)})")
+                if ok_i:
+                    ok_retry, retry_msg = _run_python_script(script_path)
+                    actions.append(f"run_python({script_name}):retry_after_pip")
+                    run_msg += f"\n\n[安装后重试]\n{retry_msg}"
+                    if ok_retry:
+                        return AgentResponse(
+                            thought=resp.thought,
+                            actions=actions,
+                            output=f"{resp.output}\n\n---\n[规划]\n{plan_resp.output[:1200]}\n\n[探测状态]\n{probe_status}\n\n[自动执行结果]\n{run_msg}",
+                        )
     all_msgs = [
         f"[规划]\n{plan_resp.output[:1200]}",
         f"[探测状态]\n{probe_status}",
@@ -601,6 +956,7 @@ def _auto_script_pipeline(
             f"用户原始需求：{user_query}\n"
             f"脚本文件名：{script_name}\n"
             f"修复轮次：{attempt}\n"
+            f"硬约束：{json.dumps(excel_constraints, ensure_ascii=False)}\n"
             f"探测结果(JSON)：\n{probe_summary[:10000]}\n\n"
             "当前脚本：\n"
             f"```python\n{current_code}\n```\n\n"
@@ -623,9 +979,38 @@ def _auto_script_pipeline(
             actions.append(f"auto_fix:{attempt}:denied")
             break
 
-        write_file(script_name, fix_code)
+        _write_script_file(script_path, fix_code)
         current_code = fix_code
         ok_i, run_msg_i = _run_python_script(script_path)
+        if ok_i and is_excel_task:
+            q_ok_i, q_msg_i = _verify_excel_result_quality(run_msg_i)
+            run_msg_i += f"\n\n[语义校验]\n{q_msg_i}"
+            if not q_ok_i:
+                ok_i = False
+        if not ok_i:
+            category_i, advice_i = _classify_script_failure(run_msg_i, "", 1)
+            run_msg_i = f"{run_msg_i}\n\n故障分类: {category_i}\n{advice_i}"
+            missing_i = _extract_missing_modules(run_msg_i)
+            if missing_i:
+                pkgs_i = [_normalize_pip_package(x) for x in missing_i]
+                pkgs_i = list(dict.fromkeys([p for p in pkgs_i if p.strip()]))
+                if _confirm_local_operation(consent_state, f"安装缺失依赖并重试：{', '.join(pkgs_i)}"):
+                    console.print(f"[yellow]检测到缺失依赖，准备安装：{', '.join(pkgs_i)}[/yellow]")
+                    ok_p, msg_p = _install_python_packages(pkgs_i)
+                    actions.append(f"pip_install({','.join(pkgs_i)})")
+                    run_msg_i += f"\n\n[依赖安装]\n{msg_p}"
+                    if ok_p:
+                        ok_retry_i, retry_msg_i = _run_python_script(script_path)
+                        actions.append(f"run_python({script_name}):retry_after_pip")
+                        run_msg_i += f"\n\n[安装后重试]\n{retry_msg_i}"
+                        if ok_retry_i:
+                            all_msgs.append(f"[第{attempt}轮自动修复执行结果]\n{run_msg_i}")
+                            all_msgs.append(f"[自动修复状态] 已在第{attempt}轮通过安装依赖修复成功。")
+                            return AgentResponse(
+                                thought=resp.thought,
+                                actions=actions,
+                                output=f"{resp.output}\n\n---\n" + "\n\n".join(all_msgs),
+                            )
         actions.extend([f"auto_fix:{attempt}", f"run_python({script_name})"])
         all_msgs.append(f"[第{attempt}轮自动修复执行结果]\n{run_msg_i}")
         if ok_i:
@@ -1760,6 +2145,7 @@ def chat(
                 "/ask <问题>         强制 Wiki 模式提问\n"
                 "/memdraft [标题]    将本轮会话整理为 wiki 文档草稿\n"
                 "/memsave [标题]     将草稿保存到 raw/faq 目录\n"
+                "自然语言入库示例：写入知识库 标题：xxx 内容：...\n"
                 "/xlsx2md <路径>     将 xlsx 转为同目录同名 md（支持文件或目录）\n"
                 "/pdf2md <路径>      将 pdf 转为同目录同名 md（支持文件或目录）\n"
                 "/docx2md <路径>     将 word(docx) 转为同目录同名 md（支持文件或目录）\n"
@@ -2303,7 +2689,10 @@ def chat(
             if not code:
                 console.print(f"[red]File not found or empty:[/red] {file}")
                 continue
+            extra_ctx = _build_cross_file_context(query, exclude_files={file})
             code_ctx = f"file: {file}\n```\\n{code}\\n```"
+            if extra_ctx:
+                code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
             console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
             resp = _run_agent_with_thinking(
                 agent,
@@ -2323,7 +2712,10 @@ def chat(
             if not code:
                 console.print(f"[red]File not found or empty:[/red] {file}")
                 continue
+            extra_ctx = _build_cross_file_context(query, exclude_files={file})
             code_ctx = f"file: {file}\n```\\n{code}\\n```"
+            if extra_ctx:
+                code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
             console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
             resp = _run_agent_with_thinking(
                 agent,
@@ -2359,7 +2751,10 @@ def chat(
                 blocks.append(f"file: {f}\n```\\n{code}\\n```")
             if missing:
                 continue
+            extra_ctx = _build_cross_file_context(query, exclude_files=set(file_list))
             code_ctx = "\n\n".join(blocks)
+            if extra_ctx:
+                code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
             console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
             resp = _run_agent_with_thinking(
                 agent,
@@ -2376,7 +2771,46 @@ def chat(
             last_patch_allowed = set(file_list)
         else:
             console.print(f"[black on bright_cyan] You: {cmd} [/black on bright_cyan]")
-            if _looks_like_image_understand_request(cmd):
+            if _looks_like_kb_save_request(cmd):
+                title_hint = _extract_kb_title(cmd)
+                content_text = _extract_kb_content(cmd)
+                if content_text:
+                    title, markdown_text = _normalize_kb_markdown(content_text, title_hint=title_hint)
+                else:
+                    title, markdown_text = _build_kb_markdown_from_last_turn(session_history, title_hint=title_hint)
+                if not markdown_text:
+                    resp = AgentResponse(
+                        thought="kb_save:no-history",
+                        actions=["kb_save:skipped"],
+                        output=(
+                            "当前没有可写入知识库的内容。\n"
+                            "可先进行一次问答，或直接输入：\n"
+                            "写入知识库 标题：xxx 内容：..."
+                        ),
+                    )
+                    remember_turn = False
+                else:
+                    try:
+                        cfg_now = load_config()
+                        out = _save_memory_markdown(cfg_now, title, markdown_text)
+                        resp = AgentResponse(
+                            thought="kb_save:ok",
+                            actions=[f"kb_save(path='{out}')"],
+                            output=(
+                                "已实际写入本地知识库文件：\n"
+                                f"{out}\n\n"
+                                "你可继续执行 /sync 将其纳入检索。"
+                            ),
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        resp = AgentResponse(
+                            thought="kb_save:failed",
+                            actions=["kb_save:error"],
+                            output=f"写入本地知识库失败：{e}",
+                        )
+                    remember_turn = True
+                plain_chat_turn = False
+            elif _looks_like_image_understand_request(cmd):
                 config = load_config()
                 _ensure_auto_image_models(config)
                 llm = build_llm(config)
@@ -2466,8 +2900,28 @@ def chat(
                     )
                     remember_turn = True
                 plain_chat_turn = False
+            elif _looks_like_script_request(cmd):
+                console.print("[dim]检测到编码/自动化需求：直连代码执行流程（跳过 Wiki 检索）[/dim]")
+                seed_resp = AgentResponse(
+                    thought="code-assist:direct-pipeline",
+                    actions=["code_pipeline:start"],
+                    output="已识别为编码任务，开始执行：需求分析 → 结构探测 → 生成脚本 → 自动调试。",
+                )
+                resp = _auto_script_pipeline(
+                    agent=agent,
+                    user_query=cmd,
+                    resp=seed_resp,
+                    history=session_history,
+                    consent_state=local_op_consent,
+                )
+                remember_turn = resp.thought != "cancelled-by-user"
+                plain_chat_turn = False
             else:
                 auto_ctx = _extract_existing_py_context(cmd)
+                if _looks_like_script_request(cmd):
+                    xctx = _build_cross_file_context(cmd)
+                    if xctx:
+                        auto_ctx = (auto_ctx + "\n\n" if auto_ctx else "") + "[Cross-file context]\n" + xctx
                 resp = _run_agent_with_thinking(
                     agent,
                     user_input=cmd,
@@ -2488,6 +2942,25 @@ def chat(
                 consent_state=local_op_consent,
             )
 
+        is_patch_cmd = cmd.startswith("/patch ") or cmd.startswith("/patchm ")
+        if is_patch_cmd and resp.thought != "cancelled-by-user":
+            _print_patch_preview(resp.output)
+            target_desc = ", ".join(sorted(last_patch_allowed)) if last_patch_allowed else last_patch_file
+            if target_desc and _confirm_local_operation(local_op_consent, f"立即应用补丁到：{target_desc}"):
+                if last_patch_allowed:
+                    ok_apply, bid, msgs = _backup_and_apply_multi(last_patch_allowed, resp.output)
+                    last_backup_id = bid
+                    apply_msg = "\n".join(msgs)
+                else:
+                    ok_apply, bid, apply_msg = _backup_and_apply_single(last_patch_file, resp.output)
+                    last_backup_id = bid
+                status_line = "[补丁应用] 成功" if ok_apply else "[补丁应用] 失败"
+                resp.output = f"{resp.output}\n\n---\n{status_line}\n{apply_msg}"
+                if ok_apply:
+                    last_patch_file = ""
+                    last_patch_output = ""
+                    last_patch_allowed = None
+
         if show_trace:
             _print_trace(resp.thought, resp.actions)
 
@@ -2501,8 +2974,6 @@ def chat(
             if len(session_history) > 12:
                 session_history = session_history[-12:]
             _save_session_state(session_history, mode=session_mode)
-        if resp.thought != "cancelled-by-user" and (cmd.startswith("/patch ") or cmd.startswith("/patchm ")):
-            _print_patch_preview(resp.output)
 
 
 if __name__ == "__main__":

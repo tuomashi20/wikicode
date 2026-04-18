@@ -186,6 +186,24 @@ class WikiFirstAgent:
                     reliable.append(r)
         return reliable
 
+    @staticmethod
+    def _is_code_query(query: str, code_context: str = "") -> bool:
+        q = (query or "").lower()
+        keys = [
+            "python",
+            "脚本",
+            "代码",
+            "debug",
+            "报错",
+            "异常",
+            "修复",
+            "bug",
+            ".py",
+            "自动化",
+            "合并",
+        ]
+        return bool(code_context.strip()) or any(k in q for k in keys)
+
     def _wiki_grounded_chat(
         self,
         query: str,
@@ -303,11 +321,19 @@ class WikiFirstAgent:
             code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:9000]}" if code_context else ""
             user_prompt = f"Requirement:\n{query}{history_block}{code_part}\n\nReturn unified diff only."
         else:
-            system_prompt = (
-                "You are WikiCoder assistant. No wiki policy matched. "
-                "Answer user questions directly; do NOT limit to wiki-domain topics. "
-                "If uncertain, state uncertainty clearly."
-            )
+            if self._is_code_query(query, code_context):
+                system_prompt = (
+                    "You are a practical coding assistant. "
+                    "Prioritize directly usable code and executable steps. "
+                    "When fixing issues, explain root cause briefly, then provide corrected code. "
+                    "Do not add unnecessary theory."
+                )
+            else:
+                system_prompt = (
+                    "You are WikiCoder assistant. No wiki policy matched. "
+                    "Answer user questions directly; do NOT limit to wiki-domain topics. "
+                    "If uncertain, state uncertainty clearly."
+                )
             code_part = f"\n\nCurrent code context:\n{code_context[:6000]}" if code_context else ""
             user_prompt = f"User question:\n{query}{history_block}{code_part}"
 
