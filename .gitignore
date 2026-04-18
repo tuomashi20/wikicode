@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.py[cod]
 *.pyc.*
 
@@ -9,6 +9,7 @@ data/wiki_processed/
 # local config/secrets & backups
 .wikicoder/config.yaml
 .wikicoder/backups/
+.wikicoder/scripts/
 
 # packaging artifacts
 *.egg-info/

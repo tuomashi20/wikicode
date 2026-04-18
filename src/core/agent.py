@@ -223,7 +223,7 @@ class WikiFirstAgent:
                 f"id: {c['chunk_id']}\n"
                 f"title: {c['title']}\n"
                 f"source: {c['parent_file']}\n"
-                f"content:\n{c['content'][:1800]}"
+                f"content:\n{c['content'][:2400]}"
             )
 
         style = self.config.wiki_strategy.style_guidelines or {}
@@ -233,17 +233,35 @@ class WikiFirstAgent:
         if response_mode == "patch":
             system_prompt = (
                 "You are a senior code review assistant. Prioritize provided wiki policy. "
-                "Output MUST be unified diff (git diff style) with '--- a/<file>', '+++ b/<file>', and '@@' hunks. "
-                "Do not explain. If no change is needed, output NO_CHANGES."
+                "Output MUST use SEARCH/REPLACE block format as shown below. "
+                "Do not explain. If no change is needed, output NO_CHANGES.\n\n"
+                "=== OUTPUT FORMAT (required) ===\n"
+                "For EACH change, output a block like:\n\n"
+                "<<<< SEARCH\n"
+                "exact lines to find in the original file\n"
+                "====\n"
+                "replacement lines\n"
+                ">>>> REPLACE\n\n"
+                "=== EXAMPLE ===\n\n"
+                "<<<< SEARCH\n"
+                "def old_func():\n"
+                "    return 1\n"
+                "====\n"
+                "def old_func():\n"
+                "    return 2\n"
+                ">>>> REPLACE\n\n"
+                "IMPORTANT: The SEARCH block must exactly match existing code. "
+                "Include enough context lines for unique matching. "
+                "You may output multiple SEARCH/REPLACE blocks for multiple changes."
             )
-            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:9000]}" if code_context else ""
+            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:12000]}" if code_context else ""
             user_prompt = (
                 f"Requirement: {query}\n\n"
                 "Wiki policy:\n"
                 + "\n\n".join(context_blocks)
                 + history_block
                 + code_part
-                + "\n\nReturn unified diff only."
+                + "\n\nReturn SEARCH/REPLACE blocks only."
             )
         else:
             system_prompt = (
@@ -251,7 +269,7 @@ class WikiFirstAgent:
                 "If policy conflicts with common practice, policy wins; if policy is insufficient, state assumptions. "
                 f"Style constraints: {style_text}."
             )
-            code_part = f"\n\nCurrent code context:\n{code_context[:6000]}" if code_context else ""
+            code_part = f"\n\nCurrent code context:\n{code_context[:8000]}" if code_context else ""
             user_prompt = (
                 f"User question:\n{query}\n\n"
                 "Relevant wiki snippets:\n"
@@ -315,11 +333,20 @@ class WikiFirstAgent:
         if response_mode == "patch":
             system_prompt = (
                 "You are a senior code assistant. No wiki policy matched. "
-                "Generate unified diff (git diff style) with '--- a/<file>', '+++ b/<file>', and '@@' hunks. "
-                "No explanation. If no change is needed, output NO_CHANGES."
+                "Output MUST use SEARCH/REPLACE block format. "
+                "No explanation. If no change is needed, output NO_CHANGES.\n\n"
+                "=== OUTPUT FORMAT (required) ===\n"
+                "For EACH change, output a block like:\n\n"
+                "<<<< SEARCH\n"
+                "exact lines to find in the original file\n"
+                "====\n"
+                "replacement lines\n"
+                ">>>> REPLACE\n\n"
+                "IMPORTANT: The SEARCH block must exactly match existing code. "
+                "Include enough context lines for unique matching."
             )
-            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:9000]}" if code_context else ""
-            user_prompt = f"Requirement:\n{query}{history_block}{code_part}\n\nReturn unified diff only."
+            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:12000]}" if code_context else ""
+            user_prompt = f"Requirement:\n{query}{history_block}{code_part}\n\nReturn SEARCH/REPLACE blocks only."
         else:
             if self._is_code_query(query, code_context):
                 system_prompt = (
@@ -334,7 +361,7 @@ class WikiFirstAgent:
                     "Answer user questions directly; do NOT limit to wiki-domain topics. "
                     "If uncertain, state uncertainty clearly."
                 )
-            code_part = f"\n\nCurrent code context:\n{code_context[:6000]}" if code_context else ""
+            code_part = f"\n\nCurrent code context:\n{code_context[:8000]}" if code_context else ""
             user_prompt = f"User question:\n{query}{history_block}{code_part}"
 
         try:
@@ -363,7 +390,7 @@ class WikiFirstAgent:
             return f"Wiki miss and general LLM call failed: {e}\nPlease verify llm.api_key / provider config."
 
     @staticmethod
-    def _format_history_block(history: list[tuple[str, str]] | None, max_turns: int = 6, max_chars: int = 2400) -> str:
+    def _format_history_block(history: list[tuple[str, str]] | None, max_turns: int = 8, max_chars: int = 4800) -> str:
         if not history:
             return ""
         turns = history[-max_turns:]
@@ -371,8 +398,8 @@ class WikiFirstAgent:
         for idx, (q, a) in enumerate(turns, start=1):
             q1 = (q or "").strip()
             a1 = (a or "").strip()
-            if len(a1) > 280:
-                a1 = a1[:280] + "..."
+            if len(a1) > 600:
+                a1 = a1[:600] + "..."
             lines.append(f"\n[{idx}] user: {q1}")
             lines.append(f"[{idx}] assistant: {a1}")
         out = "\n".join(lines)

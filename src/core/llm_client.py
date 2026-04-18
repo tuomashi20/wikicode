@@ -34,7 +34,16 @@ class LLMClient:
         if self.provider == "jiutian":
             yield from self._call_jiutian_chat_stream(system_prompt, user_prompt)
             return
-        # fallback: non-stream providers emit once
+        if self.provider in {"openai", "openai_compatible"}:
+            yield from self._call_openai_stream(system_prompt, user_prompt)
+            return
+        if self.provider == "ollama":
+            yield from self._call_ollama_stream(system_prompt, user_prompt)
+            return
+        if self.provider in {"google_api_studio", "google", "gemini"}:
+            yield from self._call_google_stream(system_prompt, user_prompt)
+            return
+        # fallback: 不支持流式的 provider 一次性输出
         text = self.generate(system_prompt, user_prompt)
         if text:
             yield text
@@ -218,6 +227,104 @@ class LLMClient:
         parts = candidates[0].get("content", {}).get("parts", [])
         text = "".join(str(p.get("text", "")) for p in parts)
         return text.strip()
+
+    def _call_openai_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        """OpenAI 兼容的流式输出。"""
+        try:
+            from openai import OpenAI  # type: ignore
+            base = (self.config.base_url or "https://api.openai.com/v1").rstrip("/")
+            client = OpenAI(base_url=base, api_key=self.config.api_key)
+            stream = client.chat.completions.create(
+                model=self.config.model,
+                temperature=self.config.temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=True,
+            )
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if hasattr(delta, "content") and delta.content:
+                    yield str(delta.content)
+            return
+        except ImportError:
+            # openai SDK 未安装时回退到一次性请求
+            text = self._call_openai(system_prompt, user_prompt)
+            if text:
+                yield text
+        except Exception:
+            text = self._call_openai(system_prompt, user_prompt)
+            if text:
+                yield text
+
+    def _call_ollama_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        """Ollama 流式输出。"""
+        base = (self.config.base_url or "http://localhost:11434").rstrip("/")
+        url = f"{base}/api/chat"
+        payload = {
+            "model": self.config.model,
+            "stream": True,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "options": {"temperature": self.config.temperature},
+        }
+        try:
+            with httpx.Client(timeout=self.config.timeout_seconds) as client:
+                with client.stream("POST", url, json=payload) as resp:
+                    for line in resp.iter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                            piece = data.get("message", {}).get("content", "")
+                            if piece:
+                                yield piece
+                            if data.get("done", False):
+                                return
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+        except Exception:
+            text = self._call_ollama(system_prompt, user_prompt)
+            if text:
+                yield text
+
+    def _call_google_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
+        """Google Gemini 流式输出。"""
+        base = (self.config.base_url or "https://generativelanguage.googleapis.com").rstrip("/")
+        model = self.config.model
+        url = f"{base}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={self.config.api_key}"
+        payload = {
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            "generationConfig": {"temperature": self.config.temperature},
+        }
+        try:
+            with httpx.Client(timeout=self.config.timeout_seconds) as client:
+                with client.stream("POST", url, json=payload, headers={"Content-Type": "application/json"}) as resp:
+                    for line in resp.iter_lines():
+                        line = line.strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+                        try:
+                            data = json.loads(line[6:])
+                            candidates = data.get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                for p in parts:
+                                    t = p.get("text", "")
+                                    if t:
+                                        yield t
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+        except Exception:
+            text = self._call_google(system_prompt, user_prompt)
+            if text:
+                yield text
 
     def _call_ollama(self, system_prompt: str, user_prompt: str) -> str:
         base = (self.config.base_url or "http://localhost:11434").rstrip("/")

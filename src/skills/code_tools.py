@@ -63,6 +63,45 @@ def _validate_python_syntax(path: str, content: str) -> tuple[bool, str]:
         return False, f"Python syntax check failed: {e}"
 
 
+
+def _validate_json_syntax(path: str, content: str) -> tuple[bool, str]:
+    """校验 JSON 文件语法。"""
+    if not path.lower().endswith(".json"):
+        return True, ""
+    try:
+        json.loads(content)
+        return True, ""
+    except (json.JSONDecodeError, ValueError) as e:
+        return False, f"JSON syntax check failed: {e}"
+
+
+def _validate_yaml_syntax(path: str, content: str) -> tuple[bool, str]:
+    """校验 YAML 文件语法（需要 PyYAML）。"""
+    low = path.lower()
+    if not (low.endswith(".yaml") or low.endswith(".yml")):
+        return True, ""
+    try:
+        import yaml
+        yaml.safe_load(content)
+        return True, ""
+    except ImportError:
+        return True, ""
+    except Exception as e:
+        return False, f"YAML syntax check failed: {e}"
+
+
+def _validate_file_syntax(path: str, content: str) -> tuple[bool, str]:
+    """统一的文件语法校验入口，根据扩展名自动分发到对应验证器。"""
+    low = path.lower()
+    if low.endswith(".py"):
+        return _validate_python_syntax(path, content)
+    if low.endswith(".json"):
+        return _validate_json_syntax(path, content)
+    if low.endswith(".yaml") or low.endswith(".yml"):
+        return _validate_yaml_syntax(path, content)
+    return True, ""
+
+
 def extract_search_replace_blocks(text: str) -> list[tuple[str, str]]:
     s = text.strip()
     if not s:
@@ -248,7 +287,7 @@ def _apply_unified_diff_block(path: str, block_text: str) -> tuple[bool, str]:
     new_text = "\n".join(current)
     if keep_trailing_newline:
         new_text += "\n"
-    ok_py, py_msg = _validate_python_syntax(path, new_text)
+    ok_py, py_msg = _validate_file_syntax(path, new_text)
     if not ok_py:
         return False, py_msg
     target.write_text(new_text, encoding="utf-8")
@@ -291,7 +330,7 @@ def _apply_create_block(path: str, block_text: str) -> tuple[bool, str]:
     if not ok:
         return False, content
     final_content = (content + "\n") if content else ""
-    ok_py, py_msg = _validate_python_syntax(path, final_content)
+    ok_py, py_msg = _validate_file_syntax(path, final_content)
     if not ok_py:
         return False, py_msg
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -319,7 +358,7 @@ def apply_search_replace(path: str, patch_text: str) -> tuple[bool, str]:
         if old not in text:
             return False, f"SEARCH block not found in target: {old[:80]}"
         text = text.replace(old, new, 1)
-    ok_py, py_msg = _validate_python_syntax(path, text)
+    ok_py, py_msg = _validate_file_syntax(path, text)
     if not ok_py:
         return False, py_msg
     p.write_text(text, encoding="utf-8")

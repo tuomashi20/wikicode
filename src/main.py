@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import os
@@ -596,11 +597,13 @@ def _build_cross_file_context(
     return "\n\n".join(blocks)
 
 
-def _run_python_script_detailed(script_path: Path, timeout_sec: int = 120) -> tuple[bool, str, str, int]:
+def _run_python_script_detailed(script_path: Path, timeout_sec: int = 120, cwd: str | None = None) -> tuple[bool, str, str, int]:
+    # 支持自定义工作目录，默认使用 PROJECT_ROOT
+    work_dir = cwd or str(PROJECT_ROOT)
     try:
         proc = subprocess.run(
             [sys.executable, str(script_path)],
-            cwd=str(Path.cwd()),
+            cwd=work_dir,
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -608,12 +611,12 @@ def _run_python_script_detailed(script_path: Path, timeout_sec: int = 120) -> tu
     except subprocess.TimeoutExpired as e:
         out = (e.stdout or "").strip() if isinstance(e.stdout, str) else ""
         err = (e.stderr or "").strip() if isinstance(e.stderr, str) else ""
-        detail = f"执行超时：超过 {timeout_sec}s（cwd={Path.cwd()} | script={script_path.name}）"
+        detail = f"执行超时：超过 {timeout_sec}s（cwd={work_dir} | script={script_path.name}）"
         if err:
             detail += f"\n{err}"
         return False, out, detail, 124
     except Exception as e:  # noqa: BLE001
-        return False, "", f"执行失败（cwd={Path.cwd()} | script={script_path.name}）: {e}", -1
+        return False, "", f"执行失败（cwd={work_dir} | script={script_path.name}）: {e}", -1
     return proc.returncode == 0, (proc.stdout or "").strip(), (proc.stderr or "").strip(), int(proc.returncode)
 
 
@@ -622,9 +625,10 @@ def _write_script_file(script_path: Path, content: str) -> None:
     script_path.write_text(content, encoding="utf-8")
 
 
-def _run_python_script(script_path: Path, timeout_sec: int = 120) -> tuple[bool, str]:
-    ok, out, err, rc = _run_python_script_detailed(script_path, timeout_sec=timeout_sec)
-    prefix = f"执行命令: {sys.executable} {script_path.name}\n工作目录: {Path.cwd()}\n"
+def _run_python_script(script_path: Path, timeout_sec: int = 120, cwd: str | None = None) -> tuple[bool, str]:
+    ok, out, err, rc = _run_python_script_detailed(script_path, timeout_sec=timeout_sec, cwd=cwd)
+    work_dir = cwd or str(PROJECT_ROOT)
+    prefix = f"执行命令: {sys.executable} {script_path.name}\n工作目录: {work_dir}\n"
     if ok:
         msg = prefix + f"脚本执行成功（exit=0）"
         if out:
@@ -744,10 +748,17 @@ def _verify_excel_result_quality(stdout_text: str) -> tuple[bool, str]:
     raw = _extract_marker_json(stdout_text, "WIKICODER_RESULT_JSON=")
     if not raw:
         return False, "缺少结果质量报告（未输出 WIKICODER_RESULT_JSON）。"
+    # 先尝试 JSON 解析，失败后兼容 Python dict 字面量（单引号等）
+    data: dict = {}
     try:
         data = json.loads(raw)
     except Exception:
-        return False, "结果质量报告不是合法 JSON。"
+        try:
+            data = ast.literal_eval(raw)
+            if not isinstance(data, dict):
+                return False, "结果质量报告格式异常（非 dict）。"
+        except Exception:
+            return False, "结果质量报告不是合法 JSON 或 Python dict。"
 
     row_count = int(data.get("row_count", 0) or 0)
     col_count = int(data.get("col_count", 0) or 0)
@@ -762,8 +773,8 @@ def _verify_excel_result_quality(stdout_text: str) -> tuple[bool, str]:
         return False, "合并结果列数为 0。"
     if col_count > 300:
         return False, f"列数异常偏大（{col_count}），疑似表头错位。"
-    if nan_ratio >= 0.85:
-        return False, f"空值占比过高（{nan_ratio:.2%}），疑似列对齐失败。"
+    if nan_ratio >= 0.50:
+        return False, f"空值占比过高（{nan_ratio:.2%}），疑似列对齐失败或混入了非源文件。"
     return True, f"质量校验通过：rows={row_count}, cols={col_count}, nan_ratio={nan_ratio:.2%}"
 
 
@@ -789,6 +800,42 @@ def _confirm_local_operation(consent_state: dict[str, str], action_desc: str) ->
     return False
 
 
+def _extract_target_cwd(path_hints: list[str]) -> str | None:
+    """从路径线索中提取用户的目标工作目录。"""
+    for hint in path_hints:
+        p = Path(hint.strip())
+        if p.is_dir():
+            return str(p.resolve())
+        if p.is_file():
+            return str(p.parent.resolve())
+        # 尝试作目录解析（可能用户给的路径尚不存在但父目录存在）
+        if p.parent.is_dir():
+            return str(p.parent.resolve())
+    return None
+
+
+def _get_scripts_dir() -> Path:
+    """获取脚本临时目录（.wikicoder/scripts/），自动创建。"""
+    scripts_dir = PROJECT_ROOT / ".wikicoder" / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    return scripts_dir
+
+
+def _cleanup_old_scripts(max_age_days: int = 7) -> None:
+    """清理超过指定天数的旧脚本文件。"""
+    scripts_dir = PROJECT_ROOT / ".wikicoder" / "scripts"
+    if not scripts_dir.exists():
+        return
+    import time as _time
+    cutoff = _time.time() - max_age_days * 86400
+    for f in scripts_dir.glob("wikicoder_*.py"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except Exception:
+            pass
+
+
 def _auto_script_pipeline(
     *,
     agent: WikiFirstAgent,
@@ -799,36 +846,63 @@ def _auto_script_pipeline(
 ) -> AgentResponse:
     if not _looks_like_script_request(user_query):
         return resp
-    console.print("[dim]编码流程: 1/4 需求分析[/dim]")
+
+    try:
+        return _auto_script_pipeline_inner(
+            agent=agent,
+            user_query=user_query,
+            resp=resp,
+            history=history,
+            consent_state=consent_state,
+        )
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]编码流水线异常：{e}[/red]")
+        return AgentResponse(
+            thought="code-pipeline:error",
+            actions=resp.actions + [f"pipeline_error:{type(e).__name__}"],
+            output=(
+                f"{resp.output}\n\n---\n"
+                f"[编码流水线异常]\n{type(e).__name__}: {e}\n\n"
+                "可能原因：LLM 超时、网络中断、或模型返回异常。\n"
+                "建议：1) 检查网络连接 2) 增大 config.yaml 中 timeout_seconds（建议 120+）3) 重试"
+            ),
+        )
+
+
+def _auto_script_pipeline_inner(
+    *,
+    agent: WikiFirstAgent,
+    user_query: str,
+    resp: AgentResponse,
+    history: list[tuple[str, str]],
+    consent_state: dict[str, str],
+) -> AgentResponse:
+    # 清理旧脚本文件
+    _cleanup_old_scripts()
+
     excel_constraints = _extract_excel_constraints(user_query)
     is_excel_task = bool(excel_constraints.get("excel_task"))
     path_hints = _extract_path_hints(user_query)
     hint_text = ", ".join(path_hints) if path_hints else "(未显式给出路径，默认当前目录)"
+    # 从路径线索提取目标工作目录
+    target_cwd = _extract_target_cwd(path_hints)
+    cwd_info = f"脚本工作目录: {target_cwd}" if target_cwd else "脚本工作目录: 项目根目录"
 
-    plan_prompt = (
-        "你是自动化工程助手。请根据用户需求给出简短执行计划（3-6步），"
-        "重点说明先探测文件结构再生成脚本的步骤。只输出纯文本。\n\n"
-        f"用户需求：{user_query}\n"
-        f"路径线索：{hint_text}"
-    )
-    plan_resp = _run_agent_with_thinking(
-        agent,
-        user_input=plan_prompt,
-        force_wiki=False,
-        mode="general_only",
-        history=history,
-    )
-
-    console.print("[dim]编码流程: 2/4 数据结构探测[/dim]")
+    console.print("[dim]编码流程: 1/3 数据结构探测[/dim]")
     probe_prompt = (
-        "请生成一个只读的 Python 探测脚本，用于分析用户需求涉及的数据结构。"
+        "请生成一个只读的 Python 探测脚本，用于分析用户需求涉及的数据结构。\n"
         "要求：\n"
         "1) 不可写文件、不可删除、不可联网\n"
         "2) 仅扫描必要目录并抽样读取结构\n"
-        "3) 最后在 stdout 输出一行：WIKICODER_PROBE_JSON=<json>\n"
-        "4) 仅输出 Python 代码，不要解释\n\n"
+        "3) 如果涉及表格文件，请读取前 3 行原始数据（含可能的表头行），"
+        "并报告每列数据类型、行数、列数、空值比例\n"
+        "4) 检测文件编码（尝试 utf-8/gbk/gb2312）\n"
+        "5) 最后在 stdout 输出一行：WIKICODER_PROBE_JSON=<json>（使用 json.dumps 输出）\n"
+        "6) 仅输出 Python 代码，不要解释\n"
+        "7) 脚本必须包含 if __name__ == '__main__': 入口\n\n"
         f"用户需求：{user_query}\n"
         f"路径线索：{hint_text}\n"
+        f"{cwd_info}\n"
         f"硬约束：{json.dumps(excel_constraints, ensure_ascii=False)}"
     )
     probe_resp = _run_agent_with_thinking(
@@ -843,8 +917,9 @@ def _auto_script_pipeline(
         return resp
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    scripts_dir = _get_scripts_dir()
     probe_name = f"wikicoder_probe_{ts}.py"
-    probe_path = (Path.cwd() / probe_name).resolve()
+    probe_path = scripts_dir / probe_name
     if not _confirm_local_operation(consent_state, f"写入探测脚本 {probe_name} 并执行（只读探测）"):
         return AgentResponse(
             thought=resp.thought,
@@ -852,24 +927,40 @@ def _auto_script_pipeline(
             output=f"{resp.output}\n\n---\n[本地操作]\n用户拒绝执行探测，未进入自动化实现。",
         )
     _write_script_file(probe_path, probe_code)
-    ok_probe, probe_out, probe_err, probe_rc = _run_python_script_detailed(probe_path)
+    ok_probe, probe_out, probe_err, probe_rc = _run_python_script_detailed(probe_path, cwd=target_cwd)
     probe_json = _extract_probe_json(probe_out)
     probe_summary = probe_json if probe_json else json.dumps(
         {"stdout": probe_out[:2000], "stderr": probe_err[:2000], "exit": probe_rc}, ensure_ascii=False
     )
     probe_status = "成功" if ok_probe else "失败（继续按已有信息尝试）"
 
-    console.print("[dim]编码流程: 3/4 生成执行脚本[/dim]")
+    console.print("[dim]编码流程: 2/3 生成执行脚本[/dim]")
+    # 构建标准化的脚本生成 Prompt
     script_prompt = (
-        "你将根据探测结果实现自动化脚本。请仅输出完整 Python 代码，不要解释。\n"
-        "要求：\n"
-        "1) 对输入异常做健壮处理\n"
-        "2) 打印关键进度和最终结果\n"
-        "3) 若是表格处理，先对列名/类型对齐后再合并\n"
-        "4) 若为 Excel 任务，优先使用 pandas + engine='openpyxl'，并对列名执行 strip()\n"
-        "5) 若为 Excel 任务，最终输出一行：WIKICODER_RESULT_JSON=<json>，包含 output_file,row_count,col_count,nan_ratio\n\n"
+        "你将根据探测结果实现自动化脚本。请仅输出完整 Python 代码，不要解释。\n\n"
+        "=== 代码规范（必须遵守） ===\n"
+        "1) 脚本必须包含 if __name__ == '__main__': 入口\n"
+        "2) 所有文件读写使用 encoding='utf-8', errors='ignore'\n"
+        "3) 中文路径使用 raw string 或 os.path.join，不要手动拼接反斜杠\n"
+        "4) 输出文件名必须唯一（建议加时间戳），避免覆盖源文件或已存在文件\n"
+        "5) 写文件前检查目标路径是否被占用（try/except PermissionError）\n"
+        "6) 对输入异常做健壮处理（文件不存在、格式异常、空数据等）\n"
+        "7) 打印关键进度和最终结果\n"
+        "8) 可用依赖：pandas, openpyxl, os, sys, json, glob, pathlib, re, datetime\n\n"
+        "=== 表格处理专项规范 ===\n"
+        "9) 若是表格合并，先对列名执行 strip() 去除空格\n"
+        "10) 优先使用 pandas + engine='openpyxl'\n"
+        "11) 合并时必须以第一个源文件的列顺序为基准，后续文件按此顺序对齐（不要按字母排序列名）\n"
+        "12) 合并时必须排除之前生成的合并结果文件（merged_*.xlsx 等），只处理原始源文件\n"
+        "13) 所有路径必须使用用户提供的绝对路径，不要使用 os.getcwd() 或相对路径\n"
+        "14) 若为 Excel 任务，最终输出一行：\n"
+        "    print('WIKICODER_RESULT_JSON=' + json.dumps({...}))\n"
+        "    其中 JSON 包含 output_file, row_count, col_count, nan_ratio\n"
+        "    【必须用 json.dumps 生成，不要用 str() 或 f-string】\n\n"
+        f"=== 任务信息 ===\n"
         f"用户需求：{user_query}\n"
         f"路径线索：{hint_text}\n"
+        f"{cwd_info}\n"
         f"探测状态：{probe_status}\n"
         f"硬约束：{json.dumps(excel_constraints, ensure_ascii=False)}\n"
         f"探测结果(JSON)：\n{probe_summary[:12000]}"
@@ -890,7 +981,7 @@ def _auto_script_pipeline(
         )
 
     script_name = f"wikicoder_task_{ts}.py"
-    script_path = (Path.cwd() / script_name).resolve()
+    script_path = scripts_dir / script_name
     if not _confirm_local_operation(consent_state, f"写入业务脚本 {script_name} 并执行"):
         return AgentResponse(
             thought=resp.thought,
@@ -907,8 +998,8 @@ def _auto_script_pipeline(
         f"run_python({script_name})",
     ]
 
-    console.print("[dim]编码流程: 4/4 运行与自动修复[/dim]")
-    ok, run_msg = _run_python_script(script_path)
+    console.print("[dim]编码流程: 3/3 运行与自动修复[/dim]")
+    ok, run_msg = _run_python_script(script_path, cwd=target_cwd)
     if ok and is_excel_task:
         q_ok, q_msg = _verify_excel_result_quality(run_msg)
         run_msg += f"\n\n[语义校验]\n{q_msg}"
@@ -927,17 +1018,16 @@ def _auto_script_pipeline(
                 run_msg += f"\n\n[依赖安装]\n{msg_i}"
                 actions.append(f"pip_install({','.join(pkgs)})")
                 if ok_i:
-                    ok_retry, retry_msg = _run_python_script(script_path)
+                    ok_retry, retry_msg = _run_python_script(script_path, cwd=target_cwd)
                     actions.append(f"run_python({script_name}):retry_after_pip")
                     run_msg += f"\n\n[安装后重试]\n{retry_msg}"
                     if ok_retry:
                         return AgentResponse(
                             thought=resp.thought,
                             actions=actions,
-                            output=f"{resp.output}\n\n---\n[规划]\n{plan_resp.output[:1200]}\n\n[探测状态]\n{probe_status}\n\n[自动执行结果]\n{run_msg}",
+                            output=f"{resp.output}\n\n---\n[探测状态]\n{probe_status}\n\n[自动执行结果]\n{run_msg}",
                         )
     all_msgs = [
-        f"[规划]\n{plan_resp.output[:1200]}",
         f"[探测状态]\n{probe_status}",
         f"[自动执行结果]\n{run_msg}",
     ]
@@ -948,19 +1038,52 @@ def _auto_script_pipeline(
             output=f"{resp.output}\n\n---\n" + "\n\n".join(all_msgs),
         )
 
+    # === 自动修复循环（上限5轮 + 智能退出） ===
+    MAX_FIX_ATTEMPTS = 5
     current_code = code
     attempt = 1
+    last_category = ""
+    same_category_count = 0
     while True:
+        # 渐进式策略：前2轮修复、第3轮起要求从零重写
+        if attempt <= 2:
+            fix_strategy = (
+                "请修复以下脚本中的错误。仅输出完整 Python 代码，不要解释。\n"
+                "重点关注报错堆栈中的具体行号和错误类型。"
+            )
+        else:
+            fix_strategy = (
+                "之前的修复尝试未能解决问题。请抛弃原有思路，从零重写整个脚本。\n"
+                "仅输出完整 Python 代码，不要解释。\n"
+                "请特别注意以下编码规范：\n"
+                "- 文件读写必须用 encoding='utf-8', errors='ignore'\n"
+                "- 输出文件名加时间戳避免覆盖冲突\n"
+                "- 写文件前用 try/except 处理 PermissionError\n"
+                "- 若为 Excel 任务，结果行必须用 json.dumps 输出"
+            )
+
+        # 注入前轮失败原因摘要
+        prev_failures = ""
+        if attempt > 1:
+            recent_fail_msgs = [m for m in all_msgs if m.startswith("[第")]
+            if recent_fail_msgs:
+                prev_failures = (
+                    "\n\n=== 前轮修复失败摘要（请避免重复犯同样错误） ===\n"
+                    + "\n".join(m[:500] for m in recent_fail_msgs[-2:])
+                )
+
         fix_prompt = (
-            "你需要修复一个执行失败的 Python 自动化脚本。请只输出完整 Python 代码，不要解释。\n\n"
+            f"{fix_strategy}\n\n"
             f"用户原始需求：{user_query}\n"
             f"脚本文件名：{script_name}\n"
-            f"修复轮次：{attempt}\n"
+            f"修复轮次：{attempt}/{MAX_FIX_ATTEMPTS}\n"
+            f"{cwd_info}\n"
             f"硬约束：{json.dumps(excel_constraints, ensure_ascii=False)}\n"
             f"探测结果(JSON)：\n{probe_summary[:10000]}\n\n"
             "当前脚本：\n"
             f"```python\n{current_code}\n```\n\n"
             f"最近报错：\n```\n{all_msgs[-1][:7000]}\n```"
+            f"{prev_failures}"
         )
         fix_resp = _run_agent_with_thinking(
             agent,
@@ -981,7 +1104,7 @@ def _auto_script_pipeline(
 
         _write_script_file(script_path, fix_code)
         current_code = fix_code
-        ok_i, run_msg_i = _run_python_script(script_path)
+        ok_i, run_msg_i = _run_python_script(script_path, cwd=target_cwd)
         if ok_i and is_excel_task:
             q_ok_i, q_msg_i = _verify_excel_result_quality(run_msg_i)
             run_msg_i += f"\n\n[语义校验]\n{q_msg_i}"
@@ -990,6 +1113,20 @@ def _auto_script_pipeline(
         if not ok_i:
             category_i, advice_i = _classify_script_failure(run_msg_i, "", 1)
             run_msg_i = f"{run_msg_i}\n\n故障分类: {category_i}\n{advice_i}"
+            # 智能退出：连续相同故障分类则终止
+            if category_i == last_category:
+                same_category_count += 1
+            else:
+                same_category_count = 0
+                last_category = category_i
+            if same_category_count >= 2:
+                all_msgs.append(f"[第{attempt}轮自动修复执行结果]\n{run_msg_i}")
+                all_msgs.append(
+                    f"[自动修复状态] 连续 {same_category_count + 1} 轮同类故障（{category_i}），"
+                    "自动修复无法解决，建议人工介入。"
+                )
+                actions.extend([f"auto_fix:{attempt}", f"run_python({script_name})"])
+                break
             missing_i = _extract_missing_modules(run_msg_i)
             if missing_i:
                 pkgs_i = [_normalize_pip_package(x) for x in missing_i]
@@ -1000,7 +1137,7 @@ def _auto_script_pipeline(
                     actions.append(f"pip_install({','.join(pkgs_i)})")
                     run_msg_i += f"\n\n[依赖安装]\n{msg_p}"
                     if ok_p:
-                        ok_retry_i, retry_msg_i = _run_python_script(script_path)
+                        ok_retry_i, retry_msg_i = _run_python_script(script_path, cwd=target_cwd)
                         actions.append(f"run_python({script_name}):retry_after_pip")
                         run_msg_i += f"\n\n[安装后重试]\n{retry_msg_i}"
                         if ok_retry_i:
@@ -1021,8 +1158,8 @@ def _auto_script_pipeline(
                 output=f"{resp.output}\n\n---\n" + "\n\n".join(all_msgs),
             )
         attempt += 1
-        if attempt > 50:
-            all_msgs.append("[自动修复状态] 已达到安全上限(50轮)，仍未成功。")
+        if attempt > MAX_FIX_ATTEMPTS:
+            all_msgs.append(f"[自动修复状态] 已达到安全上限({MAX_FIX_ATTEMPTS}轮)，仍未成功，建议人工检查报错信息。")
             break
 
     return AgentResponse(
@@ -2097,883 +2234,904 @@ def chat(
         cmd = text.strip()
         if not cmd:
             continue
-        # tolerate commands without leading slash
-        if cmd in {
-            "sync",
-            "help",
-            "reset",
-            "exit",
-            "quit",
-            "kbclear",
-            "kbclear yes",
-            "kbclear all yes",
-            "kbbackups",
-            "kbsave",
-            "resume",
-            "memdraft",
-            "memsave",
-            "model",
-            "xlsx2md",
-            "pdf2md",
-            "docx2md",
-        }:
-            cmd = f"/{cmd}"
+        try:  # 最外层异常保护：任何未预期异常不会终止 REPL
+            # tolerate commands without leading slash
+            if cmd in {
+                "sync",
+                "help",
+                "reset",
+                "exit",
+                "quit",
+                "kbclear",
+                "kbclear yes",
+                "kbclear all yes",
+                "kbbackups",
+                "kbsave",
+                "resume",
+                "memdraft",
+                "memsave",
+                "model",
+                "xlsx2md",
+                "pdf2md",
+                "docx2md",
+            }:
+                cmd = f"/{cmd}"
 
-        if cmd in {"/exit", "/quit"}:
-            console.print("Bye.")
-            break
+            if cmd in {"/exit", "/quit"}:
+                console.print("Bye.")
+                break
 
-        if cmd == "/help":
-            console.print(
-                "[bold]WikiCoder 命令帮助[/bold]\n\n"
-                "[cyan]一、知识库与同步[/cyan]\n"
-                "/vaultpath <目录>  设置知识库根目录（自动派生 raw/wiki/wiki_processed）\n"
-                "/sync               执行同步（增量）：RAW -> 索引 -> WIKI 页面\n"
-                "/structure          查看当前索引结构（文件与 chunk 数）\n"
-                "/model [name]       查看/切换文本模型（think/chat）\n"
-                "/kbclear yes        清空索引（chunks + sqlite）\n"
-                "/kbclear all yes    清空索引 + wiki 页面（保留 raw 原文件）\n\n"
-                "/kbsave [name]      备份知识库（raw/wiki/processed）\n"
-                "/kbbackups          查看知识库备份列表\n"
-                "/kbrestore <id>     恢复指定知识库备份\n\n"
-                "[cyan]二、问答与模式[/cyan]\n"
-                "/mode auto|wiki_only|general_only  切换会话模式\n"
-                "  - auto: 先检索 wiki，未命中回退通用模型\n"
-                "  - wiki_only: 仅 wiki，不回退\n"
-                "  - general_only: 直接通用模型\n"
-                "/resume             恢复上次会话上下文（最近30轮）\n"
-                "/ask <问题>         强制 Wiki 模式提问\n"
-                "/memdraft [标题]    将本轮会话整理为 wiki 文档草稿\n"
-                "/memsave [标题]     将草稿保存到 raw/faq 目录\n"
-                "自然语言入库示例：写入知识库 标题：xxx 内容：...\n"
-                "/xlsx2md <路径>     将 xlsx 转为同目录同名 md（支持文件或目录）\n"
-                "/pdf2md <路径>      将 pdf 转为同目录同名 md（支持文件或目录）\n"
-                "/docx2md <路径>     将 word(docx) 转为同目录同名 md（支持文件或目录）\n"
-                "/reset              清空当前会话记忆\n\n"
-                "[cyan]三、评测与回归[/cyan]\n"
-                "/eval <cases> [topk] [out]         运行检索评测（recall/top1/mrr）\n"
-                "/regress <cases> [topk] [out]      一键同步 + 评测\n"
-                "/compare <base> <latest>           对比两份评测报告（delta/fixed/regressed）\n"
-                "/baseline <report> [baseline]      将报告设为基线\n\n"
-                "[cyan]四、代码审阅与补丁[/cyan]\n"
-                "/review <文件> :: <问题>            按知识库规则审阅文件\n"
-                "/patch <文件> :: <需求>             生成单文件补丁\n"
-                "/patchm <f1,f2> :: <需求>           生成多文件补丁\n"
-                "/preview                            预览最近补丁摘要\n"
-                "/apply yes                          应用最近补丁\n"
-                "/backups                            查看备份列表\n"
-                "/undo [backup_id]                   回滚备份\n\n"
-                "[cyan]五、显示与会话[/cyan]\n"
-                "提问处理中会显示耗时秒数，可按 ESC 取消本次提问\n"
-                "普通对话中如为脚本类需求：先结构探测 -> 再生成脚本 -> 执行并持续自动修复\n"
-                "本地写入/执行前会询问授权：y(本次) / a(本会话全部同意) / n(拒绝)\n"
-                "高级命令请执行：/help advanced\n"
-                "/exit               退出 CLI"
-            )
-            continue
-
-        if cmd == "/help advanced":
-            console.print(
-                "[bold]WikiCoder 高级命令[/bold]\n\n"
-                "[cyan]评测与回归[/cyan]\n"
-                "/eval <cases> [topk] [out]\n"
-                "/regress <cases> [topk] [out]\n"
-                "/compare <base> <latest>\n"
-                "/baseline <report> [baseline]\n\n"
-                "[cyan]代码补丁工作流[/cyan]\n"
-                "/review <文件> :: <问题>\n"
-                "/patch <文件> :: <需求>\n"
-                "/patchm <f1,f2> :: <需求>\n"
-                "/preview\n"
-                "/apply yes\n"
-                "/backups\n"
-                "/undo <backup_id>\n\n"
-                "[cyan]显示控制[/cyan]\n"
-                "/trace on|off\n"
-                "/stream on|off"
-            )
-            continue
-
-        if cmd == "/sync":
-            result = run_sync()
-            wp = result.get("wiki_pages", 0)
-            sk = result.get("skipped", 0)
-            dl = result.get("deleted", 0)
-            console.print(
-                f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
-                f"chunks={result['chunks']} wiki_pages={wp}"
-            )
-            continue
-
-        if cmd == "/xlsx2md" or cmd.startswith("/xlsx2md "):
-            if cmd == "/xlsx2md":
-                console.print("[yellow]用法：/xlsx2md <文件或目录路径>[/yellow]")
-                continue
-            arg = cmd.split(" ", 1)[1].strip()
-            recursive = False
-            if arg.endswith(" -r") or arg.endswith(" --recursive"):
-                recursive = True
-                arg = arg.rsplit(" ", 1)[0].strip()
-            outs, errs = convert_xlsx_path(arg, recursive=recursive)
-            for o in outs:
-                console.print(f"[green]已生成：{o}[/green]")
-            for e in errs:
-                console.print(f"[yellow]{e}[/yellow]")
-            if outs and not errs:
-                console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
-            continue
-
-        if cmd == "/pdf2md" or cmd.startswith("/pdf2md "):
-            if cmd == "/pdf2md":
-                console.print("[yellow]用法：/pdf2md <文件或目录路径>[/yellow]")
-                continue
-            arg = cmd.split(" ", 1)[1].strip()
-            recursive = False
-            if arg.endswith(" -r") or arg.endswith(" --recursive"):
-                recursive = True
-                arg = arg.rsplit(" ", 1)[0].strip()
-            outs, errs = convert_pdf_path(arg, recursive=recursive)
-            for o in outs:
-                console.print(f"[green]已生成：{o}[/green]")
-            for e in errs:
-                console.print(f"[yellow]{e}[/yellow]")
-            if outs and not errs:
-                console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
-            continue
-
-        if cmd == "/docx2md" or cmd.startswith("/docx2md "):
-            if cmd == "/docx2md":
-                console.print("[yellow]用法：/docx2md <文件或目录路径>[/yellow]")
-                continue
-            arg = cmd.split(" ", 1)[1].strip()
-            recursive = False
-            if arg.endswith(" -r") or arg.endswith(" --recursive"):
-                recursive = True
-                arg = arg.rsplit(" ", 1)[0].strip()
-            outs, errs = convert_docx_path(arg, recursive=recursive)
-            for o in outs:
-                console.print(f"[green]已生成：{o}[/green]")
-            for e in errs:
-                console.print(f"[yellow]{e}[/yellow]")
-            if outs and not errs:
-                console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
-            continue
-
-        if cmd in {"/kbclear", "/kbclear yes", "/kbclear all yes"}:
-            if cmd == "/kbclear":
-                console.print("[yellow]危险操作，请使用 /kbclear yes 或 /kbclear all yes 确认。[/yellow]")
-                continue
-            clear_all = cmd == "/kbclear all yes"
-            cfg = load_config()
-            msgs = clear_index_store(processed_path=cfg.wiki_strategy.processed_path)
-            if clear_all:
-                msgs.extend(_clear_wiki_output(cfg.wiki_strategy.wiki_path))
-            for m in msgs:
+            if cmd == "/help":
                 console.print(
-                    f"[green]{m}[/green]"
-                    if m.startswith(("Cleared", "Removed", "Truncated"))
-                    else f"[yellow]{m}[/yellow]"
+                    "[bold]WikiCoder 命令帮助[/bold]\n\n"
+                    "[cyan]一、知识库与同步[/cyan]\n"
+                    "/vaultpath <目录>  设置知识库根目录（自动派生 raw/wiki/wiki_processed）\n"
+                    "/sync               执行同步（增量）：RAW -> 索引 -> WIKI 页面\n"
+                    "/structure          查看当前索引结构（文件与 chunk 数）\n"
+                    "/model [name]       查看/切换文本模型（think/chat）\n"
+                    "/kbclear yes        清空索引（chunks + sqlite）\n"
+                    "/kbclear all yes    清空索引 + wiki 页面（保留 raw 原文件）\n\n"
+                    "/kbsave [name]      备份知识库（raw/wiki/processed）\n"
+                    "/kbbackups          查看知识库备份列表\n"
+                    "/kbrestore <id>     恢复指定知识库备份\n\n"
+                    "[cyan]二、问答与模式[/cyan]\n"
+                    "/mode auto|wiki_only|general_only  切换会话模式\n"
+                    "  - auto: 先检索 wiki，未命中回退通用模型\n"
+                    "  - wiki_only: 仅 wiki，不回退\n"
+                    "  - general_only: 直接通用模型\n"
+                    "/resume             恢复上次会话上下文（最近30轮）\n"
+                    "/ask <问题>         强制 Wiki 模式提问\n"
+                    "/memdraft [标题]    将本轮会话整理为 wiki 文档草稿\n"
+                    "/memsave [标题]     将草稿保存到 raw/faq 目录\n"
+                    "自然语言入库示例：写入知识库 标题：xxx 内容：...\n"
+                    "/xlsx2md <路径>     将 xlsx 转为同目录同名 md（支持文件或目录）\n"
+                    "/pdf2md <路径>      将 pdf 转为同目录同名 md（支持文件或目录）\n"
+                    "/docx2md <路径>     将 word(docx) 转为同目录同名 md（支持文件或目录）\n"
+                    "/reset              清空当前会话记忆\n\n"
+                    "[cyan]三、评测与回归[/cyan]\n"
+                    "/eval <cases> [topk] [out]         运行检索评测（recall/top1/mrr）\n"
+                    "/regress <cases> [topk] [out]      一键同步 + 评测\n"
+                    "/compare <base> <latest>           对比两份评测报告（delta/fixed/regressed）\n"
+                    "/baseline <report> [baseline]      将报告设为基线\n\n"
+                    "[cyan]四、代码审阅与补丁[/cyan]\n"
+                    "/review <文件> :: <问题>            按知识库规则审阅文件\n"
+                    "/patch <文件> :: <需求>             生成单文件补丁\n"
+                    "/patchm <f1,f2> :: <需求>           生成多文件补丁\n"
+                    "/preview                            预览最近补丁摘要\n"
+                    "/apply yes                          应用最近补丁\n"
+                    "/backups                            查看备份列表\n"
+                    "/undo [backup_id]                   回滚备份\n\n"
+                    "[cyan]五、显示与会话[/cyan]\n"
+                    "提问处理中会显示耗时秒数，可按 ESC 取消本次提问\n"
+                    "普通对话中如为脚本类需求：先结构探测 -> 再生成脚本 -> 执行并持续自动修复\n"
+                    "本地写入/执行前会询问授权：y(本次) / a(本会话全部同意) / n(拒绝)\n"
+                    "高级命令请执行：/help advanced\n"
+                    "/exit               退出 CLI"
                 )
-            if clear_all:
-                console.print("[cyan]已清空索引和 wiki 生成页（raw 未删除）。可执行 /sync 重新构建。[/cyan]")
-            else:
-                console.print("[cyan]已清空索引。可执行 /sync 重新构建。[/cyan]")
-            continue
-
-        if cmd == "/kbbackups":
-            items = list_kb_backups(limit=30)
-            if not items:
-                console.print("No KB backups found.")
-            else:
-                for it in items:
-                    console.print(f"- {it['id']} | {it['created_at']}")
-            continue
-
-        if cmd == "/kbsave" or cmd.startswith("/kbsave "):
-            name = cmd.split(" ", 1)[1].strip() if cmd.startswith("/kbsave ") else ""
-            cfg = load_config()
-            bid, msgs = save_kb_backup(cfg, name=name or None)
-            console.print(f"[green]KB backup created:[/green] {bid}")
-            for m in msgs:
-                console.print(f"[yellow]{m}[/yellow]")
-            continue
-
-        if cmd.startswith("/kbrestore "):
-            backup_id = cmd.split(" ", 1)[1].strip()
-            if not backup_id:
-                console.print("[yellow]Usage: /kbrestore <backup_id>[/yellow]")
                 continue
-            cfg = load_config()
-            ok, msgs = restore_kb_backup(cfg, backup_id)
-            for m in msgs:
-                console.print(f"[green]{m}[/green]" if m.startswith("Restored") else f"[yellow]{m}[/yellow]")
-            if ok:
-                console.print("[cyan]KB restore completed.[/cyan]")
-            else:
-                console.print("[yellow]KB restore completed with warnings/errors.[/yellow]")
-            continue
 
+            if cmd == "/help advanced":
+                console.print(
+                    "[bold]WikiCoder 高级命令[/bold]\n\n"
+                    "[cyan]评测与回归[/cyan]\n"
+                    "/eval <cases> [topk] [out]\n"
+                    "/regress <cases> [topk] [out]\n"
+                    "/compare <base> <latest>\n"
+                    "/baseline <report> [baseline]\n\n"
+                    "[cyan]代码补丁工作流[/cyan]\n"
+                    "/review <文件> :: <问题>\n"
+                    "/patch <文件> :: <需求>\n"
+                    "/patchm <f1,f2> :: <需求>\n"
+                    "/preview\n"
+                    "/apply yes\n"
+                    "/backups\n"
+                    "/undo <backup_id>\n\n"
+                    "[cyan]显示控制[/cyan]\n"
+                    "/trace on|off\n"
+                    "/stream on|off"
+                )
+                continue
 
-        if cmd == "/structure":
-            items = wiki_list_structure()
-            if not items:
-                console.print("No indexed wiki chunks.")
-            else:
-                for item in items:
-                    console.print(f"- {item['parent_file']} ({item['chunk_count']} chunks)")
-            continue
+            if cmd == "/sync":
+                result = run_sync()
+                wp = result.get("wiki_pages", 0)
+                sk = result.get("skipped", 0)
+                dl = result.get("deleted", 0)
+                console.print(
+                    f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
+                    f"chunks={result['chunks']} wiki_pages={wp}"
+                )
+                continue
 
-        if cmd == "/eval" or cmd.startswith("/eval "):
-            parts = cmd.split()
-            cases_path = "data/eval/retrieval_cases.jsonl"
-            topk_n = 8
-            out_path = ""
-            if len(parts) >= 2:
-                cases_path = parts[1]
-            if len(parts) >= 3:
-                try:
-                    topk_n = max(1, int(parts[2]))
-                except Exception:
-                    console.print("[yellow]Usage: /eval <cases.jsonl> [topk] [out.json][/yellow]")
+            if cmd == "/xlsx2md" or cmd.startswith("/xlsx2md "):
+                if cmd == "/xlsx2md":
+                    console.print("[yellow]用法：/xlsx2md <文件或目录路径>[/yellow]")
                     continue
-            if len(parts) >= 4:
-                out_path = parts[3]
-            pth = Path(cases_path)
-            if not pth.is_absolute():
-                pth = (Path.cwd() / pth).resolve()
-            try:
-                eval_cases = load_eval_cases(pth)
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]Failed loading cases:[/red] {e}")
+                arg = cmd.split(" ", 1)[1].strip()
+                recursive = False
+                if arg.endswith(" -r") or arg.endswith(" --recursive"):
+                    recursive = True
+                    arg = arg.rsplit(" ", 1)[0].strip()
+                outs, errs = convert_xlsx_path(arg, recursive=recursive)
+                for o in outs:
+                    console.print(f"[green]已生成：{o}[/green]")
+                for e in errs:
+                    console.print(f"[yellow]{e}[/yellow]")
+                if outs and not errs:
+                    console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
                 continue
-            summary, details = evaluate_retrieval(
-                cases=eval_cases,
-                topk=topk_n,
-                synonyms_path=config.wiki_strategy.synonyms_path,
-            )
-            console.print(
-                f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
-                f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
-                f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
-            )
-            for d in details:
-                status = "[green]HIT[/green]" if d.hit else "[red]MISS[/red]"
-                extra = f" field={d.matched_field}" if d.matched_field else ""
-                rk = f" rank={d.rank}" if d.rank else ""
-                top = f" top='{d.top_hit}'" if d.top_hit else ""
-                console.print(f"- {status} query={d.query!r}{extra}{rk}{top}")
-            if out_path.strip():
+
+            if cmd == "/pdf2md" or cmd.startswith("/pdf2md "):
+                if cmd == "/pdf2md":
+                    console.print("[yellow]用法：/pdf2md <文件或目录路径>[/yellow]")
+                    continue
+                arg = cmd.split(" ", 1)[1].strip()
+                recursive = False
+                if arg.endswith(" -r") or arg.endswith(" --recursive"):
+                    recursive = True
+                    arg = arg.rsplit(" ", 1)[0].strip()
+                outs, errs = convert_pdf_path(arg, recursive=recursive)
+                for o in outs:
+                    console.print(f"[green]已生成：{o}[/green]")
+                for e in errs:
+                    console.print(f"[yellow]{e}[/yellow]")
+                if outs and not errs:
+                    console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
+                continue
+
+            if cmd == "/docx2md" or cmd.startswith("/docx2md "):
+                if cmd == "/docx2md":
+                    console.print("[yellow]用法：/docx2md <文件或目录路径>[/yellow]")
+                    continue
+                arg = cmd.split(" ", 1)[1].strip()
+                recursive = False
+                if arg.endswith(" -r") or arg.endswith(" --recursive"):
+                    recursive = True
+                    arg = arg.rsplit(" ", 1)[0].strip()
+                outs, errs = convert_docx_path(arg, recursive=recursive)
+                for o in outs:
+                    console.print(f"[green]已生成：{o}[/green]")
+                for e in errs:
+                    console.print(f"[yellow]{e}[/yellow]")
+                if outs and not errs:
+                    console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
+                continue
+
+            if cmd in {"/kbclear", "/kbclear yes", "/kbclear all yes"}:
+                if cmd == "/kbclear":
+                    console.print("[yellow]危险操作，请使用 /kbclear yes 或 /kbclear all yes 确认。[/yellow]")
+                    continue
+                clear_all = cmd == "/kbclear all yes"
+                cfg = load_config()
+                msgs = clear_index_store(processed_path=cfg.wiki_strategy.processed_path)
+                if clear_all:
+                    msgs.extend(_clear_wiki_output(cfg.wiki_strategy.wiki_path))
+                for m in msgs:
+                    console.print(
+                        f"[green]{m}[/green]"
+                        if m.startswith(("Cleared", "Removed", "Truncated"))
+                        else f"[yellow]{m}[/yellow]"
+                    )
+                if clear_all:
+                    console.print("[cyan]已清空索引和 wiki 生成页（raw 未删除）。可执行 /sync 重新构建。[/cyan]")
+                else:
+                    console.print("[cyan]已清空索引。可执行 /sync 重新构建。[/cyan]")
+                continue
+
+            if cmd == "/kbbackups":
+                items = list_kb_backups(limit=30)
+                if not items:
+                    console.print("No KB backups found.")
+                else:
+                    for it in items:
+                        console.print(f"- {it['id']} | {it['created_at']}")
+                continue
+
+            if cmd == "/kbsave" or cmd.startswith("/kbsave "):
+                name = cmd.split(" ", 1)[1].strip() if cmd.startswith("/kbsave ") else ""
+                cfg = load_config()
+                bid, msgs = save_kb_backup(cfg, name=name or None)
+                console.print(f"[green]KB backup created:[/green] {bid}")
+                for m in msgs:
+                    console.print(f"[yellow]{m}[/yellow]")
+                continue
+
+            if cmd.startswith("/kbrestore "):
+                backup_id = cmd.split(" ", 1)[1].strip()
+                if not backup_id:
+                    console.print("[yellow]Usage: /kbrestore <backup_id>[/yellow]")
+                    continue
+                cfg = load_config()
+                ok, msgs = restore_kb_backup(cfg, backup_id)
+                for m in msgs:
+                    console.print(f"[green]{m}[/green]" if m.startswith("Restored") else f"[yellow]{m}[/yellow]")
+                if ok:
+                    console.print("[cyan]KB restore completed.[/cyan]")
+                else:
+                    console.print("[yellow]KB restore completed with warnings/errors.[/yellow]")
+                continue
+
+
+            if cmd == "/structure":
+                items = wiki_list_structure()
+                if not items:
+                    console.print("No indexed wiki chunks.")
+                else:
+                    for item in items:
+                        console.print(f"- {item['parent_file']} ({item['chunk_count']} chunks)")
+                continue
+
+            if cmd == "/eval" or cmd.startswith("/eval "):
+                parts = cmd.split()
+                cases_path = "data/eval/retrieval_cases.jsonl"
+                topk_n = 8
+                out_path = ""
+                if len(parts) >= 2:
+                    cases_path = parts[1]
+                if len(parts) >= 3:
+                    try:
+                        topk_n = max(1, int(parts[2]))
+                    except Exception:
+                        console.print("[yellow]Usage: /eval <cases.jsonl> [topk] [out.json][/yellow]")
+                        continue
+                if len(parts) >= 4:
+                    out_path = parts[3]
+                pth = Path(cases_path)
+                if not pth.is_absolute():
+                    pth = (Path.cwd() / pth).resolve()
+                try:
+                    eval_cases = load_eval_cases(pth)
+                except Exception as e:  # noqa: BLE001
+                    console.print(f"[red]Failed loading cases:[/red] {e}")
+                    continue
+                summary, details = evaluate_retrieval(
+                    cases=eval_cases,
+                    topk=topk_n,
+                    synonyms_path=config.wiki_strategy.synonyms_path,
+                )
+                console.print(
+                    f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
+                    f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
+                    f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
+                )
+                for d in details:
+                    status = "[green]HIT[/green]" if d.hit else "[red]MISS[/red]"
+                    extra = f" field={d.matched_field}" if d.matched_field else ""
+                    rk = f" rank={d.rank}" if d.rank else ""
+                    top = f" top='{d.top_hit}'" if d.top_hit else ""
+                    console.print(f"- {status} query={d.query!r}{extra}{rk}{top}")
+                if out_path.strip():
+                    op = Path(out_path)
+                    if not op.is_absolute():
+                        op = (Path.cwd() / op).resolve()
+                    written = save_eval_report(summary, details, op)
+                    console.print(f"[cyan]Report saved:[/cyan] {written}")
+                continue
+
+            if cmd == "/regress" or cmd.startswith("/regress "):
+                parts = cmd.split()
+                cases_path = "data/eval/retrieval_cases.jsonl"
+                topk_n = 8
+                out_path = "data/eval/reports/latest.json"
+                if len(parts) >= 2:
+                    cases_path = parts[1]
+                if len(parts) >= 3:
+                    try:
+                        topk_n = max(1, int(parts[2]))
+                    except Exception:
+                        console.print("[yellow]Usage: /regress <cases.jsonl> [topk] [out.json][/yellow]")
+                        continue
+                if len(parts) >= 4:
+                    out_path = parts[3]
+
+                result = run_sync()
+                wp = result.get("wiki_pages", 0)
+                sk = result.get("skipped", 0)
+                dl = result.get("deleted", 0)
+                console.print(
+                    f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
+                    f"chunks={result['chunks']} wiki_pages={wp}"
+                )
+
+                pth = Path(cases_path)
+                if not pth.is_absolute():
+                    pth = (Path.cwd() / pth).resolve()
+                try:
+                    eval_cases = load_eval_cases(pth)
+                except Exception as e:  # noqa: BLE001
+                    console.print(f"[red]Failed loading cases:[/red] {e}")
+                    continue
+
+                summary, details = evaluate_retrieval(
+                    cases=eval_cases,
+                    topk=topk_n,
+                    synonyms_path=config.wiki_strategy.synonyms_path,
+                )
+                console.print(
+                    f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
+                    f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
+                    f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
+                )
                 op = Path(out_path)
                 if not op.is_absolute():
                     op = (Path.cwd() / op).resolve()
                 written = save_eval_report(summary, details, op)
-                console.print(f"[cyan]Report saved:[/cyan] {written}")
-            continue
+                console.print(f"[cyan]Regression report:[/cyan] {written}")
+                continue
 
-        if cmd == "/regress" or cmd.startswith("/regress "):
-            parts = cmd.split()
-            cases_path = "data/eval/retrieval_cases.jsonl"
-            topk_n = 8
-            out_path = "data/eval/reports/latest.json"
-            if len(parts) >= 2:
-                cases_path = parts[1]
-            if len(parts) >= 3:
+            if cmd == "/compare" or cmd.startswith("/compare "):
+                parts = cmd.split()
+                base_path = "data/eval/reports/baseline.json"
+                current_path = "data/eval/reports/latest.json"
+                if len(parts) >= 2:
+                    base_path = parts[1]
+                if len(parts) >= 3:
+                    current_path = parts[2]
+                bp = Path(base_path)
+                cp = Path(current_path)
+                if not bp.is_absolute():
+                    bp = (Path.cwd() / bp).resolve()
+                if not cp.is_absolute():
+                    cp = (Path.cwd() / cp).resolve()
                 try:
-                    topk_n = max(1, int(parts[2]))
-                except Exception:
-                    console.print("[yellow]Usage: /regress <cases.jsonl> [topk] [out.json][/yellow]")
+                    b = load_eval_report(bp)
+                    c = load_eval_report(cp)
+                except Exception as e:  # noqa: BLE001
+                    console.print(f"[red]Failed loading reports:[/red] {e}")
                     continue
-            if len(parts) >= 4:
-                out_path = parts[3]
 
-            result = run_sync()
-            wp = result.get("wiki_pages", 0)
-            sk = result.get("skipped", 0)
-            dl = result.get("deleted", 0)
-            console.print(
-                f"[green]Sync completed[/green]: changed={result['files']} skipped={sk} deleted={dl} "
-                f"chunks={result['chunks']} wiki_pages={wp}"
-            )
-
-            pth = Path(cases_path)
-            if not pth.is_absolute():
-                pth = (Path.cwd() / pth).resolve()
-            try:
-                eval_cases = load_eval_cases(pth)
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]Failed loading cases:[/red] {e}")
+                comp = compare_eval_reports(b, c)
+                d = comp["delta"]
+                console.print(
+                    f"[green]Eval compare[/green]: "
+                    f"Δrecall={d.get('recall_at_k')} Δtop1={d.get('top1_accuracy')} Δmrr={d.get('mrr')} "
+                    f"Δhit={d.get('hit')} Δmiss={d.get('miss')}"
+                )
+                console.print(f"- fixed={len(comp['fixed_queries'])} regressed={len(comp['regressed_queries'])} "
+                              f"still_miss={len(comp['still_miss_queries'])}")
                 continue
 
-            summary, details = evaluate_retrieval(
-                cases=eval_cases,
-                topk=topk_n,
-                synonyms_path=config.wiki_strategy.synonyms_path,
-            )
-            console.print(
-                f"[green]Retrieval eval[/green]: total={summary['total']} hit={summary['hit']} "
-                f"miss={summary['miss']} recall@{summary['topk']}={summary['recall_at_k']} "
-                f"top1={summary['top1_accuracy']} mrr={summary['mrr']}"
-            )
-            op = Path(out_path)
-            if not op.is_absolute():
-                op = (Path.cwd() / op).resolve()
-            written = save_eval_report(summary, details, op)
-            console.print(f"[cyan]Regression report:[/cyan] {written}")
-            continue
-
-        if cmd == "/compare" or cmd.startswith("/compare "):
-            parts = cmd.split()
-            base_path = "data/eval/reports/baseline.json"
-            current_path = "data/eval/reports/latest.json"
-            if len(parts) >= 2:
-                base_path = parts[1]
-            if len(parts) >= 3:
-                current_path = parts[2]
-            bp = Path(base_path)
-            cp = Path(current_path)
-            if not bp.is_absolute():
-                bp = (Path.cwd() / bp).resolve()
-            if not cp.is_absolute():
-                cp = (Path.cwd() / cp).resolve()
-            try:
-                b = load_eval_report(bp)
-                c = load_eval_report(cp)
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]Failed loading reports:[/red] {e}")
+            if cmd == "/baseline" or cmd.startswith("/baseline "):
+                parts = cmd.split()
+                src = "data/eval/reports/latest.json"
+                dst = "data/eval/reports/baseline.json"
+                if len(parts) >= 2:
+                    src = parts[1]
+                if len(parts) >= 3:
+                    dst = parts[2]
+                sp = Path(src)
+                tp = Path(dst)
+                if not sp.is_absolute():
+                    sp = (Path.cwd() / sp).resolve()
+                if not tp.is_absolute():
+                    tp = (Path.cwd() / tp).resolve()
+                if not sp.exists():
+                    console.print(f"[red]Source report not found:[/red] {sp}")
+                    continue
+                tp.parent.mkdir(parents=True, exist_ok=True)
+                tp.write_text(sp.read_text(encoding="utf-8-sig"), encoding="utf-8")
+                console.print(f"[green]Baseline updated[/green]: {tp}")
                 continue
 
-            comp = compare_eval_reports(b, c)
-            d = comp["delta"]
-            console.print(
-                f"[green]Eval compare[/green]: "
-                f"Δrecall={d.get('recall_at_k')} Δtop1={d.get('top1_accuracy')} Δmrr={d.get('mrr')} "
-                f"Δhit={d.get('hit')} Δmiss={d.get('miss')}"
-            )
-            console.print(f"- fixed={len(comp['fixed_queries'])} regressed={len(comp['regressed_queries'])} "
-                          f"still_miss={len(comp['still_miss_queries'])}")
-            continue
 
-        if cmd == "/baseline" or cmd.startswith("/baseline "):
-            parts = cmd.split()
-            src = "data/eval/reports/latest.json"
-            dst = "data/eval/reports/baseline.json"
-            if len(parts) >= 2:
-                src = parts[1]
-            if len(parts) >= 3:
-                dst = parts[2]
-            sp = Path(src)
-            tp = Path(dst)
-            if not sp.is_absolute():
-                sp = (Path.cwd() / sp).resolve()
-            if not tp.is_absolute():
-                tp = (Path.cwd() / tp).resolve()
-            if not sp.exists():
-                console.print(f"[red]Source report not found:[/red] {sp}")
+            if cmd.startswith("/vaultpath "):
+                new_path = cmd[len("/vaultpath ") :].strip()
+                ok, msg = _set_vault_path(new_path)
+                if ok:
+                    config = load_config()
+                    ensure_workspace(config)
+                    console.print(f"[green]{msg}[/green]")
+                    console.print(f"[cyan]目录已创建：{config.wiki_strategy.vault_path}[/cyan]")
+                    console.print(f"[cyan]请将知识原文件放入 RAW 子目录：{config.wiki_strategy.raw_path}[/cyan]")
+                    console.print("[cyan]然后执行同步命令：/sync[/cyan]")
+                else:
+                    console.print(f"[red]{msg}[/red]")
                 continue
-            tp.parent.mkdir(parents=True, exist_ok=True)
-            tp.write_text(sp.read_text(encoding="utf-8-sig"), encoding="utf-8")
-            console.print(f"[green]Baseline updated[/green]: {tp}")
-            continue
-
-
-        if cmd.startswith("/vaultpath "):
-            new_path = cmd[len("/vaultpath ") :].strip()
-            ok, msg = _set_vault_path(new_path)
-            if ok:
-                config = load_config()
-                ensure_workspace(config)
-                console.print(f"[green]{msg}[/green]")
-                console.print(f"[cyan]目录已创建：{config.wiki_strategy.vault_path}[/cyan]")
-                console.print(f"[cyan]请将知识原文件放入 RAW 子目录：{config.wiki_strategy.raw_path}[/cyan]")
-                console.print("[cyan]然后执行同步命令：/sync[/cyan]")
-            else:
-                console.print(f"[red]{msg}[/red]")
-            continue
-        if cmd == "/preview":
-            if not last_patch_output:
-                console.print("No patch available. Run /patch or /patchm first.")
-                continue
-            _print_patch_preview(last_patch_output)
-            continue
-
-        if cmd == "/backups":
-            items = list_backups(limit=20)
-            if not items:
-                console.print("No backups found.")
-            else:
-                for it in items:
-                    console.print(f"- {it['id']} | files={it['file_count']} | {it['created_at']}")
-            continue
-
-        if cmd == "/undo" or cmd.startswith("/undo "):
-            bid = cmd.split(" ", 1)[1].strip() if cmd.startswith("/undo ") else last_backup_id
-            if not bid:
-                console.print("No backup id provided and no recent backup in session.")
-                continue
-            ok, msgs = restore_backup(bid)
-            for m in msgs:
-                console.print(f"[green]{m}[/green]" if m.startswith(("Restored", "Removed", "No-op")) else f"[yellow]{m}[/yellow]")
-            if not ok:
-                console.print("[yellow]Undo completed with errors.[/yellow]")
-            continue
-
-        if cmd == "/apply" or cmd == "/apply yes":
-            if not last_patch_file or not last_patch_output:
-                console.print("No patch to apply. Run /patch first.")
-                continue
-            if cmd != "/apply yes":
-                console.print("[yellow]Use /apply yes to confirm applying patch.[/yellow]")
+            if cmd == "/preview":
+                if not last_patch_output:
+                    console.print("No patch available. Run /patch or /patchm first.")
+                    continue
                 _print_patch_preview(last_patch_output)
                 continue
-            if last_patch_allowed:
-                ok, bid, msgs = _backup_and_apply_multi(last_patch_allowed, last_patch_output)
-                last_backup_id = bid
+
+            if cmd == "/backups":
+                items = list_backups(limit=20)
+                if not items:
+                    console.print("No backups found.")
+                else:
+                    for it in items:
+                        console.print(f"- {it['id']} | files={it['file_count']} | {it['created_at']}")
+                continue
+
+            if cmd == "/undo" or cmd.startswith("/undo "):
+                bid = cmd.split(" ", 1)[1].strip() if cmd.startswith("/undo ") else last_backup_id
+                if not bid:
+                    console.print("No backup id provided and no recent backup in session.")
+                    continue
+                ok, msgs = restore_backup(bid)
                 for m in msgs:
-                    console.print(f"[green]{m}[/green]" if m.startswith("Applied") else f"[yellow]{m}[/yellow]")
+                    console.print(f"[green]{m}[/green]" if m.startswith(("Restored", "Removed", "No-op")) else f"[yellow]{m}[/yellow]")
                 if not ok:
-                    console.print("[yellow]Patch applied partially or with skips/errors.[/yellow]")
-            else:
-                ok, bid, msg = _backup_and_apply_single(last_patch_file, last_patch_output)
-                last_backup_id = bid
-                console.print((f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]"))
-            continue
+                    console.print("[yellow]Undo completed with errors.[/yellow]")
+                continue
 
-        if cmd.startswith("/trace "):
-            val = cmd.split(" ", 1)[1].strip().lower()
-            if val in {"on", "off"}:
-                show_trace = val == "on"
-                console.print(f"trace={show_trace}")
-            else:
-                console.print("Usage: /trace on|off")
-            continue
-
-        if cmd.startswith("/stream "):
-            val = cmd.split(" ", 1)[1].strip().lower()
-            if val in {"on", "off"}:
-                show_stream = val == "on"
-                console.print(f"stream={show_stream}")
-            else:
-                console.print("Usage: /stream on|off")
-            continue
-
-        if cmd.startswith("/mode "):
-            val = cmd.split(" ", 1)[1].strip().lower()
-            if val not in {"auto", "wiki_only", "general_only"}:
-                console.print("[yellow]Usage: /mode auto|wiki_only|general_only[/yellow]")
-                continue
-            session_mode = val
-            console.print(f"[cyan]session mode = {session_mode}[/cyan]")
-            _save_session_state(session_history, mode=session_mode)
-            continue
-
-        if cmd == "/model":
-            config = load_config()
-            _print_runtime_settings(config, session_mode=session_mode)
-            console.print(
-                "[cyan]可切换：/model jiutian-think-v3 | /model jiutian-lan-comv3[/cyan]\n"
-                "[dim]图片理解/图片生成模型会根据问题自动切换。[/dim]"
-            )
-            continue
-
-        if cmd.startswith("/model "):
-            model_name = cmd.split(" ", 1)[1].strip()
-            ok, msg = _set_model_config(model_name)
-            if not ok:
-                console.print(f"[yellow]{msg}[/yellow]")
-                continue
-            console.print(f"[green]{msg}[/green]")
-            config = load_config()
-            agent = build_agent(config)
-            _print_runtime_settings(config, session_mode=session_mode)
-            continue
-
-        if cmd == "/resume":
-            old_hist, old_mode = _load_session_state()
-            if not old_hist:
-                console.print("[yellow]没有可恢复的上次会话记录。[/yellow]")
-                continue
-            session_history = old_hist
-            session_mode = old_mode
-            console.print(f"[green]已恢复上次会话[/green]：{len(session_history)} 轮，mode={session_mode}")
-            _replay_session_on_screen(session_history)
-            continue
-
-        if cmd == "/reset":
-            session_history = []
-            console.print("[cyan]已清空会话上下文记忆。[/cyan]")
-            _clear_session_state_file()
-            continue
-
-        if cmd == "/memdraft" or cmd.startswith("/memdraft "):
-            title_hint = cmd.split(" ", 1)[1].strip() if cmd.startswith("/memdraft ") else ""
-            if not session_history:
-                console.print("[yellow]当前会话暂无可整理内容。请先进行几轮问答。[/yellow]")
-                continue
-            llm = build_llm(config)
-            hist_text = "\n\n".join(
-                [f"### 用户问题\n{q}\n\n### 助手回答\n{a}" for q, a in session_history[-12:]]
-            )
-            system_prompt = (
-                "你是知识工程师。请把给定对话整理为可直接入库的中文 Wiki Markdown 文档。"
-                "要求：结构清晰、可复用、避免口语、不要编造事实。"
-            )
-            user_prompt = (
-                f"文档标题建议：{title_hint or '自动整理会话'}\n\n"
-                "请严格按以下结构输出 Markdown：\n"
-                "# 标题\n"
-                "## 背景\n"
-                "## 结论\n"
-                "## 详细说明\n"
-                "## 操作步骤\n"
-                "## 注意事项\n"
-                "## 标签\n"
-                "对话内容如下：\n\n"
-                f"{hist_text}"
-            )
-            try:
-                draft = _run_llm_with_thinking(
-                    llm,
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    phase="整理会话为Wiki文档中",
-                ).strip()
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]生成草稿失败：{e}[/red]")
-                continue
-            if not draft:
-                console.print("[yellow]已取消或草稿为空，请重试。[/yellow]")
-                continue
-            memory_draft = draft
-            m = re.search(r"^#\s+(.+)$", draft, flags=re.MULTILINE)
-            memory_title = (m.group(1).strip() if m else title_hint or "会话整理")
-            console.print(f"[green]已生成草稿[/green]：{memory_title}")
-            _stream_markdown(draft, enabled=False)
-            console.print("[cyan]可执行 /memsave [标题] 保存到 raw/faq，并随后 /sync[/cyan]")
-            continue
-
-        if cmd == "/memsave" or cmd.startswith("/memsave "):
-            if not memory_draft:
-                console.print("[yellow]当前没有草稿。请先执行 /memdraft[/yellow]")
-                continue
-            title = cmd.split(" ", 1)[1].strip() if cmd.startswith("/memsave ") else memory_title
-            title = title or memory_title or "会话整理"
-            try:
-                out = _save_memory_markdown(config, title, memory_draft)
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[red]保存失败：{e}[/red]")
-                continue
-            console.print(f"[green]已保存：{out}[/green]")
-            console.print("[cyan]请执行 /sync 将该记忆纳入检索。[/cyan]")
-            continue
-
-        remember_turn = False
-        plain_chat_turn = False
-        if cmd.startswith("/ask "):
-            query = cmd[5:].strip()
-            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
-            resp = _run_agent_with_thinking(
-                agent,
-                user_input=query,
-                force_wiki=True,
-                history=session_history,
-                mode="wiki_only",
-            )
-            remember_turn = True
-        elif cmd.startswith("/review "):
-            body = cmd[len("/review ") :].strip()
-            if "::" not in body:
-                console.print("Usage: /review <file> :: <query>")
-                continue
-            file, query = [x.strip() for x in body.split("::", 1)]
-            code = read_file(file)
-            if not code:
-                console.print(f"[red]File not found or empty:[/red] {file}")
-                continue
-            extra_ctx = _build_cross_file_context(query, exclude_files={file})
-            code_ctx = f"file: {file}\n```\\n{code}\\n```"
-            if extra_ctx:
-                code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
-            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
-            resp = _run_agent_with_thinking(
-                agent,
-                user_input=query,
-                force_wiki=True,
-                code_context=code_ctx,
-                history=session_history,
-                mode="wiki_only",
-            )
-        elif cmd.startswith("/patch "):
-            body = cmd[len("/patch ") :].strip()
-            if "::" not in body:
-                console.print("Usage: /patch <file> :: <query>")
-                continue
-            file, query = [x.strip() for x in body.split("::", 1)]
-            code = read_file(file)
-            if not code:
-                console.print(f"[red]File not found or empty:[/red] {file}")
-                continue
-            extra_ctx = _build_cross_file_context(query, exclude_files={file})
-            code_ctx = f"file: {file}\n```\\n{code}\\n```"
-            if extra_ctx:
-                code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
-            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
-            resp = _run_agent_with_thinking(
-                agent,
-                user_input=query,
-                force_wiki=True,
-                code_context=code_ctx,
-                response_mode="patch",
-                target_file=file,
-                history=session_history,
-                mode="wiki_only",
-            )
-            last_patch_file = file
-            last_patch_output = resp.output
-            last_patch_allowed = None
-        elif cmd.startswith("/patchm "):
-            body = cmd[len("/patchm ") :].strip()
-            if "::" not in body:
-                console.print("Usage: /patchm <file1,file2> :: <query>")
-                continue
-            files_part, query = [x.strip() for x in body.split("::", 1)]
-            file_list = [f.strip() for f in files_part.split(",") if f.strip()]
-            if not file_list:
-                console.print("Usage: /patchm <file1,file2> :: <query>")
-                continue
-            blocks: list[str] = []
-            missing = False
-            for f in file_list:
-                code = read_file(f)
-                if not code:
-                    console.print(f"[red]File not found or empty:[/red] {f}")
-                    missing = True
-                    break
-                blocks.append(f"file: {f}\n```\\n{code}\\n```")
-            if missing:
-                continue
-            extra_ctx = _build_cross_file_context(query, exclude_files=set(file_list))
-            code_ctx = "\n\n".join(blocks)
-            if extra_ctx:
-                code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
-            console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
-            resp = _run_agent_with_thinking(
-                agent,
-                user_input=query,
-                force_wiki=True,
-                code_context=code_ctx,
-                response_mode="patch",
-                target_file=", ".join(file_list),
-                history=session_history,
-                mode="wiki_only",
-            )
-            last_patch_file = file_list[0]
-            last_patch_output = resp.output
-            last_patch_allowed = set(file_list)
-        else:
-            console.print(f"[black on bright_cyan] You: {cmd} [/black on bright_cyan]")
-            if _looks_like_kb_save_request(cmd):
-                title_hint = _extract_kb_title(cmd)
-                content_text = _extract_kb_content(cmd)
-                if content_text:
-                    title, markdown_text = _normalize_kb_markdown(content_text, title_hint=title_hint)
+            if cmd == "/apply" or cmd == "/apply yes":
+                if not last_patch_file or not last_patch_output:
+                    console.print("No patch to apply. Run /patch first.")
+                    continue
+                if cmd != "/apply yes":
+                    console.print("[yellow]Use /apply yes to confirm applying patch.[/yellow]")
+                    _print_patch_preview(last_patch_output)
+                    continue
+                if last_patch_allowed:
+                    ok, bid, msgs = _backup_and_apply_multi(last_patch_allowed, last_patch_output)
+                    last_backup_id = bid
+                    for m in msgs:
+                        console.print(f"[green]{m}[/green]" if m.startswith("Applied") else f"[yellow]{m}[/yellow]")
+                    if not ok:
+                        console.print("[yellow]Patch applied partially or with skips/errors.[/yellow]")
                 else:
-                    title, markdown_text = _build_kb_markdown_from_last_turn(session_history, title_hint=title_hint)
-                if not markdown_text:
-                    resp = AgentResponse(
-                        thought="kb_save:no-history",
-                        actions=["kb_save:skipped"],
-                        output=(
-                            "当前没有可写入知识库的内容。\n"
-                            "可先进行一次问答，或直接输入：\n"
-                            "写入知识库 标题：xxx 内容：..."
-                        ),
-                    )
-                    remember_turn = False
+                    ok, bid, msg = _backup_and_apply_single(last_patch_file, last_patch_output)
+                    last_backup_id = bid
+                    console.print((f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]"))
+                continue
+
+            if cmd.startswith("/trace "):
+                val = cmd.split(" ", 1)[1].strip().lower()
+                if val in {"on", "off"}:
+                    show_trace = val == "on"
+                    console.print(f"trace={show_trace}")
                 else:
-                    try:
-                        cfg_now = load_config()
-                        out = _save_memory_markdown(cfg_now, title, markdown_text)
-                        resp = AgentResponse(
-                            thought="kb_save:ok",
-                            actions=[f"kb_save(path='{out}')"],
-                            output=(
-                                "已实际写入本地知识库文件：\n"
-                                f"{out}\n\n"
-                                "你可继续执行 /sync 将其纳入检索。"
-                            ),
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        resp = AgentResponse(
-                            thought="kb_save:failed",
-                            actions=["kb_save:error"],
-                            output=f"写入本地知识库失败：{e}",
-                        )
-                    remember_turn = True
-                plain_chat_turn = False
-            elif _looks_like_image_understand_request(cmd):
+                    console.print("Usage: /trace on|off")
+                continue
+
+            if cmd.startswith("/stream "):
+                val = cmd.split(" ", 1)[1].strip().lower()
+                if val in {"on", "off"}:
+                    show_stream = val == "on"
+                    console.print(f"stream={show_stream}")
+                else:
+                    console.print("Usage: /stream on|off")
+                continue
+
+            if cmd.startswith("/mode "):
+                val = cmd.split(" ", 1)[1].strip().lower()
+                if val not in {"auto", "wiki_only", "general_only"}:
+                    console.print("[yellow]Usage: /mode auto|wiki_only|general_only[/yellow]")
+                    continue
+                session_mode = val
+                console.print(f"[cyan]session mode = {session_mode}[/cyan]")
+                _save_session_state(session_history, mode=session_mode)
+                continue
+
+            if cmd == "/model":
                 config = load_config()
-                _ensure_auto_image_models(config)
-                llm = build_llm(config)
-                q, img_url = _extract_image_understand_prompt(cmd)
-                try:
-                    result = _run_image_understand_with_thinking(
-                        llm,
-                        prompt=q,
-                        image_url=img_url,
-                        phase="图片理解中",
-                    )
-                    if not result:
-                        resp = AgentResponse(
-                            thought="cancelled-by-user",
-                            actions=["cancelled: ESC pressed"],
-                            output="已取消本次图片理解。",
-                        )
-                        remember_turn = False
-                    else:
-                        text_out = result
-                        try:
-                            payload = json.loads(result)
-                            _, _, texts = _extract_image_fields(payload)
-                            if texts:
-                                text_out = "\n\n".join(texts[:5])
-                        except Exception:
-                            pass
-                        resp = AgentResponse(
-                            thought=f"image_understand(provider={config.llm.provider}, model={config.llm.image_understand_model})",
-                            actions=[f"image_understand(url='{img_url[:60]}...')"],
-                            output=text_out or "图片理解完成，但未返回可读文本。",
-                        )
-                        remember_turn = True
-                except Exception as e:  # noqa: BLE001
-                    resp = AgentResponse(
-                        thought="image_understand:failed",
-                        actions=["image_understand:error"],
-                        output=f"图片理解失败：{e}",
-                    )
-                    remember_turn = True
-                plain_chat_turn = False
-            elif _looks_like_image_generate_request(cmd):
+                _print_runtime_settings(config, session_mode=session_mode)
+                console.print(
+                    "[cyan]可切换：/model jiutian-think-v3 | /model jiutian-lan-comv3[/cyan]\n"
+                    "[dim]图片理解/图片生成模型会根据问题自动切换。[/dim]"
+                )
+                continue
+
+            if cmd.startswith("/model "):
+                model_name = cmd.split(" ", 1)[1].strip()
+                ok, msg = _set_model_config(model_name)
+                if not ok:
+                    console.print(f"[yellow]{msg}[/yellow]")
+                    continue
+                console.print(f"[green]{msg}[/green]")
                 config = load_config()
-                _ensure_auto_image_models(config)
+                agent = build_agent(config)
+                _print_runtime_settings(config, session_mode=session_mode)
+                continue
+
+            if cmd == "/resume":
+                old_hist, old_mode = _load_session_state()
+                if not old_hist:
+                    console.print("[yellow]没有可恢复的上次会话记录。[/yellow]")
+                    continue
+                session_history = old_hist
+                session_mode = old_mode
+                console.print(f"[green]已恢复上次会话[/green]：{len(session_history)} 轮，mode={session_mode}")
+                _replay_session_on_screen(session_history)
+                continue
+
+            if cmd == "/reset":
+                session_history = []
+                console.print("[cyan]已清空会话上下文记忆。[/cyan]")
+                _clear_session_state_file()
+                continue
+
+            if cmd == "/memdraft" or cmd.startswith("/memdraft "):
+                title_hint = cmd.split(" ", 1)[1].strip() if cmd.startswith("/memdraft ") else ""
+                if not session_history:
+                    console.print("[yellow]当前会话暂无可整理内容。请先进行几轮问答。[/yellow]")
+                    continue
                 llm = build_llm(config)
-                img_prompt = _extract_image_generate_prompt(cmd)
+                hist_text = "\n\n".join(
+                    [f"### 用户问题\n{q}\n\n### 助手回答\n{a}" for q, a in session_history[-12:]]
+                )
+                system_prompt = (
+                    "你是知识工程师。请把给定对话整理为可直接入库的中文 Wiki Markdown 文档。"
+                    "要求：结构清晰、可复用、避免口语、不要编造事实。"
+                )
+                user_prompt = (
+                    f"文档标题建议：{title_hint or '自动整理会话'}\n\n"
+                    "请严格按以下结构输出 Markdown：\n"
+                    "# 标题\n"
+                    "## 背景\n"
+                    "## 结论\n"
+                    "## 详细说明\n"
+                    "## 操作步骤\n"
+                    "## 注意事项\n"
+                    "## 标签\n"
+                    "对话内容如下：\n\n"
+                    f"{hist_text}"
+                )
                 try:
-                    result = _run_image_generate_with_thinking(
+                    draft = _run_llm_with_thinking(
                         llm,
-                        prompt=img_prompt,
-                        size="1024x1024",
-                        phase="图片生成中",
-                    )
-                    if not result:
-                        resp = AgentResponse(
-                            thought="cancelled-by-user",
-                            actions=["cancelled: ESC pressed"],
-                            output="已取消本次图片生成。",
-                        )
-                        remember_turn = False
-                    else:
-                        urls, saved_files, meta_file = _save_image_result(
-                            result,
-                            save_dir="data/generated_images",
-                            prefix="imggen",
-                            image_asset_host=config.llm.image_asset_host,
-                        )
-                        lines = [f"已完成图片生成（模型：{config.llm.image_generate_model}）。"]
-                        if saved_files:
-                            lines.append("\n保存文件：")
-                            lines.extend([f"- {p}" for p in saved_files])
-                        if urls:
-                            lines.append("\n图片链接：")
-                            lines.extend([f"- {u}" for u in urls])
-                        lines.append(f"\n原始响应保存：{meta_file}")
-                        resp = AgentResponse(
-                            thought=f"image_generate(provider={config.llm.provider}, model={config.llm.image_generate_model})",
-                            actions=[f"image_generate(prompt='{img_prompt[:60]}...')"],
-                            output="\n".join(lines),
-                        )
-                        remember_turn = True
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        phase="整理会话为Wiki文档中",
+                    ).strip()
                 except Exception as e:  # noqa: BLE001
-                    resp = AgentResponse(
-                        thought="image_generate:failed",
-                        actions=["image_generate:error"],
-                        output=f"图片生成失败：{e}",
-                    )
-                    remember_turn = True
-                plain_chat_turn = False
-            elif _looks_like_script_request(cmd):
-                console.print("[dim]检测到编码/自动化需求：直连代码执行流程（跳过 Wiki 检索）[/dim]")
-                seed_resp = AgentResponse(
-                    thought="code-assist:direct-pipeline",
-                    actions=["code_pipeline:start"],
-                    output="已识别为编码任务，开始执行：需求分析 → 结构探测 → 生成脚本 → 自动调试。",
-                )
-                resp = _auto_script_pipeline(
-                    agent=agent,
-                    user_query=cmd,
-                    resp=seed_resp,
-                    history=session_history,
-                    consent_state=local_op_consent,
-                )
-                remember_turn = resp.thought != "cancelled-by-user"
-                plain_chat_turn = False
-            else:
-                auto_ctx = _extract_existing_py_context(cmd)
-                if _looks_like_script_request(cmd):
-                    xctx = _build_cross_file_context(cmd)
-                    if xctx:
-                        auto_ctx = (auto_ctx + "\n\n" if auto_ctx else "") + "[Cross-file context]\n" + xctx
+                    console.print(f"[red]生成草稿失败：{e}[/red]")
+                    continue
+                if not draft:
+                    console.print("[yellow]已取消或草稿为空，请重试。[/yellow]")
+                    continue
+                memory_draft = draft
+                m = re.search(r"^#\s+(.+)$", draft, flags=re.MULTILINE)
+                memory_title = (m.group(1).strip() if m else title_hint or "会话整理")
+                console.print(f"[green]已生成草稿[/green]：{memory_title}")
+                _stream_markdown(draft, enabled=False)
+                console.print("[cyan]可执行 /memsave [标题] 保存到 raw/faq，并随后 /sync[/cyan]")
+                continue
+
+            if cmd == "/memsave" or cmd.startswith("/memsave "):
+                if not memory_draft:
+                    console.print("[yellow]当前没有草稿。请先执行 /memdraft[/yellow]")
+                    continue
+                title = cmd.split(" ", 1)[1].strip() if cmd.startswith("/memsave ") else memory_title
+                title = title or memory_title or "会话整理"
+                try:
+                    out = _save_memory_markdown(config, title, memory_draft)
+                except Exception as e:  # noqa: BLE001
+                    console.print(f"[red]保存失败：{e}[/red]")
+                    continue
+                console.print(f"[green]已保存：{out}[/green]")
+                console.print("[cyan]请执行 /sync 将该记忆纳入检索。[/cyan]")
+                continue
+
+            remember_turn = False
+            plain_chat_turn = False
+            if cmd.startswith("/ask "):
+                query = cmd[5:].strip()
+                console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
                 resp = _run_agent_with_thinking(
                     agent,
-                    user_input=cmd,
-                    force_wiki=False,
-                    code_context=auto_ctx,
+                    user_input=query,
+                    force_wiki=True,
                     history=session_history,
-                    mode=session_mode,
+                    mode="wiki_only",
                 )
                 remember_turn = True
-                plain_chat_turn = True
-
-        if plain_chat_turn and resp.thought != "cancelled-by-user":
-            resp = _auto_script_pipeline(
-                agent=agent,
-                user_query=cmd,
-                resp=resp,
-                history=session_history,
-                consent_state=local_op_consent,
-            )
-
-        is_patch_cmd = cmd.startswith("/patch ") or cmd.startswith("/patchm ")
-        if is_patch_cmd and resp.thought != "cancelled-by-user":
-            _print_patch_preview(resp.output)
-            target_desc = ", ".join(sorted(last_patch_allowed)) if last_patch_allowed else last_patch_file
-            if target_desc and _confirm_local_operation(local_op_consent, f"立即应用补丁到：{target_desc}"):
-                if last_patch_allowed:
-                    ok_apply, bid, msgs = _backup_and_apply_multi(last_patch_allowed, resp.output)
-                    last_backup_id = bid
-                    apply_msg = "\n".join(msgs)
+            elif cmd.startswith("/review "):
+                body = cmd[len("/review ") :].strip()
+                if "::" not in body:
+                    console.print("Usage: /review <file> :: <query>")
+                    continue
+                file, query = [x.strip() for x in body.split("::", 1)]
+                code = read_file(file)
+                if not code:
+                    console.print(f"[red]File not found or empty:[/red] {file}")
+                    continue
+                extra_ctx = _build_cross_file_context(query, exclude_files={file})
+                code_ctx = f"file: {file}\n```\\n{code}\\n```"
+                if extra_ctx:
+                    code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
+                console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
+                resp = _run_agent_with_thinking(
+                    agent,
+                    user_input=query,
+                    force_wiki=True,
+                    code_context=code_ctx,
+                    history=session_history,
+                    mode="wiki_only",
+                )
+            elif cmd.startswith("/patch "):
+                body = cmd[len("/patch ") :].strip()
+                if "::" not in body:
+                    console.print("Usage: /patch <file> :: <query>")
+                    continue
+                file, query = [x.strip() for x in body.split("::", 1)]
+                code = read_file(file)
+                if not code:
+                    console.print(f"[red]File not found or empty:[/red] {file}")
+                    continue
+                extra_ctx = _build_cross_file_context(query, exclude_files={file})
+                code_ctx = f"file: {file}\n```\\n{code}\\n```"
+                if extra_ctx:
+                    code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
+                console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
+                resp = _run_agent_with_thinking(
+                    agent,
+                    user_input=query,
+                    force_wiki=True,
+                    code_context=code_ctx,
+                    response_mode="patch",
+                    target_file=file,
+                    history=session_history,
+                    mode="wiki_only",
+                )
+                last_patch_file = file
+                last_patch_output = resp.output
+                last_patch_allowed = None
+            elif cmd.startswith("/patchm "):
+                body = cmd[len("/patchm ") :].strip()
+                if "::" not in body:
+                    console.print("Usage: /patchm <file1,file2> :: <query>")
+                    continue
+                files_part, query = [x.strip() for x in body.split("::", 1)]
+                file_list = [f.strip() for f in files_part.split(",") if f.strip()]
+                if not file_list:
+                    console.print("Usage: /patchm <file1,file2> :: <query>")
+                    continue
+                blocks: list[str] = []
+                missing = False
+                for f in file_list:
+                    code = read_file(f)
+                    if not code:
+                        console.print(f"[red]File not found or empty:[/red] {f}")
+                        missing = True
+                        break
+                    blocks.append(f"file: {f}\n```\\n{code}\\n```")
+                if missing:
+                    continue
+                extra_ctx = _build_cross_file_context(query, exclude_files=set(file_list))
+                code_ctx = "\n\n".join(blocks)
+                if extra_ctx:
+                    code_ctx += "\n\n[Cross-file context]\n" + extra_ctx
+                console.print(f"[black on bright_cyan] You: {query} [/black on bright_cyan]")
+                resp = _run_agent_with_thinking(
+                    agent,
+                    user_input=query,
+                    force_wiki=True,
+                    code_context=code_ctx,
+                    response_mode="patch",
+                    target_file=", ".join(file_list),
+                    history=session_history,
+                    mode="wiki_only",
+                )
+                last_patch_file = file_list[0]
+                last_patch_output = resp.output
+                last_patch_allowed = set(file_list)
+            else:
+                console.print(f"[black on bright_cyan] You: {cmd} [/black on bright_cyan]")
+                if _looks_like_kb_save_request(cmd):
+                    title_hint = _extract_kb_title(cmd)
+                    content_text = _extract_kb_content(cmd)
+                    if content_text:
+                        title, markdown_text = _normalize_kb_markdown(content_text, title_hint=title_hint)
+                    else:
+                        title, markdown_text = _build_kb_markdown_from_last_turn(session_history, title_hint=title_hint)
+                    if not markdown_text:
+                        resp = AgentResponse(
+                            thought="kb_save:no-history",
+                            actions=["kb_save:skipped"],
+                            output=(
+                                "当前没有可写入知识库的内容。\n"
+                                "可先进行一次问答，或直接输入：\n"
+                                "写入知识库 标题：xxx 内容：..."
+                            ),
+                        )
+                        remember_turn = False
+                    else:
+                        try:
+                            cfg_now = load_config()
+                            out = _save_memory_markdown(cfg_now, title, markdown_text)
+                            resp = AgentResponse(
+                                thought="kb_save:ok",
+                                actions=[f"kb_save(path='{out}')"],
+                                output=(
+                                    "已实际写入本地知识库文件：\n"
+                                    f"{out}\n\n"
+                                    "你可继续执行 /sync 将其纳入检索。"
+                                ),
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            resp = AgentResponse(
+                                thought="kb_save:failed",
+                                actions=["kb_save:error"],
+                                output=f"写入本地知识库失败：{e}",
+                            )
+                        remember_turn = True
+                    plain_chat_turn = False
+                elif _looks_like_image_understand_request(cmd):
+                    config = load_config()
+                    _ensure_auto_image_models(config)
+                    llm = build_llm(config)
+                    q, img_url = _extract_image_understand_prompt(cmd)
+                    try:
+                        result = _run_image_understand_with_thinking(
+                            llm,
+                            prompt=q,
+                            image_url=img_url,
+                            phase="图片理解中",
+                        )
+                        if not result:
+                            resp = AgentResponse(
+                                thought="cancelled-by-user",
+                                actions=["cancelled: ESC pressed"],
+                                output="已取消本次图片理解。",
+                            )
+                            remember_turn = False
+                        else:
+                            text_out = result
+                            try:
+                                payload = json.loads(result)
+                                _, _, texts = _extract_image_fields(payload)
+                                if texts:
+                                    text_out = "\n\n".join(texts[:5])
+                            except Exception:
+                                pass
+                            resp = AgentResponse(
+                                thought=f"image_understand(provider={config.llm.provider}, model={config.llm.image_understand_model})",
+                                actions=[f"image_understand(url='{img_url[:60]}...')"],
+                                output=text_out or "图片理解完成，但未返回可读文本。",
+                            )
+                            remember_turn = True
+                    except Exception as e:  # noqa: BLE001
+                        resp = AgentResponse(
+                            thought="image_understand:failed",
+                            actions=["image_understand:error"],
+                            output=f"图片理解失败：{e}",
+                        )
+                        remember_turn = True
+                    plain_chat_turn = False
+                elif _looks_like_image_generate_request(cmd):
+                    config = load_config()
+                    _ensure_auto_image_models(config)
+                    llm = build_llm(config)
+                    img_prompt = _extract_image_generate_prompt(cmd)
+                    try:
+                        result = _run_image_generate_with_thinking(
+                            llm,
+                            prompt=img_prompt,
+                            size="1024x1024",
+                            phase="图片生成中",
+                        )
+                        if not result:
+                            resp = AgentResponse(
+                                thought="cancelled-by-user",
+                                actions=["cancelled: ESC pressed"],
+                                output="已取消本次图片生成。",
+                            )
+                            remember_turn = False
+                        else:
+                            urls, saved_files, meta_file = _save_image_result(
+                                result,
+                                save_dir="data/generated_images",
+                                prefix="imggen",
+                                image_asset_host=config.llm.image_asset_host,
+                            )
+                            lines = [f"已完成图片生成（模型：{config.llm.image_generate_model}）。"]
+                            if saved_files:
+                                lines.append("\n保存文件：")
+                                lines.extend([f"- {p}" for p in saved_files])
+                            if urls:
+                                lines.append("\n图片链接：")
+                                lines.extend([f"- {u}" for u in urls])
+                            lines.append(f"\n原始响应保存：{meta_file}")
+                            resp = AgentResponse(
+                                thought=f"image_generate(provider={config.llm.provider}, model={config.llm.image_generate_model})",
+                                actions=[f"image_generate(prompt='{img_prompt[:60]}...')"],
+                                output="\n".join(lines),
+                            )
+                            remember_turn = True
+                    except Exception as e:  # noqa: BLE001
+                        resp = AgentResponse(
+                            thought="image_generate:failed",
+                            actions=["image_generate:error"],
+                            output=f"图片生成失败：{e}",
+                        )
+                        remember_turn = True
+                    plain_chat_turn = False
+                elif _looks_like_script_request(cmd):
+                    console.print("[dim]检测到编码/自动化需求：直连代码执行流程（跳过 Wiki 检索）[/dim]")
+                    seed_resp = AgentResponse(
+                        thought="code-assist:direct-pipeline",
+                        actions=["code_pipeline:start"],
+                        output="已识别为编码任务，开始执行：需求分析 → 结构探测 → 生成脚本 → 自动调试。",
+                    )
+                    try:
+                        resp = _auto_script_pipeline(
+                            agent=agent,
+                            user_query=cmd,
+                            resp=seed_resp,
+                            history=session_history,
+                            consent_state=local_op_consent,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        console.print(f"[red]编码流水线异常：{e}[/red]")
+                        resp = AgentResponse(
+                            thought="code-pipeline:error",
+                            actions=["pipeline_error"],
+                            output=f"编码流水线执行异常：{e}\n建议增大 timeout_seconds 或检查网络连接后重试。",
+                        )
+                    remember_turn = resp.thought != "cancelled-by-user"
+                    plain_chat_turn = False
                 else:
-                    ok_apply, bid, apply_msg = _backup_and_apply_single(last_patch_file, resp.output)
-                    last_backup_id = bid
-                status_line = "[补丁应用] 成功" if ok_apply else "[补丁应用] 失败"
-                resp.output = f"{resp.output}\n\n---\n{status_line}\n{apply_msg}"
-                if ok_apply:
-                    last_patch_file = ""
-                    last_patch_output = ""
-                    last_patch_allowed = None
+                    auto_ctx = _extract_existing_py_context(cmd)
+                    if _looks_like_script_request(cmd):
+                        xctx = _build_cross_file_context(cmd)
+                        if xctx:
+                            auto_ctx = (auto_ctx + "\n\n" if auto_ctx else "") + "[Cross-file context]\n" + xctx
+                    resp = _run_agent_with_thinking(
+                        agent,
+                        user_input=cmd,
+                        force_wiki=False,
+                        code_context=auto_ctx,
+                        history=session_history,
+                        mode=session_mode,
+                    )
+                    remember_turn = True
+                    plain_chat_turn = True
 
-        if show_trace:
-            _print_trace(resp.thought, resp.actions)
+            if plain_chat_turn and resp.thought != "cancelled-by-user":
+                try:
+                    resp = _auto_script_pipeline(
+                        agent=agent,
+                        user_query=cmd,
+                        resp=resp,
+                        history=session_history,
+                        consent_state=local_op_consent,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass  # pipeline 内部已有异常保护，此处兜底防崩溃
 
-        if resp.thought == "cancelled-by-user":
-            remember_turn = False
+            is_patch_cmd = cmd.startswith("/patch ") or cmd.startswith("/patchm ")
+            if is_patch_cmd and resp.thought != "cancelled-by-user":
+                _print_patch_preview(resp.output)
+                target_desc = ", ".join(sorted(last_patch_allowed)) if last_patch_allowed else last_patch_file
+                if target_desc and _confirm_local_operation(local_op_consent, f"立即应用补丁到：{target_desc}"):
+                    if last_patch_allowed:
+                        ok_apply, bid, msgs = _backup_and_apply_multi(last_patch_allowed, resp.output)
+                        last_backup_id = bid
+                        apply_msg = "\n".join(msgs)
+                    else:
+                        ok_apply, bid, apply_msg = _backup_and_apply_single(last_patch_file, resp.output)
+                        last_backup_id = bid
+                    status_line = "[补丁应用] 成功" if ok_apply else "[补丁应用] 失败"
+                    resp.output = f"{resp.output}\n\n---\n{status_line}\n{apply_msg}"
+                    if ok_apply:
+                        last_patch_file = ""
+                        last_patch_output = ""
+                        last_patch_allowed = None
 
-        if not getattr(resp, "_already_streamed", False):
-            _stream_markdown(resp.output, enabled=show_stream)
-        if remember_turn:
-            session_history.append((cmd, resp.output))
-            if len(session_history) > 12:
-                session_history = session_history[-12:]
-            _save_session_state(session_history, mode=session_mode)
+            if show_trace:
+                _print_trace(resp.thought, resp.actions)
+
+            if resp.thought == "cancelled-by-user":
+                remember_turn = False
+
+            if not getattr(resp, "_already_streamed", False):
+                _stream_markdown(resp.output, enabled=show_stream)
+            if remember_turn:
+                session_history.append((cmd, resp.output))
+                if len(session_history) > 20:
+                    session_history = session_history[-20:]
+                _save_session_state(session_history, mode=session_mode)
+        except KeyboardInterrupt:
+            console.print("\n[yellow]已中断当前操作，可继续输入。[/yellow]")
+            continue
+        except SystemExit:
+            break
+        except BaseException as e:  # noqa: BLE001
+            console.print(f"\n[red]未预期异常（会话不中断）：{type(e).__name__}: {e}[/red]")
+            console.print("[dim]可继续输入命令。如问题持续，请检查 config.yaml 或重启。[/dim]")
+            continue
 
 
 if __name__ == "__main__":
