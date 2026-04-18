@@ -1,4 +1,4 @@
-﻿llm:
+llm:
   provider: "jiutian"
   model: "jiutian-think-v3"
   api_key: "YOUR_JIUTIAN_API_KEY"
@@ -9,7 +9,7 @@
   image_understand_url: null
   image_generate_url: null
   temperature: 0.2
-  timeout_seconds: 45
+  timeout_seconds: 120
 
 wiki_strategy:
   # 推荐：统一设置 vault_path，程序会自动派生 raw/wiki/wiki_processed
