@@ -31,6 +31,13 @@ class LLMConfig:
 @dataclass
 class WikiStrategyConfig:
     vault_path: Path | None
+    temperature: float
+    timeout_seconds: int
+
+
+@dataclass
+class WikiStrategyConfig:
+    vault_path: Path | None
     raw_path: Path
     wiki_path: Path
     processed_path: Path
@@ -38,6 +45,7 @@ class WikiStrategyConfig:
     wiki_subdirs: list[str]
     raw_to_wiki_map: dict[str, str]
     synonyms_path: Path
+    business_terms_path: Path
     split_mode: str
     heading_level: int
     wiki_compile_on_sync: bool
@@ -149,6 +157,8 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
     wiki_path = _resolve_path(wiki_data.get("wiki_path", str(wiki_default)))
     processed_path = _resolve_path(wiki_data.get("processed_path", str(processed_default)))
     synonyms_path = _resolve_path(wiki_data.get("synonyms_path", "./data/dictionaries/synonyms_zh.yaml"))
+    business_terms_path = _resolve_path(wiki_data.get("business_terms_path", "./data/dictionaries/business_terms.yaml"))
+
     # Support both raw_subdirs and legacy typo row_subdirs
     raw_subdirs_cfg = wiki_data.get("raw_subdirs")
     if raw_subdirs_cfg is None:
@@ -190,6 +200,7 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
         wiki_subdirs=wiki_subdirs,
         raw_to_wiki_map=raw_to_wiki_map,
         synonyms_path=synonyms_path,
+        business_terms_path=business_terms_path,
         split_mode=str(wiki_data.get("split_mode", "heading")),
         heading_level=int(wiki_data.get("heading_level", 2)),
         wiki_compile_on_sync=bool(wiki_data.get("wiki_compile_on_sync", True)),

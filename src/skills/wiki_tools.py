@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from src.core.query_rewriter import QueryRewrite, load_synonyms, rewrite_query
+from src.core.query_rewriter import QueryRewrite, load_synonyms, rewrite_query, load_business_terms
 from src.utils.config import PROJECT_ROOT
 from src.utils.db_manager import get_chunk_by_id, list_structure, search_chunks
 
@@ -33,8 +33,11 @@ def wiki_search_v2(
     query: str,
     limit: int = 20,
     synonyms_path: Path | str | None = None,
+    business_terms_path: Path | str | None = None,
 ) -> tuple[list[dict[str, Any]], QueryRewrite]:
-    rw = rewrite_query(query, synonyms=load_synonyms(synonyms_path))
+    syns = load_synonyms(synonyms_path)
+    cores = load_business_terms(business_terms_path)
+    rw = rewrite_query(query, synonyms=syns, core_keywords=cores)
     if not query.strip():
         return [], rw
 

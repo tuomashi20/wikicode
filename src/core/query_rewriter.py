@@ -43,33 +43,72 @@ class QueryRewrite:
 
 
 
-def _tokenize(query: str) -> list[str]:
+def load_business_terms(path: Path | str | None) -> list[str]:
+    """加载核心业务词列表。"""
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        return []
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        if isinstance(data, dict):
+            return [str(x).strip() for x in data.get("core_keywords", []) if str(x).strip()]
+        return []
+    except Exception:
+        return []
+
+
+
+def _tokenize(query: str, core_keywords: list[str] | None = None) -> list[str]:
     q = query.strip().lower()
     if not q:
         return []
 
-    tokens: list[str] = []
-    tokens.extend(re.findall(r"[a-z0-9_]{2,}", q))
+    tokens_with_score: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    cores = set(x.lower() for x in (core_keywords or []))
+
+    # 1. 提取基础词块 (英文/数字)
+    for match in re.findall(r"[a-z0-9_]{2,}", q):
+        if match not in seen:
+            score = 100 if match.isdigit() else 50
+            tokens_with_score.append((match, score))
+            seen.add(match)
+
+    # 2. 提取中文序列并生成 N-grams
     cn_seqs = re.findall(r"[\u4e00-\u9fff]{2,}", q)
     for seq in cn_seqs:
-        if len(seq) <= 8:
-            tokens.append(seq)
+        # 保留原词块（取消 8 位限制）
+        if seq not in seen:
+            score = 80
+            if seq in cores:
+                score = 200  # 核心词最高分
+            tokens_with_score.append((seq, score))
+            seen.add(seq)
+
+        # 生成 N-grams 滑窗
         for n in (4, 3, 2):
             if len(seq) >= n:
                 for i in range(0, len(seq) - n + 1):
                     gram = seq[i : i + n]
-                    if gram not in _STOPWORDS:
-                        tokens.append(gram)
+                    if gram not in _STOPWORDS and gram not in seen:
+                        score = 40
+                        if gram in cores:
+                            score = 150 # 核心词片段也给高分
+                        tokens_with_score.append((gram, score))
+                        seen.add(gram)
 
+    # 3. 按优先级排序（分数高者优先，同分者按原始位置顺序）
+    tokens_with_score.sort(key=lambda x: x[1], reverse=True)
+    
+    # 扩大配额至 40 个 Token
     out: list[str] = []
-    seen: set[str] = set()
-    for t in tokens:
+    for t, _ in tokens_with_score:
         if t in _STOPWORDS:
             continue
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-        if len(out) >= 20:
+        out.append(t)
+        if len(out) >= 40:
             break
     return out
 
@@ -97,8 +136,12 @@ def load_synonyms(path: Path | str | None) -> dict[str, list[str]]:
 
 
 
-def rewrite_query(query: str, synonyms: dict[str, list[str]] | None = None) -> QueryRewrite:
-    keywords = _tokenize(query)
+def rewrite_query(
+    query: str, 
+    synonyms: dict[str, list[str]] | None = None,
+    core_keywords: list[str] | None = None,
+) -> QueryRewrite:
+    keywords = _tokenize(query, core_keywords=core_keywords)
     expanded: list[str] = []
     seen: set[str] = set()
     syn_map = synonyms or _DEFAULT_SYNONYMS
@@ -114,9 +157,9 @@ def rewrite_query(query: str, synonyms: dict[str, list[str]] | None = None) -> Q
                         expanded.append(s)
                         seen.add(s)
 
-    expanded = expanded[:10]
-    fts_query = " OR ".join([f'"{t}"' for t in expanded[:8]]) if expanded else ""
-    suggest_terms = expanded[:6]
+    expanded = expanded[:20] # 扩大扩展后的词容量
+    fts_query = " OR ".join([f'"{t}"' for t in expanded[:15]]) if expanded else ""
+    suggest_terms = expanded[:8]
 
     return QueryRewrite(
         original=query,

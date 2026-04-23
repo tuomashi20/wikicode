@@ -105,6 +105,8 @@ class SlashCommandCompleter(Completer):
             ("/xlsx2md ", "xlsx 转 markdown（文件或目录）"),
             ("/pdf2md ", "pdf 转 markdown（文件或目录）"),
             ("/docx2md ", "word 转 markdown（文件或目录）"),
+            ("/md2canvas ", "markdown 转 obsidian canvas（正则版）"),
+            ("/md2canvas_ai ", "markdown 转 obsidian canvas（AI 增强版）"),
             ("/exit", "退出 CLI"),
             ("/help advanced", "查看高级命令"),
         ]
@@ -2397,6 +2399,11 @@ def chat(
                     console.print(f"[cyan]完成，共转换 {len(outs)} 个文件。[/cyan]")
                 continue
 
+            if cmd == "/md2canvas" or cmd.startswith("/md2canvas ") or cmd.startswith("/md2canvas_ai"):
+                from src.skills.canvas_tools import handle_canvas_command
+                handle_canvas_command(cmd)
+                continue
+
             if cmd in {"/kbclear", "/kbclear yes", "/kbclear all yes"}:
                 if cmd == "/kbclear":
                     console.print("[yellow]危险操作，请使用 /kbclear yes 或 /kbclear all yes 确认。[/yellow]")
@@ -3132,6 +3139,18 @@ def chat(
             console.print(f"\n[red]未预期异常（会话不中断）：{type(e).__name__}: {e}[/red]")
             console.print("[dim]可继续输入命令。如问题持续，请检查 config.yaml 或重启。[/dim]")
             continue
+
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", help="监听地址"),
+    port: int = typer.Option(8000, help="监听端口"),
+):
+    """启动 Wikicodian 后端 Web 服务"""
+    from src.core.web_api import start_server
+    console.print(f"[bold green]Wikicodian 服务启动中...[/bold green] 地址: http://{host}:{port}")
+    start_server(host=host, port=port)
 
 
 if __name__ == "__main__":

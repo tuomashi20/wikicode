@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from src.core.llm_client import LLMClient
+from src.core.query_rewriter import QueryRewrite, load_business_terms
 from src.skills.wiki_tools import wiki_read_chunk, wiki_search_v2
 from src.utils.config import AppConfig
 from src.utils.logger import get_file_logger
@@ -29,6 +30,7 @@ class WikiFirstAgent:
         self.config = config
         self.logger = get_file_logger("session", "session.log")
         self.llm = LLMClient(config.llm)
+        self.core_keywords = load_business_terms(config.wiki_strategy.business_terms_path)
 
     def run(
         self,
@@ -75,17 +77,31 @@ class WikiFirstAgent:
             on_status("wiki_search: started")
 
         results, rw = (
-            wiki_search_v2(query, limit=8, synonyms_path=self.config.wiki_strategy.synonyms_path) if query else ([], None)
+            wiki_search_v2(
+                query, 
+                limit=8, 
+                synonyms_path=self.config.wiki_strategy.synonyms_path,
+                business_terms_path=self.config.wiki_strategy.business_terms_path
+            ) if query else ([], None)
         )
         if rw is not None:
             _act(f"query_rewrite(keywords={rw.keywords[:6]}, expanded={rw.expanded_terms[:6]})")
         _act(f"wiki_search_v2(query={query!r}) -> {len(results)}")
 
         terms = self._build_query_terms(query, rw)
-        reliable = self._filter_reliable_results(results, terms)
+        reliable = self._filter_reliable_results(results, terms, self.core_keywords, query)
+        
         if results and not reliable:
             _act("wiki_relevance_filter: drop_all_low_relevance")
         elif reliable and len(reliable) < len(results):
+            # 强化检查：如果 Top 3 没有核心词，尝试在全集里打捞
+            query_core = [k for k in self.core_keywords if k.lower() in query.lower()]
+            if query_core and not any(any(k.lower() in r.get("title", "").lower() for k in query_core) for r in reliable[:2]):
+                reordered = self._rerank_by_business_core(results, query_core)
+                if reordered and reordered[0]["chunk_id"] != reliable[0]["chunk_id"]:
+                    reliable = reordered
+                    _act(f"wiki_rerank: promote_business_core_match(found={len(reordered)})")
+            
             _act(f"wiki_relevance_filter: keep={len(reliable)}/{len(results)}")
 
         if reliable:
@@ -161,30 +177,71 @@ class WikiFirstAgent:
                 out.append(part)
         return out[:16]
 
-    @staticmethod
-    def _filter_reliable_results(results: list[dict], terms: list[str]) -> list[dict]:
+    def _filter_reliable_results(
+        self, 
+        results: list[dict], 
+        terms: list[str], 
+        core_keywords: list[str] | None = None,
+        query: str = ""
+    ) -> list[dict]:
         if not results or not terms:
             return []
 
         reliable: list[dict] = []
+        cores = [k.lower() for k in (core_keywords or [])]
+        query_cores = [k for k in cores if k in query.lower()]
+
         for r in results:
+            title = str(r.get("title", "")).lower()
             text = " ".join(
                 [
-                    str(r.get("title", "")),
+                    title,
                     str(r.get("tags", "")),
                     str(r.get("parent_file", "")),
                     str(r.get("content_text", ""))[:1200],
                 ]
             ).lower()
-            hit = sum(1 for t in terms if t and t in text)
-            if hit >= 2:
+            
+            hit_count = sum(1 for t in terms if t and t in text)
+            
+            # 核心词拦截逻辑：如果问题含核心词但文档完全没边，即便命中数字也降权
+            has_core_hit = any(k in text for k in query_cores)
+            is_digit_only = hit_count > 0 and all(t.isdigit() or len(t) < 3 for t in terms if t in text and not any(k in t for k in cores))
+            
+            if query_cores and not has_core_hit and is_digit_only:
+                continue # 噪音拦截：拦截仅命中年份但无业务词的文档
+
+            if hit_count >= 2:
+                # 标题命中核心词加权
+                if any(k in title for k in query_cores):
+                    r["_score"] = float(r.get("_score", 0)) + 1000
                 reliable.append(r)
                 continue
-            if hit == 1:
+            if hit_count == 1:
                 single = next((t for t in terms if t in text), "")
-                if len(single) >= 3:
+                # 业务核心词即便只中一个也是可靠的
+                if len(single) >= 3 or any(single in k for k in cores):
                     reliable.append(r)
+        
+        # 重新按分数排序（数据库基础分 + Agent 加权分）
+        reliable.sort(key=lambda x: float(x.get("_score", 0)), reverse=True)
         return reliable
+
+    def _rerank_by_business_core(self, results: list[dict], query_cores: list[str]) -> list[dict]:
+        """将包含业务核心词的文档强制置顶。"""
+        if not query_cores:
+            return results
+        
+        with_core = []
+        others = []
+        for r in results:
+            text = f"{r.get('title','')} {r.get('content_text','')}".lower()
+            if any(k.lower() in text for k in query_cores):
+                with_core.append(r)
+            else:
+                others.append(r)
+        
+        return with_core + others
 
     @staticmethod
     def _is_code_query(query: str, code_context: str = "") -> bool:

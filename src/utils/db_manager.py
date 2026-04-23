@@ -236,6 +236,8 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
     if not q:
         return []
 
+    # 提取中文核心片段用于 LIKE 奖励
+    core_phrases = re.findall(r"[\u4e00-\u9fff]{3,}", q)
     tokens = _tokenize_query(q)
     if not tokens:
         tokens = [q]
@@ -245,7 +247,8 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
 
         # 1) FTS retrieval
         try:
-            fts_query = " OR ".join([f'"{t.replace("\"", "")}"' for t in tokens[:8]])
+            # 扩展检索深度
+            fts_query = " OR ".join([f'"{t.replace("\"", "")}"' for t in tokens[:12]])
             fts_rows = conn.execute(
                 """
                 SELECT c.chunk_id, c.title, c.parent_file, c.raw_file_path, c.tags, c.content_path, c.content_text, c.last_modified,
@@ -256,11 +259,24 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                 ORDER BY rank ASC
                 LIMIT ?
                 """,
-                (fts_query, max(limit * 3, 30)),
+                (fts_query, max(limit * 5, 50)),
             ).fetchall()
             for i, r in enumerate(fts_rows):
                 # rank smaller is better
                 score = 1000.0 - float(i)
+                # 原始核心片段匹配（暴力加权 V3）
+                text_low = f"{r['title']} {r['content_text']} {r['parent_file']}".lower()
+                has_core = False
+                for ph in core_phrases:
+                    if ph.lower() in text_low:
+                        score += 700.0 # 业务片段命中：给予降维打击式的高分
+                        has_core = True
+                    if ph.lower() in str(r['title']).lower():
+                        score += 500.0 # 标题命中：额外再奖励
+                # 业务路径命中奖励
+                for ph in core_phrases:
+                    if ph.lower() in str(r['parent_file']).lower():
+                        score += 400.0
                 scored_rows.append((r, score))
         except Exception:
             pass
@@ -272,17 +288,21 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
         WHERE title LIKE ? OR tags LIKE ? OR parent_file LIKE ? OR content_text LIKE ?
         LIMIT ?
         """
-        for idx, t in enumerate(tokens[:12]):
+        for idx, t in enumerate(tokens[:16]):
             like = f"%{t}%"
-            rows = conn.execute(like_sql, (like, like, like, like, max(limit * 2, 20))).fetchall()
+            rows = conn.execute(like_sql, (like, like, like, like, max(limit * 2, 40))).fetchall()
             for r in rows:
                 score = 200.0 - (idx * 2)
-                if str(r["title"]).lower().find(t) >= 0:
-                    score += 30
-                if str(r["tags"]).lower().find(t) >= 0:
-                    score += 20
-                if str(r["content_text"]).lower().find(t) >= 0:
-                    score += 8
+                t_low = t.lower()
+                title_low = str(r["title"]).lower()
+                if title_low.find(t_low) >= 0:
+                    score += 80 # 基础命中分
+                # 若命中的是用户原始的长语块，给予极致分
+                for ph in core_phrases:
+                    if ph.lower() in title_low:
+                        score += 600
+                    if ph.lower() in str(r['parent_file']).lower():
+                        score += 300
                 scored_rows.append((r, score))
 
         merged = _merge_rows_by_score(scored_rows, limit=limit)
@@ -290,7 +310,6 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
             return merged
 
         # 3) Robust fallback: scan chunk markdown files directly.
-        # This keeps recall when old data lacks content_text/tags or schema migration wasn't fully rebuilt yet.
         rows_all = conn.execute(
             """
             SELECT chunk_id, title, parent_file, raw_file_path, tags, content_path, content_text, last_modified
@@ -309,14 +328,16 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                     content_text = p.read_text(encoding="utf-8", errors="ignore")
             hay = f"{r['title']} {r['tags']} {r['parent_file']} {content_text}".lower()
             score = 0.0
-            for t in tokens[:16]:
-                c = hay.count(t)
+            for t in tokens[:20]:
+                c = hay.count(t.lower())
                 if c > 0:
                     score += c * 3.0
-                    if str(r["title"]).lower().find(t) >= 0:
+                    if str(r["title"]).lower().find(t.lower()) >= 0:
                         score += 10.0
-                    if str(r["tags"]).lower().find(t) >= 0:
-                        score += 6.0
+            # Fallback 阶段也给予长片段奖励
+            for ph in core_phrases:
+                if ph.lower() in hay:
+                    score += 100.0
             if score > 0:
                 scored_fallback.append((r, score))
         except Exception:
