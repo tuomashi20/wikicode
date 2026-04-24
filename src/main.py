@@ -409,15 +409,40 @@ def _replay_session_on_screen(history: list[tuple[str, str]]) -> None:
 
 def _extract_python_code(text: str) -> str:
     s = text.strip()
-    blocks = re.findall(r"```python\s*\n([\s\S]*?)\n```", s, flags=re.IGNORECASE)
-    if not blocks:
-        blocks = re.findall(r"```\s*\n([\s\S]*?)\n```", s, flags=re.IGNORECASE)
-    if not blocks:
+    if not s:
         return ""
-    code = blocks[0].strip("\n")
-    if "import " in code or "def " in code or "class " in code:
-        return code
+    # 1. 优先尝试标准 Markdown 提取
+    blocks = re.findall(r"```python\s*\n?([\s\S]*?)```", s, flags=re.IGNORECASE)
+    if not blocks:
+        blocks = re.findall(r"```\s*\n?([\s\S]*?)```", s, flags=re.IGNORECASE)
+    
+    if blocks:
+        code = blocks[0].strip()
+        if _is_likely_python(code):
+            return code
+
+    # 2. 如果没有标签，检查全文是否就是 Python 代码
+    if _is_likely_python(s):
+        return s
+    
     return ""
+
+
+def _is_likely_python(text: str) -> bool:
+    """判断一段文本是否极大概率为 Python 代码。"""
+    t = text.strip()
+    if not t:
+        return False
+    # 常见的 Python 关键字或特征
+    features = [
+        "import ", "from ", "def ", "class ", "if __name__", 
+        "pd.", "os.", "np.", "plt.", "sys.", "print("
+    ]
+    # 只要命中其中一个且内容较长，或者命中多个
+    match_count = sum(1 for f in features if f in t)
+    if match_count >= 1 and len(t) > 20:
+        return True
+    return False
 
 
 def _looks_like_script_request(text: str) -> bool:
@@ -608,6 +633,8 @@ def _run_python_script_detailed(script_path: Path, timeout_sec: int = 120, cwd: 
             cwd=work_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="ignore",
             timeout=timeout_sec,
         )
     except subprocess.TimeoutExpired as e:
@@ -692,6 +719,8 @@ def _install_python_packages(packages: list[str], timeout_sec: int = 180) -> tup
             cwd=str(Path.cwd()),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="ignore",
             timeout=timeout_sec,
         )
     except Exception as e:  # noqa: BLE001
@@ -913,13 +942,19 @@ def _auto_script_pipeline_inner(
         force_wiki=False,
         mode="general_only",
         history=history,
+        silent=True,
     )
     probe_code = _extract_python_code(probe_resp.output)
     if not probe_code:
         return resp
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    scripts_dir = _get_scripts_dir()
+    # 动态决定脚本存放位置：优先放在数据同级目录
+    if target_cwd and Path(target_cwd).is_dir():
+        scripts_dir = Path(target_cwd)
+    else:
+        scripts_dir = _get_scripts_dir()
+        
     probe_name = f"wikicoder_probe_{ts}.py"
     probe_path = scripts_dir / probe_name
     if not _confirm_local_operation(consent_state, f"写入探测脚本 {probe_name} 并执行（只读探测）"):
@@ -955,7 +990,14 @@ def _auto_script_pipeline_inner(
         "11) 合并时必须以第一个源文件的列顺序为基准，后续文件按此顺序对齐（不要按字母排序列名）\n"
         "12) 合并时必须排除之前生成的合并结果文件（merged_*.xlsx 等），只处理原始源文件\n"
         "13) 所有路径必须使用用户提供的绝对路径，不要使用 os.getcwd() 或相对路径\n"
-        "14) 若为 Excel 任务，最终输出一行：\n"
+        "14) 【严重警告：禁止手动过滤行】pandas.read_excel 默认会将第 0 行作为标题。读取后，DataFrame 的第一行即为有效数据。\n"
+        "    因此，在 concat 合并后续文件时，绝对禁止使用 .iloc[1:] 或任何手动跳过第一行的操作。\n"
+        "    正确的逻辑应该是：直接 pd.concat([df1, df2, ...])，pandas 会自动处理列对齐。\n"
+        "15) 【数据对齐校验】生成的代码必须在合并前后打印行数。合并后总行数应等于各分表行数之和。\n"
+        "16) 【编码安全】脚本开头的 print 语句前，请务必执行：\n"
+        "    import sys, io; sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')\n"
+        "    严禁在 print 中使用 Emoji（如 ✅、❌）或特殊符号，仅使用标准 ASCII 字符。\n"
+        "17) 若为 Excel 任务，最终输出一行：\n"
         "    print('WIKICODER_RESULT_JSON=' + json.dumps({...}))\n"
         "    其中 JSON 包含 output_file, row_count, col_count, nan_ratio\n"
         "    【必须用 json.dumps 生成，不要用 str() 或 f-string】\n\n"
@@ -973,6 +1015,7 @@ def _auto_script_pipeline_inner(
         force_wiki=False,
         mode="general_only",
         history=history,
+        silent=True,
     )
     code = _extract_python_code(script_resp.output)
     if not code:
@@ -983,6 +1026,7 @@ def _auto_script_pipeline_inner(
         )
 
     script_name = f"wikicoder_task_{ts}.py"
+    # 业务脚本同样跟随 scripts_dir
     script_path = scripts_dir / script_name
     if not _confirm_local_operation(consent_state, f"写入业务脚本 {script_name} 并执行"):
         return AgentResponse(
@@ -1040,28 +1084,28 @@ def _auto_script_pipeline_inner(
             output=f"{resp.output}\n\n---\n" + "\n\n".join(all_msgs),
         )
 
-    # === 自动修复循环（上限5轮 + 智能退出） ===
-    MAX_FIX_ATTEMPTS = 5
+    # === 自动修复循环（上限10轮 + 智能退出） ===
+    MAX_FIX_ATTEMPTS = 10
     current_code = code
     attempt = 1
     last_category = ""
     same_category_count = 0
     while True:
-        # 渐进式策略：前2轮修复、第3轮起要求从零重写
+        # 渐进式策略：前2轮修复、第3-5轮重写、第6轮起强制重读需求
         if attempt <= 2:
             fix_strategy = (
                 "请修复以下脚本中的错误。仅输出完整 Python 代码，不要解释。\n"
                 "重点关注报错堆栈中的具体行号和错误类型。"
             )
-        else:
+        elif attempt <= 5:
             fix_strategy = (
                 "之前的修复尝试未能解决问题。请抛弃原有思路，从零重写整个脚本。\n"
-                "仅输出完整 Python 代码，不要解释。\n"
-                "请特别注意以下编码规范：\n"
-                "- 文件读写必须用 encoding='utf-8', errors='ignore'\n"
-                "- 输出文件名加时间戳避免覆盖冲突\n"
-                "- 写文件前用 try/except 处理 PermissionError\n"
-                "- 若为 Excel 任务，结果行必须用 json.dumps 输出"
+                "请特别注意文件读写编码、路径规范及异常处理。"
+            )
+        else:
+            fix_strategy = (
+                "【深度重构模式】多次修复仍未成功。请彻底重新审视用户需求和探测结果，\n"
+                "从最基础的逻辑开始检查。仅输出完整代码。"
             )
 
         # 注入前轮失败原因摘要
@@ -1093,6 +1137,74 @@ def _auto_script_pipeline_inner(
             force_wiki=False,
             mode="general_only",
             history=history,
+            silent=True,
+        )
+        fix_code = _extract_python_code(fix_resp.output)
+        if not fix_code:
+            all_msgs.append(f"[第{attempt}轮自动修复] 模型未返回可执行代码。")
+            break
+
+        if not _confirm_local_operation(consent_state, f"覆盖脚本 {script_name} 并再次执行（第{attempt}轮修复）"):
+            all_msgs.append(f"[第{attempt}轮自动修复] 用户拒绝继续本地写入/执行。")
+            actions.append(f"auto_fix:{attempt}:denied")
+            break
+
+        _write_script_file(script_path, fix_code)
+        current_code = fix_code
+        ok_i, run_msg_i = _run_python_script(script_path, cwd=target_cwd)
+        if ok_i and is_excel_task:
+            q_ok_i, q_msg_i = _verify_excel_result_quality(run_msg_i)
+            run_msg_i += f"\n\n[语义校验]\n{q_msg_i}"
+            if not q_ok_i:
+                ok_i = False
+        if not ok_i:
+            category_i, advice_i = _classify_script_failure(run_msg_i, "", 1)
+            run_msg_i = f"{run_msg_i}\n\n故障分类: {category_i}\n{advice_i}"
+            # 智能退出：连续 3 次相同故障分类（且非超时/依赖问题）则终止
+            if category_i == last_category and category_i not in {"timeout", "dependency_missing"}:
+                same_category_count += 1
+            else:
+                same_category_count = 0
+                last_category = category_i
+            if same_category_count >= 3:
+                all_msgs.append(f"[第{attempt}轮自动修复执行结果]\n{run_msg_i}")
+                all_msgs.append(
+                    f"[自动修复状态] 连续 {same_category_count + 1} 轮同类故障（{category_i}），"
+                    "自动修复无法解决，建议人工介入。"
+                )
+                actions.extend([f"auto_fix:{attempt}", f"run_python({script_name})"])
+                break
+
+        # 注入前轮失败原因摘要
+        prev_failures = ""
+        if attempt > 1:
+            recent_fail_msgs = [m for m in all_msgs if m.startswith("[第")]
+            if recent_fail_msgs:
+                prev_failures = (
+                    "\n\n=== 前轮修复失败摘要（请避免重复犯同样错误） ===\n"
+                    + "\n".join(m[:500] for m in recent_fail_msgs[-2:])
+                )
+
+        fix_prompt = (
+            f"{fix_strategy}\n\n"
+            f"用户原始需求：{user_query}\n"
+            f"脚本文件名：{script_name}\n"
+            f"修复轮次：{attempt}/{MAX_FIX_ATTEMPTS}\n"
+            f"{cwd_info}\n"
+            f"硬约束：{json.dumps(excel_constraints, ensure_ascii=False)}\n"
+            f"探测结果(JSON)：\n{probe_summary[:10000]}\n\n"
+            "当前脚本：\n"
+            f"```python\n{current_code}\n```\n\n"
+            f"最近报错：\n```\n{all_msgs[-1][:7000]}\n```"
+            f"{prev_failures}"
+        )
+        fix_resp = _run_agent_with_thinking(
+            agent,
+            user_input=fix_prompt,
+            force_wiki=False,
+            mode="general_only",
+            history=history,
+            silent=True,
         )
         fix_code = _extract_python_code(fix_resp.output)
         if not fix_code:
@@ -1214,6 +1326,7 @@ def _run_agent_with_thinking(
     response_mode: str = "answer",
     target_file: str = "",
     history: list[tuple[str, str]] | None = None,
+    silent: bool = False,
 ):
     state: dict[str, object] = {}
     token_q: "queue.Queue[str]" = queue.Queue()
@@ -1265,10 +1378,13 @@ def _run_agent_with_thinking(
                     except Exception:
                         break
                 if chunks:
-                    if not streamed:
-                        streamed = True
-                        live.stop()
-                    console.print("".join(chunks), end="")
+                    if not silent:
+                        if not streamed:
+                            streamed = True
+                            live.stop()
+                        console.print("".join(chunks), end="")
+                    else:
+                        streamed = True # 在静默模式下仅标记已开始，但不停止动画
 
                 elapsed = time.perf_counter() - start
                 phase = "检索 Wiki + 调用模型"
@@ -1276,11 +1392,21 @@ def _run_agent_with_thinking(
                     phase = "调用通用模型"
                 elif mode == "wiki_only":
                     phase = "仅检索 Wiki"
-                if not streamed:
-                    live.update(
-                        f"[bold cyan]{frames[idx % len(frames)]} 思考中 {elapsed:.1f}s[/bold cyan] "
-                        f"[dim]（{phase}，按 ESC 取消本次提问；Windows 可用 Ctrl+C）[/dim]"
-                    )
+                
+                if not live.is_started: # 如果被非静默模式停掉了，就不更新了
+                    continue
+
+                status_suffix = ""
+                if silent and streamed:
+                    # 尝试计算已接收内容的大致大小
+                    received_size = token_q.qsize() * 0.5 # 估算
+                    status_suffix = f" [正在接收数据...]"
+
+                live.update(
+                    f"[bold cyan]{frames[idx % len(frames)]} {phase} {elapsed:.1f}s[/bold cyan] "
+                    f"{status_suffix} "
+                    f"[dim]（按 ESC 取消；Windows 可用 Ctrl+C）[/dim]"
+                )
                 idx += 1
 
                 if _escape_pressed():

@@ -1,0 +1,85 @@
+{
+  "nodes": [
+    {
+      "id": "2bf7788132e7471b",
+      "type": "text",
+      "text": "# 测试 Canvas 转换\n\n这是一个测试文件。",
+      "x": 0,
+      "y": 0,
+      "width": 400,
+      "height": 400
+    },
+    {
+      "id": "5cf16a699c11482f",
+      "type": "text",
+      "text": "# 第一章：介绍\n\n这里是第一章的内容。\n- 要点 1\n- 要点 2",
+      "x": 600,
+      "y": 0,
+      "width": 400,
+      "height": 400
+    },
+    {
+      "id": "adbeee5589d848b0",
+      "type": "text",
+      "text": "# 第二章：核心方案\n\n这里是第二章的内容。",
+      "x": 600,
+      "y": 500,
+      "width": 400,
+      "height": 400
+    },
+    {
+      "id": "aa69b3e86f11413f",
+      "type": "text",
+      "text": "# 2.1 细节 A\n\n细节 A 的描述。",
+      "x": 1200,
+      "y": 0,
+      "width": 400,
+      "height": 400
+    },
+    {
+      "id": "d9bebb87f63a44c4",
+      "type": "text",
+      "text": "# 2.2 细节 B\n\n细节 B 的描述。",
+      "x": 1200,
+      "y": 500,
+      "width": 400,
+      "height": 400
+    },
+    {
+      "id": "850fbc80146348e3",
+      "type": "text",
+      "text": "# 第三章：总结\n\n测试结束。",
+      "x": 600,
+      "y": 1000,
+      "width": 400,
+      "height": 400
+    }
+  ],
+  "edges": [
+    {
+      "id": "8ffa5b5f3ca5447a",
+      "fromNode": "2bf7788132e7471b",
+      "toNode": "5cf16a699c11482f"
+    },
+    {
+      "id": "455001e70e3f47be",
+      "fromNode": "2bf7788132e7471b",
+      "toNode": "adbeee5589d848b0"
+    },
+    {
+      "id": "54a9dab45dbc4bbb",
+      "fromNode": "adbeee5589d848b0",
+      "toNode": "aa69b3e86f11413f"
+    },
+    {
+      "id": "c69ee0bf1d8f4e9c",
+      "fromNode": "adbeee5589d848b0",
+      "toNode": "d9bebb87f63a44c4"
+    },
+    {
+      "id": "175fc58030334d98",
+      "fromNode": "2bf7788132e7471b",
+      "toNode": "850fbc80146348e3"
+    }
+  ]
+}
