@@ -41,6 +41,7 @@ except Exception:  # pragma: no cover
     tty = None
 
 from src.core.agent import AgentResponse, WikiFirstAgent
+from src.core.build_agent import BuildAgent, BuildStep
 from src.core.atomizer import Atomizer
 from src.core.llm_client import LLMClient
 from src.core.retrieval_eval import (
@@ -875,9 +876,6 @@ def _auto_script_pipeline(
     history: list[tuple[str, str]],
     consent_state: dict[str, str],
 ) -> AgentResponse:
-    if not _looks_like_script_request(user_query):
-        return resp
-
     try:
         return _auto_script_pipeline_inner(
             agent=agent,
@@ -923,13 +921,10 @@ def _auto_script_pipeline_inner(
     probe_prompt = (
         "请生成一个只读的 Python 探测脚本，用于分析用户需求涉及的数据结构。\n"
         "要求：\n"
-        "1) 不可写文件、不可删除、不可联网\n"
-        "2) 仅扫描必要目录并抽样读取结构\n"
-        "3) 如果涉及表格文件，请读取前 3 行原始数据（含可能的表头行），"
-        "并报告每列数据类型、行数、列数、空值比例\n"
-        "4) 检测文件编码（尝试 utf-8/gbk/gb2312）\n"
-        "5) 最后在 stdout 输出一行：WIKICODER_PROBE_JSON=<json>（使用 json.dumps 输出）\n"
-        "6) 仅输出 Python 代码，不要解释\n"
+        "1) 检测操作系统类型、版本及包管理器（如 apt, yum, brew）\n"
+        "2) 探测涉及的路径或文件是否存在，若是表格文件请报告结构（行列、空值等）\n"
+        "3) 最后在 stdout 输出一行：WIKICODER_PROBE_JSON=<json>（使用 json.dumps 输出）\n"
+        "4) 仅输出 Python 代码，不要解释\n"
         "7) 脚本必须包含 if __name__ == '__main__': 入口\n\n"
         f"用户需求：{user_query}\n"
         f"路径线索：{hint_text}\n"
@@ -983,13 +978,14 @@ def _auto_script_pipeline_inner(
         "5) 写文件前检查目标路径是否被占用（try/except PermissionError）\n"
         "6) 对输入异常做健壮处理（文件不存在、格式异常、空数据等）\n"
         "7) 打印关键进度和最终结果\n"
-        "8) 可用依赖：pandas, openpyxl, os, sys, json, glob, pathlib, re, datetime\n\n"
-        "=== 表格处理专项规范 ===\n"
-        "9) 若是表格合并，先对列名执行 strip() 去除空格\n"
-        "10) 优先使用 pandas + engine='openpyxl'\n"
-        "11) 合并时必须以第一个源文件的列顺序为基准，后续文件按此顺序对齐（不要按字母排序列名）\n"
-        "12) 合并时必须排除之前生成的合并结果文件（merged_*.xlsx 等），只处理原始源文件\n"
-        "13) 所有路径必须使用用户提供的绝对路径，不要使用 os.getcwd() 或相对路径\n"
+        "8) 可用依赖：pandas, openpyxl, os, sys, json, glob, pathlib, re, datetime, subprocess\n\n"
+        "=== 专项规范 ===\n"
+        "9) 若涉及系统操作（如 UOS/Linux 安装软件），请使用 subprocess.run 调用系统命令\n"
+        "10) 优先处理权限问题，若需 sudo 请确保逻辑闭环\n"
+        "11) 若是表格合并，先对列名执行 strip() 去除空格\n"
+        "12) 优先使用 pandas + engine='openpyxl'\n"
+        "13) 合并时必须以第一个源文件的列顺序为基准，后续文件按此顺序对齐\n"
+        "14) 所有路径必须使用绝对路径，不要使用相对路径\n"
         "14) 【严重警告：禁止手动过滤行】pandas.read_excel 默认会将第 0 行作为标题。读取后，DataFrame 的第一行即为有效数据。\n"
         "    因此，在 concat 合并后续文件时，绝对禁止使用 .iloc[1:] 或任何手动跳过第一行的操作。\n"
         "    正确的逻辑应该是：直接 pd.concat([df1, df2, ...])，pandas 会自动处理列对齐。\n"
@@ -2829,8 +2825,8 @@ def chat(
 
             if cmd.startswith("/mode "):
                 val = cmd.split(" ", 1)[1].strip().lower()
-                if val not in {"auto", "wiki_only", "general_only"}:
-                    console.print("[yellow]Usage: /mode auto|wiki_only|general_only[/yellow]")
+                if val not in {"auto", "wiki_only", "general_only", "build"}:
+                    console.print("[yellow]Usage: /mode auto|wiki_only|general_only|build[/yellow]")
                     continue
                 session_mode = val
                 console.print(f"[cyan]session mode = {session_mode}[/cyan]")
@@ -3171,29 +3167,51 @@ def chat(
                         )
                         remember_turn = True
                     plain_chat_turn = False
-                elif _looks_like_script_request(cmd):
-                    console.print("[dim]检测到编码/自动化需求：直连代码执行流程（跳过 Wiki 检索）[/dim]")
-                    seed_resp = AgentResponse(
-                        thought="code-assist:direct-pipeline",
-                        actions=["code_pipeline:start"],
-                        output="已识别为编码任务，开始执行：需求分析 → 结构探测 → 生成脚本 → 自动调试。",
-                    )
+                elif session_mode == "build":
+                    console.print("[bold cyan]>>> 进入 Build 模式 (交互式命令流模式)[/bold cyan]")
+                    agent_build = BuildAgent(config)
+                    
+                    # 使用闭包变量记录“全部同意”状态
+                    state = {"auto_all": False}
+
+                    def _cli_on_step(step: BuildStep) -> bool:
+                        console.print(f"\n[bold yellow]思考:[/bold yellow] {step.thought}")
+                        console.print(f"[bold magenta]拟执行:[/bold magenta] {step.action_type}({step.action_input})")
+                        if step.action_type == "finish":
+                            return True
+                        
+                        if state["auto_all"]:
+                            # 自动执行时也打印执行中提示
+                            console.print(f"[dim]正在自动执行 {step.action_type}...[/dim]")
+                        else:
+                            ans = console.input("[bold green]授权执行? (y/a/n): [/bold green]").strip().lower()
+                            if ans == 'a':
+                                state["auto_all"] = True
+                            elif ans == 'n': return False
+                        
+                        # 真正的执行将在 run 方法内部发生，我们通过回调后的步骤历史获取结果
+                        return True
+
                     try:
-                        resp = _auto_script_pipeline(
-                            agent=agent,
-                            user_query=cmd,
-                            resp=seed_resp,
-                            history=session_history,
-                            consent_state=local_op_consent,
-                        )
-                    except Exception as e:  # noqa: BLE001
-                        console.print(f"[red]编码流水线异常：{e}[/red]")
+                        # 劫持 BuildAgent._execute 以便在 CLI 中实时打印结果
+                        original_execute = agent_build._execute
+                        def _cli_execute_wrapper(action_type, action_input):
+                            res = original_execute(action_type, action_input)
+                            console.print(f"[bold green]执行结果:[/bold green]\n{res}")
+                            return res
+                        agent_build._execute = _cli_execute_wrapper
+
+                        final_output = agent_build.run(cmd, history=session_history, on_step=_cli_on_step)
                         resp = AgentResponse(
-                            thought="code-pipeline:error",
-                            actions=["pipeline_error"],
-                            output=f"编码流水线执行异常：{e}\n建议增大 timeout_seconds 或检查网络连接后重试。",
+                            thought="build-mode:complete",
+                            actions=["build:done"],
+                            output=final_output
                         )
-                    remember_turn = resp.thought != "cancelled-by-user"
+                    except Exception as e:
+                        console.print(f"[red]执行异常：{e}[/red]")
+                        resp = AgentResponse(thought="build:error", actions=[], output=str(e))
+                    
+                    remember_turn = True
                     plain_chat_turn = False
                 else:
                     auto_ctx = _extract_existing_py_context(cmd)
@@ -3213,16 +3231,20 @@ def chat(
                     plain_chat_turn = True
 
             if plain_chat_turn and resp.thought != "cancelled-by-user":
-                try:
-                    resp = _auto_script_pipeline(
-                        agent=agent,
-                        user_query=cmd,
-                        resp=resp,
-                        history=session_history,
-                        consent_state=local_op_consent,
-                    )
-                except Exception:  # noqa: BLE001
-                    pass  # pipeline 内部已有异常保护，此处兜底防崩溃
+                if _looks_like_script_request(cmd) and session_mode != "build":
+                    console.print("\n[bold yellow]检测到编码/自动化需求。[/bold yellow]")
+                    console.print("[yellow]当前处于常规对话模式。如需执行自动化任务，请先输入 [bold]/mode build[/bold] 切换到构建模式。[/yellow]\n")
+                else:
+                    try:
+                        resp = _auto_script_pipeline(
+                            agent=agent,
+                            user_query=cmd,
+                            resp=resp,
+                            history=session_history,
+                            consent_state=local_op_consent,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass  # pipeline 内部已有异常保护，此处兜底防崩溃
 
             is_patch_cmd = cmd.startswith("/patch ") or cmd.startswith("/patchm ")
             if is_patch_cmd and resp.thought != "cancelled-by-user":

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import traceback
+import threading
+import queue
 from typing import AsyncGenerator
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -11,7 +13,8 @@ import anyio
 
 from src.core.agent import WikiFirstAgent, AgentResponse
 from src.utils.config import load_config
-from src.main import build_agent, run_sync
+from src.main import build_agent, run_sync, build_llm, _save_memory_markdown
+from src.core.build_agent import BuildAgent, BuildStep
 
 app = FastAPI(title="WikiCoder API", version="0.1.0")
 
@@ -35,11 +38,19 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 class ChatRequest(BaseModel):
     query: str
-    mode: str = "auto"
+    mode: str = "auto" # auto, wiki_only, general_only, build
     history: list[dict[str, str]] = []
 
 def format_history(history: list[dict[str, str]]) -> list[tuple[str, str]]:
     return [(h["q"], h["a"]) for h in history]
+
+class DraftRequest(BaseModel):
+    history: list[dict[str, str]]
+    title_hint: str = ""
+
+class SaveRequest(BaseModel):
+    title: str
+    content: str
 
 @app.get("/health")
 async def health_check():
@@ -49,33 +60,78 @@ async def health_check():
 async def chat(request: ChatRequest):
     """
     流式问答接口。
-    包装同步阻塞的 agent.ask 到异步环境中。
+    支持 Plan (auto/wiki_only/general_only) 和 Build 模式。
     """
     try:
         config = load_config()
         agent = build_agent(config)
         history_tuples = format_history(request.history)
         
-        # 使用 anyio.to_thread 在后台线程运行同步阻塞的 run 方法
-        response: AgentResponse = await anyio.to_thread.run_sync(
-            agent.run, 
-            request.query, 
-            False,   # force_wiki
-            request.mode, 
-            "",      # code_context
-            "answer",# response_mode
-            "",      # target_file
-            history_tuples
-        )
-        
+        import queue
+        status_queue = queue.Queue()
+
         async def event_generator():
             try:
-                # 发送思考过程
-                if response.thought:
-                    yield f"data: {json.dumps({'thought': response.thought, 'output': ''}, ensure_ascii=False)}\n\n"
+                if request.mode == "build":
+                    # Build 模式：运行交互式命令流 Agent
+                    agent_build = BuildAgent(config)
+                    
+                    # 立即发送启动信号
+                    status_queue.put({"type": "status", "content": "Build 模式交互引擎已启动，正在分析任务..."})
+
+                    def _on_step(step: BuildStep) -> bool:
+                        # 将步骤推送到队列，供 SSE 发送
+                        status_queue.put({
+                            "type": "step", 
+                            "thought": step.thought,
+                            "action": f"{step.action_type}: {step.action_input}",
+                            "observation": step.observation
+                        })
+                        return True
+
+                    def _run_agent():
+                        try:
+                            output = agent_build.run(request.query, history_tuples, on_step=_on_step)
+                            status_queue.put({"type": "done", "output": output})
+                        except Exception as e:
+                            status_queue.put({"type": "error", "content": str(e)})
+
+                    threading.Thread(target=_run_agent, daemon=True).start()
+
+                    while True:
+                        try:
+                            item = await anyio.to_thread.run_sync(lambda: status_queue.get(timeout=0.1))
+                            if item["type"] == "status":
+                                yield f"data: {json.dumps({'status': item['content']}, ensure_ascii=False)}\n\n"
+                            elif item["type"] == "step":
+                                status_msg = f"**思考**: {item['thought']}\n\n**执行**: `{item['action']}`"
+                                if item.get("observation"):
+                                    status_msg += f"\n\n**结果**:\n```\n{item['observation']}\n```"
+                                yield f"data: {json.dumps({'status': status_msg}, ensure_ascii=False)}\n\n"
+                            elif item["type"] == "done":
+                                yield f"data: {json.dumps({'thought': '任务完成', 'output': item['output']}, ensure_ascii=False)}\n\n"
+                                break
+                            elif item["type"] == "error":
+                                yield f"data: {json.dumps({'error': item['content']}, ensure_ascii=False)}\n\n"
+                                break
+                        except queue.Empty:
+                            await anyio.sleep(0.1)
+                else:
+                    # Plan 模式：正常的 Agent 问答
+                    response: AgentResponse = await anyio.to_thread.run_sync(
+                        agent.run, 
+                        request.query, 
+                        False, 
+                        request.mode, 
+                        "", 
+                        "answer", 
+                        "", 
+                        history_tuples
+                    )
+                    if response.thought:
+                        yield f"data: {json.dumps({'thought': response.thought, 'output': ''}, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps({'thought': '', 'output': response.output}, ensure_ascii=False)}\n\n"
                 
-                # 发送正文
-                yield f"data: {json.dumps({'thought': '', 'output': response.output}, ensure_ascii=False)}\n\n"
                 yield "data: [DONE]\n\n"
             except Exception as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -203,13 +259,10 @@ async def exec_cmd(request: CmdRequest):
             return {"status": "success", "output": f"### 🔄 会话已恢复\n- 历史消息数: {len(state.get('history', []))}\n- 上次模型: `{state.get('model', 'default')}`"}
 
         if cmd == "/memdraft":
-            # 这是一个复杂逻辑，通常需要上下文。这里尝试触发
-            return {"status": "success", "output": "### 📝 记忆草稿已生成\n(提示：请使用 `/memsave` 将其保存到库中)"}
+            return {"status": "success", "output": "### 📝 整理建议\n请点击界面顶部的 **[整理记录]** 按钮，系统将自动汇总本次对话并生成 Wiki 草稿。"}
 
         if cmd == "/memsave":
-            from src.main import _save_mem_to_raw
-            ok, msg = _save_mem_to_raw()
-            return {"status": "success" if ok else "error", "output": msg}
+            return {"status": "success", "output": "### 💾 保存建议\n请点击界面顶部的 **[入库]** 按钮，将当前整理好的草稿保存到本地知识库。"}
 
         if cmd == "/ask":
             return {"status": "success", "output": "### 💡 提示\n`/ask` 指令用于强制 Wiki 模式。在插件中，您可以直接输入问题，或者通过 `/mode wiki_only` 切换到该模式。"}
@@ -300,6 +353,80 @@ async def get_config():
         "model": config.llm.model,
         "provider": config.llm.provider
     }
+
+@app.post("/v1/memdraft")
+async def mem_draft(request: DraftRequest):
+    """将对话历史整理为 Wiki Markdown 草稿"""
+    try:
+        if not request.history:
+            return {"status": "error", "message": "当前会话暂无可整理内容。"}
+        
+        config = load_config()
+        llm = build_llm(config)
+        
+        # 组装对话文本
+        hist_text = "\n\n".join(
+            [f"### 用户问题\n{h['q']}\n\n### 助手回答\n{h['a']}" for h in request.history[-12:]]
+        )
+        
+        system_prompt = (
+            "你是知识工程师。请把给定对话整理为可直接入库的中文 Wiki Markdown 文档。"
+            "要求：结构清晰、可复用、避免口语、不要编造事实。"
+        )
+        user_prompt = (
+            f"文档标题建议：{request.title_hint or '自动整理会话'}\n\n"
+            "请严格按以下结构输出 Markdown：\n"
+            "# 标题\n"
+            "## 背景\n"
+            "## 结论\n"
+            "## 详细说明\n"
+            "## 操作步骤\n"
+            "## 注意事项\n"
+            "## 标签\n"
+            "对话内容如下：\n\n"
+            f"{hist_text}"
+        )
+
+        # 异步调用 LLM (由于 generate 是同步的，放到线程池)
+        import anyio
+        draft = await anyio.to_thread.run_sync(
+            llm.generate, 
+            system_prompt, 
+            user_prompt
+        )
+        
+        import re
+        m = re.search(r"^#\s+(.+)$", draft, flags=re.MULTILINE)
+        title = (m.group(1).strip() if m else request.title_hint or "会话整理")
+        
+        return {
+            "status": "success", 
+            "draft": draft, 
+            "title": title
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/v1/memsave")
+async def mem_save(request: SaveRequest):
+    """将草稿保存到本地 raw/faq 目录"""
+    try:
+        config = load_config()
+        # 异步保存
+        import anyio
+        out_path = await anyio.to_thread.run_sync(
+            _save_memory_markdown,
+            config,
+            request.title,
+            request.content
+        )
+        return {
+            "status": "success",
+            "path": str(out_path),
+            "message": f"已成功入库：{out_path.name}"
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 def start_server(host: str = "127.0.0.1", port: int = 8000):
     import uvicorn
