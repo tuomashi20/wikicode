@@ -1,4 +1,5 @@
 typer>=0.12.0
+typer>=0.12.0
 rich>=13.7.0
 prompt-toolkit>=3.0.43
 PyYAML>=6.0.1
@@ -7,3 +8,10 @@ httpx>=0.27.0
 openpyxl>=3.1.0
 pypdf>=4.2.0
 python-docx>=1.1.0
+rich
+fastapi
+uvicorn
+anyio
+openai
+python-dotenv
+cx>=1.1.0

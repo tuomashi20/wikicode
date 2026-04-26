@@ -21,6 +21,7 @@ dependencies = [
   "fastapi",
   "uvicorn",
   "sse-starlette",
+  "pandas>=2.3.3",
 ]
 
 [project.scripts]

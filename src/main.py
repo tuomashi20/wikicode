@@ -3168,47 +3168,76 @@ def chat(
                         remember_turn = True
                     plain_chat_turn = False
                 elif session_mode == "build":
-                    console.print("[bold cyan]>>> 进入 Build 模式 (交互式命令流模式)[/bold cyan]")
-                    agent_build = BuildAgent(config)
+                    from rich.panel import Panel
+                    from rich.syntax import Syntax
+                    from rich.box import ROUNDED
                     
-                    # 使用闭包变量记录“全部同意”状态
+                    console.print("\n[bold cyan]⚡ 进入交互构建模式 (Build Mode)[/bold cyan]")
+                    agent_build = BuildAgent(config)
                     state = {"auto_all": False}
 
                     def _cli_on_step(step: BuildStep) -> bool:
-                        console.print(f"\n[bold yellow]思考:[/bold yellow] {step.thought}")
-                        console.print(f"[bold magenta]拟执行:[/bold magenta] {step.action_type}({step.action_input})")
+                        # 1. 渲染思考过程
+                        console.print(Panel(
+                            step.thought, 
+                            title="[bold yellow]Agent 思考[/bold yellow]", 
+                            border_style="yellow", 
+                            box=ROUNDED,
+                            padding=(1, 2)
+                        ))
+                        
                         if step.action_type == "finish":
                             return True
                         
+                        # 2. 渲染拟执行内容
+                        lang = "python" if step.action_type == "python" else "shell"
+                        code_view = Syntax(step.action_input, lang, theme="monokai", line_numbers=True, word_wrap=True)
+                        console.print(Panel(
+                            code_view, 
+                            title=f"[bold magenta]拟执行: {step.action_type}[/bold magenta]", 
+                            border_style="magenta",
+                            box=ROUNDED
+                        ))
+                        
+                        # 3. 授权确认
                         if state["auto_all"]:
-                            # 自动执行时也打印执行中提示
                             console.print(f"[dim]正在自动执行 {step.action_type}...[/dim]")
                         else:
-                            ans = console.input("[bold green]授权执行? (y/a/n): [/bold green]").strip().lower()
+                            ans = console.input("[bold green]确认执行? (y:执行 / a:全部自动 / n:终止): [/bold green]").strip().lower()
                             if ans == 'a':
                                 state["auto_all"] = True
-                            elif ans == 'n': return False
-                        
-                        # 真正的执行将在 run 方法内部发生，我们通过回调后的步骤历史获取结果
+                            elif ans == 'n':
+                                return False
                         return True
 
                     try:
-                        # 劫持 BuildAgent._execute 以便在 CLI 中实时打印结果
                         original_execute = agent_build._execute
                         def _cli_execute_wrapper(action_type, action_input):
-                            res = original_execute(action_type, action_input)
-                            console.print(f"[bold green]执行结果:[/bold green]\n{res}")
+                            with console.status(f"[bold cyan]正在执行 {action_type}...[/bold cyan]"):
+                                res = original_execute(action_type, action_input)
+                            
+                            res_title = "[bold green]执行结果[/bold green]"
+                            if "ExitCode: 0" not in res and action_type == "shell":
+                                res_title = "[bold red]执行结果 (异常)[/bold red]"
+                            
+                            console.print(Panel(
+                                res, 
+                                title=res_title, 
+                                border_style="blue" if "ExitCode: 0" in res else "red",
+                                box=ROUNDED
+                            ))
                             return res
+                        
                         agent_build._execute = _cli_execute_wrapper
-
                         final_output = agent_build.run(cmd, history=session_history, on_step=_cli_on_step)
+                        
                         resp = AgentResponse(
                             thought="build-mode:complete",
                             actions=["build:done"],
                             output=final_output
                         )
                     except Exception as e:
-                        console.print(f"[red]执行异常：{e}[/red]")
+                        console.print(f"[bold red]❌ 执行过程中发生异常：{e}[/bold red]")
                         resp = AgentResponse(thought="build:error", actions=[], output=str(e))
                     
                     remember_turn = True
@@ -3301,10 +3330,14 @@ def serve(
     start_server(host=host, port=port)
 
 
-if __name__ == "__main__":
-    app()
-
-
 def run_cli() -> None:
     """Console entry: start REPL directly with one command."""
     chat(trace=False, stream=False)
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) <= 1:
+        run_cli()
+    else:
+        app()

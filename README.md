@@ -1,19 +1,31 @@
-﻿# WikiCoder
+# WikiCoder
 
 Wiki-first 知识问答/代码助手：先检索本地 Wiki，未命中再回退通用大模型。
 
-## 安装
+## 🚀 快速安装
 
-```bash
-pip install -r requirements.txt
-pip install -e .
+WikiCoder 现已支持 Windows 和 UOS/Linux 的一键安装。
+
+### Windows (PowerShell)
+在项目根目录下，以管理员权限或普通权限运行：
+```powershell
+.\install_win.bat
 ```
+*注：脚本会自动配置虚拟环境、安装依赖并注册全局 `wikicoder` 命令。*
 
-启动 REPL：
+### UOS / Linux (Bash)
+在终端执行以下命令：
+```bash
+bash install_uos.sh
+```
+*安装完成后，根据提示运行 `source ~/.bashrc` 使命令生效。*
 
+### 启动项目
+安装完成后，在任意目录下直接输入：
 ```bash
 wikicoder
 ```
+即可进入交互式问答模式。
 
 ## 核心配置
 
