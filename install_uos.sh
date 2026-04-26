@@ -7,13 +7,13 @@ echo "🚀 [WikiCoder] 正在启动一键安装程序 (UOS/Linux)..."
 if ! command -v uv &> /dev/null; then
     echo "📦 [WikiCoder] 正在安装高性能引擎 uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    source $HOME/.cargo/env
+    # 注入 uv 路径到当前会话，不再死板地 source .cargo/env
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 fi
 
 # 2. 创建环境并安装依赖
 echo "🐍 [WikiCoder] 正在配置 Python 环境..."
-uv venv --quiet
-uv pip install -r requirements.txt --quiet
+uv sync --quiet
 
 # 3. 创建全局启动脚本
 echo "⚙️ [WikiCoder] 正在注册全局快捷命令..."
@@ -25,9 +25,9 @@ LAUNCHER="$BIN_DIR/wikicoder"
 
 cat <<EOF > "$LAUNCHER"
 #!/bin/bash
-# WikiCoder 启动器
+# WikiCoder 启动器 (uv run 规范版)
 cd "$PROJECT_DIR"
-./.venv/bin/python src/main.py "\$@"
+uv run python src/main.py "\$@"
 EOF
 
 chmod +x "$LAUNCHER"
