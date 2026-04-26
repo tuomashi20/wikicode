@@ -14,4 +14,3 @@ uvicorn
 anyio
 openai
 python-dotenv
-cx>=1.1.0
