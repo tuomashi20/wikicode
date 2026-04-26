@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover
 from src.core.agent import AgentResponse, WikiFirstAgent
 from src.core.build_agent import BuildAgent, BuildStep
 from src.core.atomizer import Atomizer
-from src.core.llm_client import LLMClient
+from src.core.llm_client import LLMClient, global_stats
 from src.core.retrieval_eval import (
     compare_eval_reports,
     evaluate_retrieval,
@@ -86,44 +86,91 @@ CLI_BANNER = r"""
 
 class SlashCommandCompleter(Completer):
     def __init__(self) -> None:
-        self.commands = [
-            ("/help", "查看命令帮助"),
-            ("/sync", "同步知识库（RAW -> WIKI）"),
-            ("/kbclear yes", "清空索引（需确认）"),
-            ("/kbclear all yes", "清空索引 + Wiki 页面（保留 Raw）"),
-            ("/kbsave ", "备份知识库（raw/wiki/processed）"),
-            ("/kbbackups", "查看知识库备份列表"),
-            ("/kbrestore ", "恢复知识库备份"),
-            ("/vaultpath ", "设置知识库根目录"),
-            ("/ask ", "强制 Wiki 模式提问"),
-            ("/structure", "查看索引结构"),
-            ("/model", "查看/切换模型配置"),
-            ("/mode ", "切换会话模式"),
-            ("/resume", "继续上次会话上下文"),
-            ("/reset", "清空会话记忆"),
-            ("/memdraft ", "将最近对话整理为wiki草稿"),
-            ("/memsave ", "保存wiki草稿到raw/faq"),
-            ("/xlsx2md ", "xlsx 转 markdown（文件或目录）"),
-            ("/pdf2md ", "pdf 转 markdown（文件或目录）"),
-            ("/docx2md ", "word 转 markdown（文件或目录）"),
-            ("/md2canvas ", "markdown 转 obsidian canvas（正则版）"),
-            ("/md2canvas_ai ", "markdown 转 obsidian canvas（AI 增强版）"),
-            ("/exit", "退出 CLI"),
-            ("/help advanced", "查看高级命令"),
-        ]
+        # 定义分级命令结构
+        self.cmd_structure = {
+            "/help": {"advanced": "查看高级命令"},
+            "/sync": "同步知识库（RAW -> WIKI）",
+            "/kbclear": {
+                "yes": "清空索引（保留Wiki页）",
+                "all": {"yes": "彻底清空索引与Wiki页"}
+            },
+            "/kbsave": "备份当前知识库状态",
+            "/kbbackups": "查看备份快照列表",
+            "/kbrestore": "恢复指定备份",
+            "/vaultpath": "设置知识库主路径",
+            "/ask": "强制Wiki增强模式提问",
+            "/structure": "查看索引分层结构",
+            "/model": {
+                "jiutian-think-v3": "切换为深度思考模型",
+                "jiutian-lan-comv3": "切换为快速对话模型"
+            },
+            "/mode": {
+                "auto": "自动识别模式",
+                "wiki_only": "严格Wiki知识库模式",
+                "general_only": "通用大模型模式",
+                "build": "Build模式：自动探测与执行"
+            },
+            "/resume": "恢复上一次会话上下文",
+            "/reset": "重置当前会话记忆",
+            "/memdraft": "整理最近对话为Wiki草稿",
+            "/memsave": "保存Wiki草稿到FAQ",
+            "/xlsx2md": "转换Excel文件",
+            "/pdf2md": "转换PDF文件",
+            "/docx2md": "转换Word文件",
+            "/trace": {"on": "开启动作追踪", "off": "关闭动作追踪"},
+            "/stream": {"on": "开启流式渲染", "off": "关闭流式渲染"},
+            "/exit": "安全退出系统"
+        }
 
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
         if not text.startswith("/"):
             return
-        for cmd, desc in self.commands:
-            if cmd.startswith(text):
-                yield Completion(
-                    cmd,
-                    start_position=-len(text),
-                    display=cmd,
-                    display_meta=desc,
-                )
+
+        parts = text.split()
+        # 如果还在输入主命令（没有空格或只有一个斜杠）
+        if len(parts) <= 1 and not text.endswith(" "):
+            for cmd, content in self.cmd_structure.items():
+                if cmd.startswith(text):
+                    desc = content if isinstance(content, str) else "子命令导航"
+                    yield Completion(cmd, start_position=-len(text), display=cmd, display_meta=desc)
+            # 进入参数补全阶段
+            prefix = parts[0]
+            
+            # --- 插件增强：动态路径补全 ---
+            # 如果是转换类插件命令，自动补全当前目录下的对应后缀文件
+            plugin_ext_map = {
+                "/xlsx2md": ".xlsx",
+                "/pdf2md": ".pdf",
+                "/docx2md": ".docx",
+                "/md2canvas": ".md",
+                "/md2canvas_ai": ".md"
+            }
+            if prefix in plugin_ext_map:
+                import glob
+                ext = plugin_ext_map[prefix]
+                current_arg = parts[1] if len(parts) > 1 else ""
+                files = glob.glob(f"*{ext}") + glob.glob(f"**/*{ext}", recursive=True)
+                for f_path in files:
+                    if f_path.startswith(current_arg):
+                        yield Completion(f_path, start_position=-len(current_arg), display=f_path, display_meta=f"检测到 {ext} 资源")
+                return # 插件路径补全后直接返回
+
+            if prefix in self.cmd_structure and isinstance(self.cmd_structure[prefix], dict):
+                sub_dict = self.cmd_structure[prefix]
+                # 目前支持到第二级参数
+                current_arg = parts[1] if len(parts) > 1 else ""
+                if not text.endswith(" ") and len(parts) > 1:
+                    # 正在输入参数中
+                    for arg, desc in sub_dict.items():
+                        if arg.startswith(current_arg):
+                            display_desc = desc if isinstance(desc, str) else "点击进入下一级"
+                            yield Completion(arg, start_position=-len(current_arg), display=arg, display_meta=display_desc)
+                else:
+                    # 刚敲完空格，展示所有可选参数
+                    for arg, desc in sub_dict.items():
+                        display_desc = desc if isinstance(desc, str) else "点击进入下一级"
+                        yield Completion(arg, display=arg, display_meta=display_desc)
 
 
 def build_key_bindings() -> KeyBindings:
@@ -2468,10 +2515,19 @@ def chat(
                 continue
 
             if cmd == "/xlsx2md" or cmd.startswith("/xlsx2md "):
-                if cmd == "/xlsx2md":
-                    console.print("[yellow]用法：/xlsx2md <文件或目录路径>[/yellow]")
-                    continue
-                arg = cmd.split(" ", 1)[1].strip()
+                parts = cmd.split()
+                arg = parts[1].strip() if len(parts) > 1 else ""
+                
+                # --- 向导式同步：参数缺失时列出文件 ---
+                if not arg:
+                    import glob
+                    files = glob.glob("*.xlsx") + glob.glob("**/*.xlsx", recursive=True)
+                    if not files:
+                        console.print("[yellow]当前目录下未发现 .xlsx 文件。用法：/xlsx2md <路径>[/yellow]")
+                        continue
+                    from rich.prompt import Prompt
+                    arg = Prompt.ask("请选择要转换的 Excel 文件", choices=files[:20]) # 限制前20个防止溢出
+
                 recursive = False
                 if arg.endswith(" -r") or arg.endswith(" --recursive"):
                     recursive = True
@@ -2486,10 +2542,19 @@ def chat(
                 continue
 
             if cmd == "/pdf2md" or cmd.startswith("/pdf2md "):
-                if cmd == "/pdf2md":
-                    console.print("[yellow]用法：/pdf2md <文件或目录路径>[/yellow]")
-                    continue
-                arg = cmd.split(" ", 1)[1].strip()
+                parts = cmd.split()
+                arg = parts[1].strip() if len(parts) > 1 else ""
+                
+                # --- 向导式同步：参数缺失时列出文件 ---
+                if not arg:
+                    import glob
+                    files = glob.glob("*.pdf") + glob.glob("**/*.pdf", recursive=True)
+                    if not files:
+                        console.print("[yellow]当前目录下未发现 .pdf 文件。用法：/pdf2md <路径>[/yellow]")
+                        continue
+                    from rich.prompt import Prompt
+                    arg = Prompt.ask("请选择要转换的 PDF 文件", choices=files[:20])
+
                 recursive = False
                 if arg.endswith(" -r") or arg.endswith(" --recursive"):
                     recursive = True
@@ -2805,26 +2870,41 @@ def chat(
                     console.print((f"[green]{msg}[/green]" if ok else f"[red]{msg}[/red]"))
                 continue
 
-            if cmd.startswith("/trace "):
-                val = cmd.split(" ", 1)[1].strip().lower()
+            if cmd == "/trace" or cmd.startswith("/trace "):
+                parts = cmd.split()
+                val = parts[1].lower() if len(parts) > 1 else ""
+                if not val:
+                    from rich.prompt import Prompt
+                    val = Prompt.ask("开启动作追踪？", choices=["on", "off"], default="on")
+                
                 if val in {"on", "off"}:
                     show_trace = val == "on"
                     console.print(f"trace={show_trace}")
                 else:
-                    console.print("Usage: /trace on|off")
+                    console.print("[yellow]用法: /trace on|off[/yellow]")
                 continue
 
-            if cmd.startswith("/stream "):
-                val = cmd.split(" ", 1)[1].strip().lower()
+            if cmd == "/stream" or cmd.startswith("/stream "):
+                parts = cmd.split()
+                val = parts[1].lower() if len(parts) > 1 else ""
+                if not val:
+                    from rich.prompt import Prompt
+                    val = Prompt.ask("开启流式渲染？", choices=["on", "off"], default="on")
+
                 if val in {"on", "off"}:
                     show_stream = val == "on"
                     console.print(f"stream={show_stream}")
                 else:
-                    console.print("Usage: /stream on|off")
+                    console.print("[yellow]用法: /stream on|off[/yellow]")
                 continue
 
-            if cmd.startswith("/mode "):
-                val = cmd.split(" ", 1)[1].strip().lower()
+            if cmd == "/mode" or cmd.startswith("/mode "):
+                parts = cmd.split()
+                val = parts[1].lower() if len(parts) > 1 else ""
+                if not val:
+                    from rich.prompt import Prompt
+                    val = Prompt.ask("请选择会话模式", choices=["auto", "wiki_only", "general_only", "build"], default="auto")
+                
                 if val not in {"auto", "wiki_only", "general_only", "build"}:
                     console.print("[yellow]Usage: /mode auto|wiki_only|general_only|build[/yellow]")
                     continue
@@ -2833,17 +2913,15 @@ def chat(
                 _save_session_state(session_history, mode=session_mode)
                 continue
 
-            if cmd == "/model":
-                config = load_config()
-                _print_runtime_settings(config, session_mode=session_mode)
-                console.print(
-                    "[cyan]可切换：/model jiutian-think-v3 | /model jiutian-lan-comv3[/cyan]\n"
-                    "[dim]图片理解/图片生成模型会根据问题自动切换。[/dim]"
-                )
-                continue
-
-            if cmd.startswith("/model "):
-                model_name = cmd.split(" ", 1)[1].strip()
+            if cmd == "/model" or cmd.startswith("/model "):
+                parts = cmd.split()
+                model_name = parts[1] if len(parts) > 1 else ""
+                if not model_name:
+                    config = load_config()
+                    _print_runtime_settings(config, session_mode=session_mode)
+                    from rich.prompt import Prompt
+                    model_name = Prompt.ask("请选择模型", choices=["jiutian-think-v3", "jiutian-lan-comv3"], default="jiutian-lan-comv3")
+                
                 ok, msg = _set_model_config(model_name)
                 if not ok:
                     console.print(f"[yellow]{msg}[/yellow]")
@@ -3015,7 +3093,7 @@ def chat(
                         console.print(f"[red]File not found or empty:[/red] {f}")
                         missing = True
                         break
-                    blocks.append(f"file: {f}\n```\\n{code}\\n```")
+                    blocks.append(f"file: {f}\n```\n{code}\n```")
                 if missing:
                     continue
                 extra_ctx = _build_cross_file_context(query, exclude_files=set(file_list))
@@ -3171,43 +3249,72 @@ def chat(
                     from rich.panel import Panel
                     from rich.syntax import Syntax
                     from rich.box import ROUNDED
+                    from rich.table import Table
                     
                     console.print("\n[bold cyan]⚡ 进入交互构建模式 (Build Mode)[/bold cyan]")
                     agent_build = BuildAgent(config)
                     state = {"auto_all": False}
 
+                    def _make_status_header():
+                        from rich.text import Text
+                        
+                        cost_str = f"￥{global_stats.total_cost:.4f}"
+                        token_str = f"{global_stats.total_prompt_tokens + global_stats.total_completion_tokens:,} tokens"
+                        
+                        header = Text()
+                        header.append(" BUILD ", style="bold black on cyan")
+                        header.append(" ")
+                        header.append(f" {config.llm.model} ", style="bold white on blue")
+                        header.append(" ")
+                        header.append(f" {global_stats.last_latency:.1f}s ", style="bold white on black")
+                        header.append(f"  {token_str} ({cost_str})", style="dim")
+                        
+                        return header
+
                     def _cli_on_step(step: BuildStep) -> bool:
-                        # 1. 渲染思考过程
-                        console.print(Panel(
-                            step.thought, 
-                            title="[bold yellow]Agent 思考[/bold yellow]", 
-                            border_style="yellow", 
-                            box=ROUNDED,
-                            padding=(1, 2)
-                        ))
+                        # 0. 刷新顶部面板 (使用 Rule 配合 Text)
+                        console.rule(_make_status_header())
+                        
+                        # 1. 任务看板
+                        if step.tasks:
+                            task_content = ""
+                            for t in step.tasks:
+                                is_active = any(kw in step.thought for kw in t.split()[:2])
+                                marker = "[bold blue]▶[/bold blue]" if is_active else "[dim]○[/dim]"
+                                style = "bold white" if is_active else "dim"
+                                task_content += f"{marker} [{style}]{t}[/{style}]\n"
+                            console.print(Panel(task_content.strip(), title="[bold green]📋 任务清单[/bold green]", border_style="green", box=ROUNDED, padding=(0, 1)))
+
+                        # 1.5 自我批评 (Actor-Critic)
+                        if step.self_criticism:
+                            console.print(Panel(step.self_criticism, title="[bold cyan]🤔 自我反思[/bold cyan]", border_style="cyan", box=ROUNDED))
+
+                        # 2. 思考过程 (极简)
+                        console.print(f"\n[bold yellow]计划:[/bold yellow] {step.thought}\n")
                         
                         if step.action_type == "finish":
                             return True
                         
-                        # 2. 渲染拟执行内容
-                        lang = "python" if step.action_type == "python" else "shell"
-                        code_view = Syntax(step.action_input, lang, theme="monokai", line_numbers=True, word_wrap=True)
-                        console.print(Panel(
-                            code_view, 
-                            title=f"[bold magenta]拟执行: {step.action_type}[/bold magenta]", 
-                            border_style="magenta",
-                            box=ROUNDED
-                        ))
+                        # 3. 拟执行
+                        lang = "python"
+                        if step.action_type == "shell": lang = "bash"
+                        elif step.action_type == "edit_file": lang = "json"
+                        elif step.action_type == "read_url": lang = "markdown"
                         
-                        # 3. 授权确认
+                        code_view = Syntax(step.action_input, lang, theme="monokai", line_numbers=True, word_wrap=True)
+                        action_color = "magenta"
+                        if step.action_type == "read_url": action_color = "deep_sky_blue1"
+                        elif step.action_type == "edit_file": action_color = "orange3"
+                        
+                        console.print(Panel(code_view, title=f"[bold {action_color}]🚀 拟执行: {step.action_type}[/bold {action_color}]", border_style=action_color, box=ROUNDED))
+                        
+                        # 4. 授权
                         if state["auto_all"]:
                             console.print(f"[dim]正在自动执行 {step.action_type}...[/dim]")
                         else:
-                            ans = console.input("[bold green]确认执行? (y:执行 / a:全部自动 / n:终止): [/bold green]").strip().lower()
-                            if ans == 'a':
-                                state["auto_all"] = True
-                            elif ans == 'n':
-                                return False
+                            ans = console.input("[bold green]确认执行? (y/a/n): [/bold green]").strip().lower()
+                            if ans == 'a': state["auto_all"] = True
+                            elif ans == 'n': return False
                         return True
 
                     try:
@@ -3263,17 +3370,6 @@ def chat(
                 if _looks_like_script_request(cmd) and session_mode != "build":
                     console.print("\n[bold yellow]检测到编码/自动化需求。[/bold yellow]")
                     console.print("[yellow]当前处于常规对话模式。如需执行自动化任务，请先输入 [bold]/mode build[/bold] 切换到构建模式。[/yellow]\n")
-                else:
-                    try:
-                        resp = _auto_script_pipeline(
-                            agent=agent,
-                            user_query=cmd,
-                            resp=resp,
-                            history=session_history,
-                            consent_state=local_op_consent,
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass  # pipeline 内部已有异常保护，此处兜底防崩溃
 
             is_patch_cmd = cmd.startswith("/patch ") or cmd.startswith("/patchm ")
             if is_patch_cmd and resp.thought != "cancelled-by-user":

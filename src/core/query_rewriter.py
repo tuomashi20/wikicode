@@ -140,12 +140,20 @@ def rewrite_query(
     query: str, 
     synonyms: dict[str, list[str]] | None = None,
     core_keywords: list[str] | None = None,
+    llm: Any | None = None,
+    priority: str = "append"
 ) -> QueryRewrite:
+    """
+    [重写版] 混合动力查询重写：
+    1. 基础分词与静态同义词扩展。
+    2. (可选) LLM 语义意图重构。
+    """
     keywords = _tokenize(query, core_keywords=core_keywords)
     expanded: list[str] = []
     seen: set[str] = set()
     syn_map = synonyms or _DEFAULT_SYNONYMS
 
+    # 基础层：静态同义词
     for kw in keywords:
         if kw not in seen:
             expanded.append(kw)
@@ -157,9 +165,31 @@ def rewrite_query(
                         expanded.append(s)
                         seen.add(s)
 
-    expanded = expanded[:20] # 扩大扩展后的词容量
-    fts_query = " OR ".join([f'"{t}"' for t in expanded[:15]]) if expanded else ""
-    suggest_terms = expanded[:8]
+    # 增强层：LLM 语义重写（如果传入了 LLM 客户端）
+    if llm is not None and len(query) >= 4:
+        try:
+            # 极速 Prompt：要求返回 3-5 个专业关键词
+            prompt = (
+                f"你是一个知识库检索专家。请将以下用户口语转化为 3 个可能出现在专业 Wiki 文档中的核心关键词。\n"
+                f"用户问题：{query}\n"
+                f"要求：只返回关键词，用逗号隔开。"
+            )
+            llm_text = llm.generate(system_prompt="Query Rewriter", user_prompt=prompt)
+            if llm_text:
+                llm_terms = [t.strip().lower() for t in re.split(r"[,，、\s]+", llm_text) if t.strip()]
+                for lt in llm_terms:
+                    if lt not in seen:
+                        if priority == "prepend":
+                            expanded.insert(0, lt)
+                        else:
+                            expanded.append(lt)
+                        seen.add(lt)
+        except Exception:
+            pass
+
+    expanded = expanded[:25] 
+    fts_query = " OR ".join([f'"{t}"' for t in expanded[:18]]) if expanded else ""
+    suggest_terms = expanded[:10]
 
     return QueryRewrite(
         original=query,

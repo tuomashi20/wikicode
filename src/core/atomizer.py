@@ -166,39 +166,69 @@ class Atomizer:
 
     @staticmethod
     def _split_by_heading(text: str, rel_raw_path: str, level: int = 2) -> list[Chunk]:
-        heading_pattern = re.compile(rf"^{'#' * level}\s+(.+?)\s*$", re.MULTILINE)
-        matches = list(heading_pattern.finditer(text))
-
-        if not matches:
-            default_title = Path(rel_raw_path).stem
-            chunk_id = Atomizer._build_chunk_id(rel_raw_path, 1, default_title)
-            return [
-                Chunk(
-                    chunk_id=chunk_id,
-                    title=default_title,
-                    content=text.strip() or default_title,
-                    parent_file=rel_raw_path,
-                    raw_file_path=rel_raw_path,
-                )
-            ]
-
+        """
+        [进化版] 层级感知切片：
+        1. 识别所有层级的标题 (H1-H6)。
+        2. 为每个切片构建面包屑路径 (如: 首页 > 运维 > 数据库)。
+        3. 确保子章节能够继承父章节的语义背景。
+        """
+        lines = text.splitlines()
         chunks: list[Chunk] = []
-        for idx, m in enumerate(matches, start=1):
-            title = m.group(1).strip()
-            start = m.end()
-            end = matches[idx].start() if idx < len(matches) else len(text)
-            body = text[start:end].strip()
-            content = f"## {title}\n\n{body}" if body else f"## {title}"
-            chunk_id = Atomizer._build_chunk_id(rel_raw_path, idx, title)
-            chunks.append(
-                Chunk(
-                    chunk_id=chunk_id,
-                    title=title,
-                    content=content,
-                    parent_file=rel_raw_path,
-                    raw_file_path=rel_raw_path,
-                )
+        
+        current_headers = [None] * 7 # 存储 H1-H6 的当前标题内容
+        current_body: list[str] = []
+        chunk_idx = 1
+
+        def _create_chunk(headers, body, idx):
+            # 过滤掉 None，构造面包屑路径
+            breadcrumb = " > ".join([h for h in headers if h])
+            # 注入面包屑到内容头部，增强检索上下文
+            full_content = f"【上下文路径: {breadcrumb}】\n\n" + "\n".join(body).strip()
+            # 取当前最细颗粒度的标题作为 Chunk 标题
+            title = next((h for h in reversed(headers) if h), Path(rel_raw_path).stem)
+            cid = Atomizer._build_chunk_id(rel_raw_path, idx, title)
+            return Chunk(
+                chunk_id=cid,
+                title=title,
+                content=full_content,
+                parent_file=rel_raw_path,
+                raw_file_path=rel_raw_path
             )
+
+        for line in lines:
+            header_match = re.match(r"^(#+)\s+(.+)$", line)
+            if header_match:
+                # 发现新标题，如果之前有内容，先封装成块
+                if current_body and any(current_headers):
+                    chunks.append(_create_chunk(current_headers, current_body, chunk_idx))
+                    chunk_idx += 1
+                    current_body = []
+                
+                h_level = len(header_match.group(1))
+                h_title = header_match.group(2).strip()
+                if h_level <= 6:
+                    current_headers[h_level] = h_title
+                    # 清空更低等级（更细分）的旧标题
+                    for i in range(h_level + 1, 7):
+                        current_headers[i] = None
+            else:
+                current_body.append(line)
+        
+        # 处理文件结尾的最后一段内容
+        if current_body:
+            chunks.append(_create_chunk(current_headers, current_body, chunk_idx))
+            
+        # 极端兜底：如果全文没有标题，退化为单块模式
+        if not chunks:
+            default_title = Path(rel_raw_path).stem
+            chunks.append(Chunk(
+                chunk_id=Atomizer._build_chunk_id(rel_raw_path, 1, default_title),
+                title=default_title,
+                content=text.strip(),
+                parent_file=rel_raw_path,
+                raw_file_path=rel_raw_path
+            ))
+            
         return chunks
 
     def _extract_tags(self, title: str, content: str) -> str:

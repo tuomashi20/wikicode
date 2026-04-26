@@ -101,5 +101,12 @@ wiki_strategy:
     tag_min_len: 2
     tag_max_len: 20
 
+    # --- RAG 检索与重写策略 (业务逻辑参数化) ---
+    rag_retrieval_fanout: 12           # 检索初筛的关键词名额 (建议 12-16)
+    rag_rewrite_priority: "append"     # 重写词优先级 (append:核心词优先, prepend:LLM扩展优先)
+    rag_core_boost_score: 1000.0       # 核心业务词命中时的额外加权分
+    rag_link_follow_limit: 3           # 双链联动感知深度 (0则关闭)
+    rag_context_max_chars: 2400        # 每个 Chunk 注入 Prompt 的最大长度限制
+
 sync:
   auto_on_startup: true

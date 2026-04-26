@@ -67,6 +67,12 @@ class WikiStrategyConfig:
     tag_block_prefixes: list[str]
     tag_min_len: int
     tag_max_len: int
+    # --- RAG 业务策略参数 ---
+    rag_retrieval_fanout: int           # 检索初筛的关键词名额 (默认 12)
+    rag_rewrite_priority: str           # 重写词优先级 (append/prepend)
+    rag_core_boost_score: float         # 核心业务词加权分 (默认 1000)
+    rag_link_follow_limit: int          # 双链联动感知深度 (默认 3)
+    rag_context_max_chars: int          # 单个 Chunk 注入上下文的最大长度
 
 
 @dataclass
@@ -222,6 +228,12 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
         tag_block_prefixes=_rule_list("tag_block_prefixes"),
         tag_min_len=max(1, _rule_int("tag_min_len", 2)),
         tag_max_len=max(2, _rule_int("tag_max_len", 20)),
+        # --- 解析 RAG 策略配置 ---
+        rag_retrieval_fanout=max(1, _rule_int("rag_retrieval_fanout", 12)),
+        rag_rewrite_priority=str(rules_data.get("rag_rewrite_priority", default_rules.get("rag_rewrite_priority", "append"))),
+        rag_core_boost_score=float(rules_data.get("rag_core_boost_score", default_rules.get("rag_core_boost_score", 1000.0))),
+        rag_link_follow_limit=max(0, _rule_int("rag_link_follow_limit", 3)),
+        rag_context_max_chars=max(100, _rule_int("rag_context_max_chars", 2400)),
     )
 
 

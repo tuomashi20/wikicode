@@ -1,14 +1,29 @@
-from __future__ import annotations
-
 import json
-import urllib.error
-import urllib.request
+import httpx
+import time
+from dataclasses import dataclass, field
 from collections.abc import Iterator
 from typing import Any
 
-import httpx
-
 from src.utils.config import LLMConfig
+
+@dataclass
+class LLMStats:
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_cost: float = 0.0
+    request_count: int = 0
+    last_latency: float = 0.0
+
+    def update(self, prompt_tokens: int, completion_tokens: int, latency: float):
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+        self.request_count += 1
+        self.last_latency = latency
+        # 简单估算：以 DeepSeek/GPT-4o 均价为例 (假设 $0.5/1M tokens)
+        self.total_cost += (prompt_tokens + completion_tokens) * 0.0000005 * 7.2 # 折合人民币
+
+global_stats = LLMStats()
 
 
 class LLMClient:
@@ -22,13 +37,24 @@ class LLMClient:
         self.provider = config.provider.lower().strip()
 
     def generate(self, system_prompt: str, user_prompt: str) -> str:
+        start_time = time.time()
+        res = ""
         if self.provider == "jiutian":
-            return self._call_jiutian_chat(system_prompt, user_prompt)
-        if self.provider == "ollama":
-            return self._call_ollama(system_prompt, user_prompt)
-        if self.provider in {"google_api_studio", "google", "gemini"}:
-            return self._call_google(system_prompt, user_prompt)
-        return self._call_openai(system_prompt, user_prompt)
+            res = self._call_jiutian_chat(system_prompt, user_prompt)
+        elif self.provider == "ollama":
+            res = self._call_ollama(system_prompt, user_prompt)
+        elif self.provider in {"google_api_studio", "google", "gemini"}:
+            res = self._call_google(system_prompt, user_prompt)
+        else:
+            res = self._call_openai(system_prompt, user_prompt)
+        
+        latency = time.time() - start_time
+        # 注意：这里我们无法从每个 provider 的非流式调用中直接拿到精确 usage（除非重构所有返回值）
+        # 所以先粗略估计 Token (1 汉字 ≈ 1.5 token, 1 英文 ≈ 0.3 token)
+        p_tokens = len(system_prompt + user_prompt)
+        c_tokens = len(res)
+        global_stats.update(p_tokens, c_tokens, latency)
+        return res
 
     def generate_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
         if self.provider == "jiutian":

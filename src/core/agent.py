@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Any
 
 from src.core.llm_client import LLMClient
 from src.core.query_rewriter import QueryRewrite, load_business_terms
@@ -76,12 +76,16 @@ class WikiFirstAgent:
         if on_status is not None:
             on_status("wiki_search: started")
 
+        ws = self.config.wiki_strategy
         results, rw = (
             wiki_search_v2(
                 query, 
                 limit=8, 
-                synonyms_path=self.config.wiki_strategy.synonyms_path,
-                business_terms_path=self.config.wiki_strategy.business_terms_path
+                synonyms_path=ws.synonyms_path,
+                business_terms_path=ws.business_terms_path,
+                llm=self.llm,
+                fanout_limit=ws.rag_retrieval_fanout,
+                rewrite_priority=ws.rag_rewrite_priority
             ) if query else ([], None)
         )
         if rw is not None:
@@ -112,6 +116,13 @@ class WikiFirstAgent:
         for r in reliable[:3]:
             content = wiki_read_chunk(r["chunk_id"])
             _act(f"wiki_read_chunk(chunk_id={r['chunk_id']})")
+            
+            # --- [优化] 双链感知：提取 [[链接]] 并拉取摘要 ---
+            linked_ctx = self._fetch_linked_context(content)
+            if linked_ctx:
+                content = f"{content}\n\n[相关参考背景]:\n{linked_ctx}"
+                _act(f"wiki_link_percept: followed_links_in_chunk({r['chunk_id']})")
+
             chunks.append(
                 {
                     "chunk_id": str(r["chunk_id"]),
@@ -214,7 +225,7 @@ class WikiFirstAgent:
             if hit_count >= 2:
                 # 标题命中核心词加权
                 if any(k in title for k in query_cores):
-                    r["_score"] = float(r.get("_score", 0)) + 1000
+                    r["_score"] = float(r.get("_score", 0)) + self.config.wiki_strategy.rag_core_boost_score
                 reliable.append(r)
                 continue
             if hit_count == 1:
@@ -247,17 +258,7 @@ class WikiFirstAgent:
     def _is_code_query(query: str, code_context: str = "") -> bool:
         q = (query or "").lower()
         keys = [
-            "python",
-            "脚本",
-            "代码",
-            "debug",
-            "报错",
-            "异常",
-            "修复",
-            "bug",
-            ".py",
-            "自动化",
-            "合并",
+            "python", "脚本", "代码", "debug", "报错", "异常", "修复", "bug", ".py", "自动化", "合并"
         ]
         return bool(code_context.strip()) or any(k in q for k in keys)
 
@@ -274,16 +275,17 @@ class WikiFirstAgent:
         on_status: Callable[[str], None] | None = None,
     ) -> str:
         context_blocks = []
+        ws = self.config.wiki_strategy
         for idx, c in enumerate(chunks, start=1):
             context_blocks.append(
                 f"[CHUNK {idx}]\n"
                 f"id: {c['chunk_id']}\n"
                 f"title: {c['title']}\n"
                 f"source: {c['parent_file']}\n"
-                f"content:\n{c['content'][:2400]}"
+                f"content:\n{c['content'][:ws.rag_context_max_chars]}"
             )
 
-        style = self.config.wiki_strategy.style_guidelines or {}
+        style = ws.style_guidelines or {}
         style_text = ", ".join(f"{k}={v}" for k, v in style.items()) if style else "none"
         history_block = self._format_history_block(history)
 
@@ -363,7 +365,7 @@ class WikiFirstAgent:
                         on_token(tail)
                 output = output2
             return output
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             actions.append(f"llm_generate(failed, mode=wiki:{response_mode})")
             if on_status is not None:
                 on_status(f"llm_generate: failed ({e})")
@@ -440,11 +442,34 @@ class WikiFirstAgent:
             if on_status is not None:
                 on_status("llm_generate: general completed")
             return llm_text or "LLM returned empty output."
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             actions.append(f"llm_generate(failed, mode=general:{response_mode})")
             if on_status is not None:
                 on_status(f"llm_generate: failed ({e})")
             return f"Wiki miss and general LLM call failed: {e}\nPlease verify llm.api_key / provider config."
+
+    def _fetch_linked_context(self, content: str) -> str:
+        """[双链感知]：解析内容中的 [[Link]] 语法并抓取相关摘要。"""
+        links = re.findall(r"\[\[(.+?)\]\]", content)
+        if not links:
+            return ""
+        
+        linked_info = []
+        seen = set()
+        for link in links[:self.config.wiki_strategy.rag_link_follow_limit]: 
+            title = link.strip()
+            if not title or title in seen:
+                continue
+            seen.add(title)
+            
+            res, _ = wiki_search_v2(title, limit=1)
+            if res:
+                rel_content = wiki_read_chunk(res[0]["chunk_id"])
+                if rel_content:
+                    snippet = rel_content[:300].strip() + "..."
+                    linked_info.append(f"《{title}》相关说明：\n{snippet}")
+        
+        return "\n".join(linked_info) if linked_info else ""
 
     @staticmethod
     def _format_history_block(history: list[tuple[str, str]] | None, max_turns: int = 8, max_chars: int = 4800) -> str:
@@ -514,15 +539,12 @@ class WikiFirstAgent:
         s = text.strip()
         if len(s) < 12:
             return False
-        # skip pure heading / divider / obvious non-factual lines
         if s.startswith(("#", "---", "```")):
             return False
         if s.lower().startswith(("summary", "结论", "建议", "tips", "注意")) and len(s) < 24:
             return False
-        # questions are usually not factual assertions
         if "?" in s or "？" in s:
             return False
-        # require some lexical substance
         has_en = bool(re.search(r"[a-zA-Z]{3,}", s))
         has_cjk = bool(re.search(r"[\u4e00-\u9fff]{4,}", s))
         has_num = bool(re.search(r"\d", s))

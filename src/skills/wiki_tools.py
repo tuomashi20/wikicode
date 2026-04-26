@@ -34,15 +34,19 @@ def wiki_search_v2(
     limit: int = 20,
     synonyms_path: Path | str | None = None,
     business_terms_path: Path | str | None = None,
+    llm: Any | None = None,
+    fanout_limit: int = 12,
+    rewrite_priority: str = "append",
 ) -> tuple[list[dict[str, Any]], QueryRewrite]:
     syns = load_synonyms(synonyms_path)
     cores = load_business_terms(business_terms_path)
-    rw = rewrite_query(query, synonyms=syns, core_keywords=cores)
+    # 接入配置化的语义重写逻辑
+    rw = rewrite_query(query, synonyms=syns, core_keywords=cores, llm=llm, priority=rewrite_priority)
     if not query.strip():
         return [], rw
 
     fanout = [query.strip()]
-    for t in rw.expanded_terms[:6]:
+    for t in rw.expanded_terms[:fanout_limit]:  # 受配置管控的名额
         if t not in fanout:
             fanout.append(t)
 
