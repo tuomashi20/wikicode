@@ -18,12 +18,24 @@ uv sync --quiet
 # 3. 创建全局启动脚本
 echo "⚙️ [WikiCoder] 正在注册全局快捷命令..."
 BIN_DIR="$HOME/.local/bin"
-# 强力确保目录存在且清空可能的同名障碍
-mkdir -p "$BIN_DIR"
+
+# 强力确保目录存在
+if ! mkdir -p "$BIN_DIR"; then
+    echo "❌ [WikiCoder] 错误：无法创建目录 $BIN_DIR。请检查是否拥有 $HOME 目录的写权限。"
+    exit 1
+fi
+
+# 清空可能的同名障碍
 rm -f "$BIN_DIR/wikicoder" || true
 
 PROJECT_DIR=$(pwd)
 LAUNCHER="$BIN_DIR/wikicoder"
+
+# 调试信息：确保路径在这一刻是可达的
+if [ ! -d "$BIN_DIR" ]; then
+    echo "❌ [WikiCoder] 关键故障：mkdir 执行成功但目录仍不存在。请检查磁盘空间或权限锁定。"
+    exit 1
+fi
 
 # 尝试写入启动器
 if ! cat <<EOF > "$LAUNCHER"
