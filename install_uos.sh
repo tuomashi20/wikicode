@@ -18,17 +18,24 @@ uv sync --quiet
 # 3. 创建全局启动脚本
 echo "⚙️ [WikiCoder] 正在注册全局快捷命令..."
 BIN_DIR="$HOME/.local/bin"
+# 强力确保目录存在且清空可能的同名障碍
 mkdir -p "$BIN_DIR"
+rm -f "$BIN_DIR/wikicoder" || true
 
 PROJECT_DIR=$(pwd)
 LAUNCHER="$BIN_DIR/wikicoder"
 
-cat <<EOF > "$LAUNCHER"
+# 尝试写入启动器
+if ! cat <<EOF > "$LAUNCHER"
 #!/bin/bash
 # WikiCoder 启动器 (uv run 规范版)
 cd "$PROJECT_DIR"
 uv run python src/main.py "\$@"
 EOF
+then
+    echo "❌ [WikiCoder] 错误：无法在 $LAUNCHER 创建启动文件，请检查目录权限或手动创建。"
+    exit 1
+fi
 
 chmod +x "$LAUNCHER"
 
