@@ -1,4 +1,4 @@
-﻿# WikiCoder Windows 安装脚本 (PowerShell 版)
+# WikiCoder Windows 安装脚本 (PowerShell 版)
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $ConfirmPreference = "None"
 
@@ -46,7 +46,7 @@ $ProjectDir = Get-Location
 $BatContent = @"
 @echo off
 pushd "$ProjectDir"
-.venv\Scripts\python src\main.py %*
+uv run python src\main.py %*
 popd
 "@
 
