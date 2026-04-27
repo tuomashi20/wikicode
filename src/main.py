@@ -3336,7 +3336,8 @@ def chat(
                             return res
                         
                         agent_build._execute = _cli_execute_wrapper
-                        final_output = agent_build.run(cmd, history=session_history, on_step=_cli_on_step)
+                        # Build 模式不应继承聊天历史，避免上下文污染导致陷入之前的错误思路
+                        final_output = agent_build.run(cmd, history=None, on_step=_cli_on_step)
                         
                         resp = AgentResponse(
                             thought="build-mode:complete",
@@ -3347,7 +3348,8 @@ def chat(
                         console.print(f"[bold red]❌ 执行过程中发生异常：{e}[/bold red]")
                         resp = AgentResponse(thought="build:error", actions=[], output=str(e))
                     
-                    remember_turn = True
+                    # 不将 build 的超长执行结果存入聊天历史，保持环境干净
+                    remember_turn = False
                     plain_chat_turn = False
                 else:
                     auto_ctx = _extract_existing_py_context(cmd)
