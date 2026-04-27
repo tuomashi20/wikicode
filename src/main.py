@@ -3320,8 +3320,13 @@ def chat(
                     try:
                         original_execute = agent_build._execute
                         def _cli_execute_wrapper(action_type, action_input):
+                            sudo_pwd = ""
+                            if action_type == "shell" and "sudo " in action_input:
+                                from rich.prompt import Prompt
+                                sudo_pwd = Prompt.ask("\n[bold yellow]⚠️ 检测到系统提权命令 (sudo)，请输入当前用户的密码 (留空则尝试无密码执行)[/bold yellow]", password=True)
+
                             with console.status(f"[bold cyan]正在执行 {action_type}...[/bold cyan]"):
-                                res = original_execute(action_type, action_input)
+                                res = original_execute(action_type, action_input, sudo_password=sudo_pwd)
                             
                             res_title = "[bold green]执行结果[/bold green]"
                             if "ExitCode: 0" not in res and action_type == "shell":

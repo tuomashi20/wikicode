@@ -148,7 +148,7 @@ class BuildAgent:
             return json.loads(m.group()) if m else None
         except: return None
 
-    def _execute(self, action_type: str, action_input: str) -> str:
+    def _execute(self, action_type: str, action_input: str, sudo_password: str = "") -> str:
         if action_type == "shell":
             try:
                 env = os.environ.copy()
@@ -156,6 +156,11 @@ class BuildAgent:
                 env["PATH"] = py_dir + os.pathsep + env.get("PATH", "")
                 
                 final_cmd = action_input
+                run_kwargs = {}
+                if sudo_password and "sudo " in final_cmd:
+                    final_cmd = final_cmd.replace("sudo ", "sudo -S ")
+                    run_kwargs["input"] = sudo_password + "\n"
+
                 if platform.system() == "Windows":
                     # 针对 PS 的特殊字符转义
                     if "||" in action_input or "&&" in action_input:
@@ -168,7 +173,7 @@ class BuildAgent:
                             final_cmd = f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{encoded_cmd}"'
                     final_cmd = f"chcp 65001 > nul && {final_cmd}"
                 
-                res = subprocess.run(final_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env)
+                res = subprocess.run(final_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env, **run_kwargs)
                 return f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}\nExitCode: {res.returncode}"
             except Exception as e: return str(e)
         
