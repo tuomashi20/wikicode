@@ -12,8 +12,17 @@ if ! command -v uv &> /dev/null; then
 fi
 
 # 2. 创建环境并安装依赖
-echo "🐍 [WikiCoder] 正在配置 Python 环境..."
-uv sync --quiet
+echo "🐍 [WikiCoder] 正在配置 Python 环境 (uv sync)..."
+if ! uv sync; then
+    echo "❌ [WikiCoder] 错误：依赖同步失败！"
+    echo "💡 建议：请检查网络连接，或手动运行 'uv sync --verbose' 查看具体报错。"
+    exit 1
+fi
+
+if [ ! -d ".venv" ]; then
+    echo "❌ [WikiCoder] 错误：.venv 虚拟环境未能成功创建。"
+    exit 1
+fi
 
 # 3. 创建全局启动脚本
 echo "⚙️ [WikiCoder] 正在注册全局快捷命令..."
