@@ -3336,8 +3336,15 @@ def chat(
                             return res
                         
                         agent_build._execute = _cli_execute_wrapper
-                        # Build 模式不应继承聊天历史，避免上下文污染导致陷入之前的错误思路
-                        final_output = agent_build.run(cmd, history=None, on_step=_cli_on_step)
+                        
+                        # 智能清洗历史：保留用户的连贯意图，但过滤掉大模型之前的长篇大论或执行报错
+                        clean_history = []
+                        if session_history:
+                            for h_cmd, h_ans in session_history:
+                                clean_ans = h_ans if len(h_ans) < 300 else h_ans[:200] + "\n...[冗长的执行记录已由系统自动折叠，仅保留意图上下文]"
+                                clean_history.append((h_cmd, clean_ans))
+                                
+                        final_output = agent_build.run(cmd, history=clean_history, on_step=_cli_on_step)
                         
                         resp = AgentResponse(
                             thought="build-mode:complete",
@@ -3348,7 +3355,8 @@ def chat(
                         console.print(f"[bold red]❌ 执行过程中发生异常：{e}[/bold red]")
                         resp = AgentResponse(thought="build:error", actions=[], output=str(e))
                     
-                    # 不将 build 的超长执行结果存入聊天历史，保持环境干净
+                    # 将当前任务指令记入历史，但用一句话代替那成千上万字的超长执行日志
+                    session_history.append((cmd, f"✅ [Build模式执行完成。为保持记忆清晰，具体执行流水日志未计入上下文]"))
                     remember_turn = False
                     plain_chat_turn = False
                 else:
