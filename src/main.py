@@ -64,6 +64,7 @@ from src.skills.code_tools import (
 from src.skills.docx_tools import convert_docx_path
 from src.skills.pdf_tools import convert_pdf_path
 from src.skills.xlsx_tools import convert_xlsx_path
+from src.skills.canvas_tools import handle_canvas_command
 from src.skills.wiki_tools import wiki_list_structure
 from src.utils.config import AppConfig, DEFAULT_CONFIG_PATH, PROJECT_ROOT, ensure_workspace, load_config
 from src.utils.kb_backup import list_kb_backups, restore_kb_backup, save_kb_backup
@@ -117,6 +118,8 @@ class SlashCommandCompleter(Completer):
             "/xlsx2md": "转换Excel文件",
             "/pdf2md": "转换PDF文件",
             "/docx2md": "转换Word文件",
+            "/md2canvas": "Markdown转Obsidian画布",
+            "/md2canvas_ai": "AI驱动的Markdown画布拆解",
             "/trace": {"on": "开启动作追踪", "off": "关闭动作追踪"},
             "/stream": {"on": "开启流式渲染", "off": "关闭流式渲染"},
             "/exit": "安全退出系统"
@@ -2821,6 +2824,11 @@ def chat(
                 else:
                     console.print(f"[red]{msg}[/red]")
                 continue
+
+            if cmd.startswith(("/md2canvas ", "/md2canvas_ai ")) or cmd in {"/md2canvas", "/md2canvas_ai"}:
+                handle_canvas_command(cmd)
+                continue
+
             if cmd == "/preview":
                 if not last_patch_output:
                     console.print("No patch available. Run /patch or /patchm first.")
@@ -3328,6 +3336,20 @@ def chat(
                             with console.status(f"[bold cyan]正在执行 {action_type}...[/bold cyan]"):
                                 res = original_execute(action_type, action_input, sudo_password=sudo_pwd)
                             
+                            # 网络错误诊断与人工授权重试
+                            if action_type == "shell" and "ExitCode: 0" not in res:
+                                net_keywords = ["timeout", "Connection refused", "Could not resolve host", "network is unreachable", "Temporary failure in name resolution", "Failed to connect"]
+                                if any(kw.lower() in res.lower() for kw in net_keywords):
+                                    console.print("\n[bold orange3]🌐 检测到疑似网络异常，是否尝试针对该步骤重试一次？[/bold orange3]")
+                                    ans = console.input("[bold green]确认重试? (y/n): [/bold green]").strip().lower()
+                                    if ans == 'y':
+                                        with console.status("[bold cyan]正在重试执行...[/bold cyan]"):
+                                            res = original_execute(action_type, action_input, sudo_password=sudo_pwd)
+                                        if "ExitCode: 0" not in res:
+                                            res += "\n\n[系统提示：重试依然失败。请在下一步分析原因并寻找备选方案，或给出不可解的理由。]"
+                                    else:
+                                        res += "\n\n[系统提示：用户已明确拒绝针对此网络错误的重试。你必须尝试其他路径或结束任务。]"
+
                             res_title = "[bold green]执行结果[/bold green]"
                             if "ExitCode: 0" not in res and action_type == "shell":
                                 res_title = "[bold red]执行结果 (异常)[/bold red]"
