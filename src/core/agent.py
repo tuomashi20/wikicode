@@ -13,7 +13,7 @@ from src.utils.logger import get_file_logger
 
 
 ResponseMode = Literal["answer", "patch"]
-SessionMode = Literal["auto", "wiki_only", "general_only"]
+SessionMode = Literal["plan"]
 
 
 @dataclass
@@ -36,7 +36,7 @@ class WikiFirstAgent:
         self,
         user_input: str,
         force_wiki: bool = False,
-        mode: SessionMode = "auto",
+        mode: SessionMode = "plan",
         code_context: str = "",
         response_mode: ResponseMode = "answer",
         target_file: str = "",
@@ -55,26 +55,10 @@ class WikiFirstAgent:
         if not query and not force_wiki:
             return AgentResponse(thought="empty-input", actions=actions, output="Please enter a question.")
 
-        if mode == "general_only":
-            thought = "General-only: skip wiki and answer directly."
-            if on_status is not None:
-                on_status("mode=general_only: skip wiki retrieval")
-            output = self._general_chat(
-                query=query,
-                actions=actions,
-                code_context=code_context,
-                response_mode=response_mode,
-                target_file=target_file,
-                history=history,
-                on_token=on_token,
-                on_status=on_status,
-            )
-            self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
-            return AgentResponse(thought=thought, actions=actions, output=output)
-
-        thought = "Wiki-first: search wiki before final response."
+        # Plan 模式统一走 Wiki-first 逻辑
+        thought = "Plan-mode: architecture and task breakdown."
         if on_status is not None:
-            on_status("wiki_search: started")
+            on_status("Plan mode: analyzing requirements")
 
         ws = self.config.wiki_strategy
         results, rw = (
@@ -132,12 +116,18 @@ class WikiFirstAgent:
                 }
             )
 
-        if not chunks and mode == "wiki_only":
-            output = "No wiki content matched (wiki_only mode does not fallback to general LLM)."
-            self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
-            return AgentResponse(thought=thought + " (wiki-only-nohit)", actions=actions, output=output)
-
         if not chunks:
+            # 即使没搜到 Wiki，Plan 模式也要给出架构建议
+            output = self._general_chat(
+                query=query,
+                actions=actions,
+                code_context=code_context,
+                response_mode=response_mode,
+                target_file=target_file,
+                history=history,
+                on_token=on_token,
+                on_status=on_status,
+            )
             output = self._general_chat(
                 query=query,
                 actions=actions,
@@ -324,8 +314,17 @@ class WikiFirstAgent:
             )
         else:
             system_prompt = (
-                "You are WikiCoder assistant. Follow provided wiki policy first. "
-                "If policy conflicts with common practice, policy wins; if policy is insufficient, state assumptions. "
+                "你是 WikiCoder 架构师，当前处于 Plan (规划模式)。"
+                "你的目标是基于用户问题，结合本地知识库(Wiki)提供专业的深度方案。"
+                "如果 Wiki 规范与通用实践冲突，以 Wiki 为准；如果 Wiki 信息不足，请明确说明假设并给出通用最佳实践。\n\n"
+                "=== 输出格式要求 ===\n"
+                "你必须严格按照以下结构输出 Markdown：\n"
+                "## 💡 解决方案\n"
+                "[详细的技术方案描述，需结合项目规范和最佳实践]\n\n"
+                "## 📋 任务清单\n"
+                "- [ ] 步骤 1: ...\n"
+                "- [ ] 步骤 2: ...\n\n"
+                "注意：在此模式下，你只需提供规划，不要尝试执行任何具体命令。\n\n"
                 f"Style constraints: {style_text}."
             )
             code_part = f"\n\nCurrent code context:\n{code_context[:8000]}" if code_context else ""
@@ -416,9 +415,9 @@ class WikiFirstAgent:
                 )
             else:
                 system_prompt = (
-                    "You are WikiCoder assistant. No wiki policy matched. "
-                    "Answer user questions directly; do NOT limit to wiki-domain topics. "
-                    "If uncertain, state uncertainty clearly."
+                    "你是 WikiCoder 架构师，当前处于 Plan (规划模式)。"
+                    "未发现匹配的本地 Wiki 知识，请基于通用技术能力为用户提供方案。"
+                    "输出必须包含 ## 💡 解决方案 和 ## 📋 任务清单 结构。"
                 )
             code_part = f"\n\nCurrent code context:\n{code_context[:8000]}" if code_context else ""
             user_prompt = f"User question:\n{query}{history_block}{code_part}"

@@ -106,10 +106,8 @@ class SlashCommandCompleter(Completer):
                 "jiutian-lan-comv3": "切换为快速对话模型"
             },
             "/mode": {
-                "auto": "自动识别模式",
-                "wiki_only": "严格Wiki知识库模式",
-                "general_only": "通用大模型模式",
-                "build": "Build模式：自动探测与执行"
+                "plan": "规划模式：检索知识库，制定方案与任务列表",
+                "build": "构建模式：自动探测、执行命令与代码修改"
             },
             "/resume": "恢复上一次会话上下文",
             "/reset": "重置当前会话记忆",
@@ -2384,7 +2382,7 @@ def chat(
 
     show_trace = trace
     show_stream = stream
-    session_mode = "auto"
+    session_mode = "plan"
     last_patch_file = ""
     last_patch_output = ""
     last_patch_allowed: set[str] | None = None
@@ -2394,7 +2392,7 @@ def chat(
     memory_draft = ""
     memory_title = ""
     _print_runtime_settings(config, session_mode=session_mode)
-    console.print(f"[dim]当前会话模式: mode={session_mode}[/dim]")
+    console.print(f"[dim]当前模式: mode={session_mode} (输入 /mode build 切换到执行模式)[/dim]")
     if SESSION_STATE_PATH.exists():
         console.print("[dim]检测到上次会话记录，可输入 /resume 继续上下文。[/dim]")
 
@@ -2449,10 +2447,9 @@ def chat(
                     "/kbbackups          查看知识库备份列表\n"
                     "/kbrestore <id>     恢复指定知识库备份\n\n"
                     "[cyan]二、问答与模式[/cyan]\n"
-                    "/mode auto|wiki_only|general_only  切换会话模式\n"
-                    "  - auto: 先检索 wiki，未命中回退通用模型\n"
-                    "  - wiki_only: 仅 wiki，不回退\n"
-                    "  - general_only: 直接通用模型\n"
+                    "/mode plan|build   切换会话模式\n"
+                    "  - plan:  规划模式。检索 Wiki 并产出解决方案和任务清单 (默认)\n"
+                    "  - build: 构建模式。自动探测环境、生成代码并执行修复\n"
                     "/resume             恢复上次会话上下文（最近30轮）\n"
                     "/ask <问题>         强制 Wiki 模式提问\n"
                     "/memdraft [标题]    将本轮会话整理为 wiki 文档草稿\n"
@@ -2911,13 +2908,14 @@ def chat(
                 val = parts[1].lower() if len(parts) > 1 else ""
                 if not val:
                     from rich.prompt import Prompt
-                    val = Prompt.ask("请选择会话模式", choices=["auto", "wiki_only", "general_only", "build"], default="auto")
+                    val = Prompt.ask("请选择会话模式", choices=["plan", "build"], default="plan")
                 
-                if val not in {"auto", "wiki_only", "general_only", "build"}:
-                    console.print("[yellow]Usage: /mode auto|wiki_only|general_only|build[/yellow]")
+                if val not in {"plan", "build"}:
+                    console.print("[yellow]用法: /mode plan|build[/yellow]")
                     continue
                 session_mode = val
-                console.print(f"[cyan]session mode = {session_mode}[/cyan]")
+                status_icon = "📝" if session_mode == "plan" else "⚡"
+                console.print(f"[cyan]已切换到 {status_icon} {session_mode} 模式[/cyan]")
                 _save_session_state(session_history, mode=session_mode)
                 continue
 
@@ -3029,7 +3027,7 @@ def chat(
                     user_input=query,
                     force_wiki=True,
                     history=session_history,
-                    mode="wiki_only",
+                    mode="plan",
                 )
                 remember_turn = True
             elif cmd.startswith("/review "):
@@ -3078,7 +3076,7 @@ def chat(
                     response_mode="patch",
                     target_file=file,
                     history=session_history,
-                    mode="wiki_only",
+                    mode="plan",
                 )
                 last_patch_file = file
                 last_patch_output = resp.output
@@ -3117,7 +3115,7 @@ def chat(
                     response_mode="patch",
                     target_file=", ".join(file_list),
                     history=session_history,
-                    mode="wiki_only",
+                    mode="plan",
                 )
                 last_patch_file = file_list[0]
                 last_patch_output = resp.output
