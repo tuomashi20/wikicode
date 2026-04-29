@@ -3519,11 +3519,17 @@ def serve(
         log_file = Path(PROJECT_ROOT) / "wikicoder_server.log"
         
         # 构造启动命令
-        cmd = [sys.executable, "src/main.py", "serve", "run", "--host", host, "--port", str(port)]
+        executable = sys.executable
+        if platform.system() == "Windows":
+            # 寻找 pythonw.exe (它运行的时候不会弹黑窗口)
+            pythonw = Path(executable).parent / "pythonw.exe"
+            if pythonw.exists():
+                executable = str(pythonw)
+
+        cmd = [executable, "src/main.py", "serve", "run", "--host", host, "--port", str(port)]
         
         if platform.system() == "Windows":
-            # Windows 后台运行常用方式：使用 start 开启新进程
-            # 为了实现真正的静默，建议通过 pythonw 或者特殊的 subprocess 标志
+            # Windows 后台运行：使用 CREATE_NO_WINDOW 确保双重保险
             process = subprocess.Popen(
                 cmd,
                 creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,

@@ -6,6 +6,9 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "[WikiCoder] Starting Installer..." -ForegroundColor Cyan
 Write-Host "==========================================" -ForegroundColor Cyan
 
+# 0. Force location to script directory
+Set-Location -Path $PSScriptRoot
+
 # 1. Check/Install uv
 if (!(Get-Command uv -ErrorAction SilentlyContinue)) {
     Write-Host "[WikiCoder] Installing uv engine..." -ForegroundColor Yellow
@@ -43,8 +46,9 @@ if (!(Test-Path $LauncherDir)) {
     New-Item -ItemType Directory -Path $LauncherDir | Out-Null 
 }
 
-$ProjectDir = (Get-Item .).FullName
-$BatContent = "@echo off`r`npushd ""$ProjectDir""`r`nuv run python src\main.py %*`r`npopd"
+$ProjectDir = $PSScriptRoot
+# Use absolute paths for both pushd and python execution to prevent path loss
+$BatContent = "@echo off`r`npushd ""$ProjectDir""`r`nuv run python ""$ProjectDir\src\main.py"" %*`r`npopd"
 
 Set-Content -Path "$LauncherDir\wikicoder.bat" -Value $BatContent -Encoding Ascii
 
@@ -58,25 +62,27 @@ if ($UserPath -notlike "*$LauncherDir*") {
 }
 
 # 5. Register Auto-start Task
-Write-Host "[WikiCoder] Registering auto-start service (Login trigger)..." -ForegroundColor Cyan
+Write-Host "[WikiCoder] Registering auto-start service (Task Scheduler)..." -ForegroundColor Cyan
 $TaskName = "WikiCoderServer"
 $TaskAction = New-ScheduledTaskAction -Execute "$LauncherDir\wikicoder.bat" -Argument "serve start"
 $TaskTrigger = New-ScheduledTaskTrigger -AtLogon
 $TaskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0
+$TaskPrincipal = New-ScheduledTaskPrincipal -UserId "$([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)" -LogonType Interactive
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
 try {
-    Register-ScheduledTask -Action $TaskAction -Trigger $TaskTrigger -Settings $TaskSettings -TaskName $TaskName -Description "WikiCoder Backend Server Auto-start" | Out-Null
-    Write-Host "[WikiCoder] Auto-start service registered successfully." -ForegroundColor Green
+    Register-ScheduledTask -Action $TaskAction -Trigger $TaskTrigger -Settings $TaskSettings -Principal $TaskPrincipal -TaskName $TaskName -Description "WikiCoder Backend Server Auto-start" -ErrorAction Stop | Out-Null
+    Write-Host "[WikiCoder] Auto-start task registered successfully." -ForegroundColor Green
     
-    # Immediately start the service for current session
-    Write-Host "[WikiCoder] Starting background service now..." -ForegroundColor Cyan
+    # Immediately start the service
+    Write-Host "[WikiCoder] Starting background service..." -ForegroundColor Cyan
     & "$LauncherDir\wikicoder.bat" serve start
 } catch {
-    Write-Host "[WikiCoder] Warning: Failed to register auto-start task. You may need to run as Admin for this step, or skip it." -ForegroundColor Yellow
+    Write-Host "[WikiCoder] Access Denied: Failed to register auto-start task." -ForegroundColor Yellow
+    Write-Host "[WikiCoder] Please run this script AS ADMINISTRATOR to enable auto-start." -ForegroundColor Yellow
 }
 
 Write-Host "`n==========================================" -ForegroundColor Green

@@ -37,7 +37,8 @@ fi
 # 清空可能的同名障碍
 rm -f "$BIN_DIR/wikicoder" || true
 
-PROJECT_DIR=$(pwd)
+# 锁定脚本所在的物理目录，防止路径漂移
+PROJECT_DIR=$(cd "$(dirname "$0")"; pwd)
 LAUNCHER="$BIN_DIR/wikicoder"
 
 # 调试信息：确保路径在这一刻是可达的
