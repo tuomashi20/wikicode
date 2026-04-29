@@ -95,10 +95,35 @@ fi
 echo "=========================================="
 if [ "$path_updated" = true ]; then
     echo "🔥 [重要] 请执行以下命令使配置立即生效（或者重启终端）："
-    echo ""
     echo "    source $SHELL_CONFIG"
-    echo ""
-else
-    echo "🎉 命令已就绪，您可以直接输入 'wikicoder' 启动。"
 fi
+
+# 6. 注册 Systemd 用户服务 (实现开机自启)
+echo "🛡️ [WikiCoder] 正在配置后台服务自启动 (Systemd)..."
+SERVICE_DIR="$HOME/.config/systemd/user"
+mkdir -p "$SERVICE_DIR"
+
+cat <<EOF > "$SERVICE_DIR/wikicoder.service"
+[Unit]
+Description=WikiCoder Backend Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PROJECT_DIR
+ExecStart=$LAUNCHER serve run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable wikicoder.service
+systemctl --user restart wikicoder.service
+
+echo "✨ 后台服务已启动并设置为开机自启。"
+echo "💡 您可以使用 'systemctl --user status wikicoder' 查看状态。"
+echo "💡 使用 'wikicoder serve stop' 临时停止服务。"
 echo "=========================================="

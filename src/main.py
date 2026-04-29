@@ -3454,13 +3454,107 @@ def chat(
 
 @app.command()
 def serve(
+    action: str = typer.Argument("run", help="动作: run(前台运行), start(后台启动), stop(停止), status(状态)"),
     host: str = typer.Option("127.0.0.1", help="监听地址"),
     port: int = typer.Option(8000, help="监听端口"),
 ):
-    """启动 Wikicodian 后端 Web 服务"""
-    from src.core.web_api import start_server
-    console.print(f"[bold green]Wikicodian 服务启动中...[/bold green] 地址: http://{host}:{port}")
-    start_server(host=host, port=port)
+    """管理 Wikicodian 后端 Web 服务"""
+    import os
+    import signal
+    import subprocess
+    import platform
+    import time
+    from pathlib import Path
+    from src.utils.config import PROJECT_ROOT
+    
+    pid_file = Path(PROJECT_ROOT) / "wikicoder.pid"
+    
+    def is_running(pid):
+        try:
+            if platform.system() == "Windows":
+                # Windows 下使用 tasklist 检查
+                res = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True)
+                return str(pid) in res.stdout
+            else:
+                os.kill(pid, 0)
+                return True
+        except:
+            return False
+
+    if action == "status":
+        if pid_file.exists():
+            pid = int(pid_file.read_text().strip())
+            if is_running(pid):
+                console.print(f"[bold green]● Wikicodian 服务正在运行 (PID: {pid})[/bold green]")
+                console.print(f"地址: http://{host}:{port}")
+                return
+        console.print("[bold red]○ Wikicodian 服务未在运行[/bold red]")
+
+    elif action == "stop":
+        if pid_file.exists():
+            pid = int(pid_file.read_text().strip())
+            if is_running(pid):
+                console.print(f"[yellow]正在停止服务 (PID: {pid})...[/yellow]")
+                try:
+                    if platform.system() == "Windows":
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True)
+                    else:
+                        os.kill(pid, signal.SIGTERM)
+                    time.sleep(1)
+                except Exception as e:
+                    console.print(f"[red]停止失败: {e}[/red]")
+            pid_file.unlink(missing_ok=True)
+            console.print("[bold green]服务已停止。[/bold green]")
+        else:
+            console.print("[yellow]未发现正在运行的服务记录。[/yellow]")
+
+    elif action == "start":
+        if pid_file.exists():
+            pid = int(pid_file.read_text().strip())
+            if is_running(pid):
+                console.print(f"[yellow]服务已在运行 (PID: {pid})，请勿重复启动。[/yellow]")
+                return
+        
+        console.print(f"[bold cyan]正在后台启动 Wikicodian 服务...[/bold cyan]")
+        log_file = Path(PROJECT_ROOT) / "wikicoder_server.log"
+        
+        # 构造启动命令
+        cmd = [sys.executable, "src/main.py", "serve", "run", "--host", host, "--port", str(port)]
+        
+        if platform.system() == "Windows":
+            # Windows 后台运行常用方式：使用 start 开启新进程
+            # 为了实现真正的静默，建议通过 pythonw 或者特殊的 subprocess 标志
+            process = subprocess.Popen(
+                cmd,
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                stdout=open(log_file, "a"),
+                stderr=subprocess.STDOUT,
+                cwd=PROJECT_ROOT
+            )
+        else:
+            # Linux 使用 setsid 彻底脱离终端
+            process = subprocess.Popen(
+                cmd,
+                preexec_fn=os.setsid,
+                stdout=open(log_file, "a"),
+                stderr=subprocess.STDOUT,
+                cwd=PROJECT_ROOT
+            )
+        
+        pid_file.write_text(str(process.pid))
+        console.print(f"[bold green]服务已在后台启动 (PID: {process.pid})[/bold green]")
+        console.print(f"日志路径: {log_file}")
+
+    else:
+        # 默认 run (前台运行)
+        from src.core.web_api import start_server
+        console.print(f"[bold green]Wikicodian 服务启动中 (前台模式)...[/bold green] 地址: http://{host}:{port}")
+        # 前台运行时记录当前 PID，方便外部 stop
+        pid_file.write_text(str(os.getpid()))
+        try:
+            start_server(host=host, port=port)
+        finally:
+            pid_file.unlink(missing_ok=True)
 
 
 def run_cli() -> None:
