@@ -75,6 +75,7 @@ class BuildAgent:
             '  "input": "内容"\n'
             "}\n\n"
             "执行准则：\n"
+            "0. 【多行文件写入】：严禁使用 shell 的 echo 命令写入多行文件，因为这在不同系统下（尤其是 Windows）极其容易产生引号和换行符冲突。请始终优先使用 python 动作，通过 `with open('filename', 'w') as f: f.write(...)` 来安全地写入多行文件内容。\n"
             "1. 【错误零容忍】：如果 Observation 显示非零退出码或错误，必须在 self_criticism 中进行逻辑解构，严禁在未改变方法的情况下重复操作。\n"
             "2. 【网络异常重试限制】：对于网络类错误，只有当 Observation 明确告知“用户已同意重试”时，你才可以尝试第二次相同的执行。若用户拒绝或无此类提示，你必须切换到其他方法（如离线处理、换源或检查代理）。\n"
             "3. 【备选路径优先】：如果 Shell 命令持续失败，优先考虑编写稳健的 Python 脚本来完成相同的逻辑。\n"
@@ -168,7 +169,23 @@ class BuildAgent:
     def _parse_and_clean_decision(self, text: str) -> dict | None:
         try:
             m = re.search(r"\{[\s\S]*\}", text)
-            return json.loads(m.group()) if m else None
+            if not m: return None
+            raw_json = m.group()
+            
+            try:
+                return json.loads(raw_json)
+            except json.JSONDecodeError:
+                # 修复逻辑：处理字符串中未转义的原始换行符
+                fixed = ""
+                in_string = False
+                for i, char in enumerate(raw_json):
+                    if char == '"' and (i == 0 or raw_json[i-1] != '\\'):
+                        in_string = not in_string
+                    if char == '\n' and in_string:
+                        fixed += '\\n'
+                    else:
+                        fixed += char
+                return json.loads(fixed)
         except: return None
 
     def _execute(self, action_type: str, action_input: str, sudo_password: str = "") -> str:
