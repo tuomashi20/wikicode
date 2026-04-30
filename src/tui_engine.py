@@ -51,7 +51,11 @@ class TUIApp:
         self.config = config
         self.agent = agent
         self.build_agent_factory = build_agent_factory
-        self.main_loop = asyncio.get_event_loop()
+        try:
+            self.main_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.main_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.main_loop)
         initial_mode = getattr(config, "mode", "plan")
         self.session_mode = initial_mode if initial_mode in ["plan", "build"] else "plan"
         self.session_history = []
