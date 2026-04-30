@@ -15,13 +15,25 @@ from pathlib import Path
 
 import typer
 import yaml
-from prompt_toolkit import PromptSession
+from prompt_toolkit import PromptSession, Application
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, BufferControl, FormattedTextControl
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.widgets import Frame, TextArea, SearchToolbar
+from prompt_toolkit.styles import Style
+from prompt_toolkit.filters import has_focus
+from prompt_toolkit.application import get_app
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.rule import Rule
+from rich.status import Status
+from rich.syntax import Syntax
 
 try:
     import msvcrt  # type: ignore[attr-defined]
@@ -76,7 +88,7 @@ console = Console()
 SESSION_STATE_PATH = PROJECT_ROOT / ".wikicoder" / "session_state.json"
 
 CLI_BANNER = r"""
-██╗    ██╗██╗██╗  ██╗██╗ ██████╗ ██████╗ ██████╗ ███████╗██████╗
+██╗    ██╗██║██╗  ██╗██╗ ██████╗ ██████╗ ██████╗ ███████╗██████╗
 ██║    ██║██║██║ ██╔╝██║██╔════╝██╔═══██╗██╔══██╗██╔════╝██╔══██╗
 ██║ █╗ ██║██║█████╔╝ ██║██║     ██║   ██║██║  ██║█████╗  ██████╔╝
 ██║███╗██║██║██╔═██╗ ██║██║     ██║   ██║██║  ██║██╔══╝  ██╔══██╗
@@ -86,130 +98,131 @@ CLI_BANNER = r"""
 
 
 class SlashCommandCompleter(Completer):
-    def __init__(self) -> None:
-        # 定义分级命令结构
-        self.cmd_structure = {
-            "/help": {"advanced": "查看高级命令"},
-            "/sync": "同步知识库（RAW -> WIKI）",
-            "/kbclear": {
-                "yes": "清空索引（保留Wiki页）",
-                "all": {"yes": "彻底清空索引与Wiki页"}
-            },
-            "/kbsave": "备份当前知识库状态",
-            "/kbbackups": "查看备份快照列表",
-            "/kbrestore": "恢复指定备份",
-            "/vaultpath": "设置知识库主路径",
-            "/ask": "强制Wiki增强模式提问",
-            "/structure": "查看索引分层结构",
-            "/model": {
-                "jiutian-think-v3": "切换为深度思考模型",
-                "jiutian-lan-comv3": "切换为快速对话模型"
-            },
+    """高级级联补全器：支持全量 WikiCoder 指令集、二级菜单与动态文件搜索"""
+    def __init__(self):
+        # 补全树 - 最终全量版 (22条指令)
+        self.cmd_tree = {
+            "/kbpath": "设置知识库同步路径 (支持目录联想)",
+            "/sync": "同步知识库 (扫描并更新本地索引)",
+            "/kbclear": "清除知识库向量索引",
+            "/kbbackups": "查看知识库备份列表",
+            "/kbrestore": "从备份 ID 恢复知识库",
+            "/memsave": "一键记忆：自动整理当前会话并存入 raw/faq (参数: <标题>)",
+            "/md2canvas": "将 Markdown 转换为 Obsidian Canvas",
+            "/undo": "撤销上一步 Wiki 写入操作",
             "/mode": {
-                "plan": "规划模式：检索知识库，制定方案与任务列表",
-                "build": "构建模式：自动探测、执行命令与代码修改"
+                "plan": "规划模式：检索知识库，制定方案",
+                "build": "构建模式：自动探测并执行修改"
             },
-            "/resume": "恢复上一次会话上下文",
-            "/reset": "重置当前会话记忆",
-            "/memdraft": "整理最近对话为Wiki草稿",
-            "/memsave": "保存Wiki草稿到FAQ",
-            "/xlsx2md": "转换Excel文件",
-            "/pdf2md": "转换PDF文件",
-            "/docx2md": "转换Word文件",
-            "/md2canvas": "Markdown转Obsidian画布",
-            "/md2canvas_ai": "AI驱动的Markdown画布拆解",
-            "/trace": {"on": "开启动作追踪", "off": "关闭动作追踪"},
-            "/stream": {"on": "开启流式渲染", "off": "关闭流式渲染"},
-            "/exit": "安全退出系统"
+            "/model": {
+                "jiutian-lan-comv3": "九天-揽月 V3 (对话/通用)", 
+                "jiutian-think-v3": "九天-思考 V3 (复杂推理)"
+            },
+            "/resume": "恢复上次会话上下文",
+            "/reset": "重置会话记忆",
+            "/ask": "向 AI 发起提问 (参数: <问题>)",
+            "/patch": "生成文件修改补丁 (参数: <文件>)",
+            "/review": "审查代码/文档规范 (参数: <文件>)",
+            "/pdf2md": "PDF 转 Markdown (支持文件补全)",
+            "/docx2md": "Word 转 Markdown (支持文件补全)",
+            "/xlsx2md": "Excel 转 Markdown",
+            "/version": "查看系统版本信息",
+            "/help": "查看完整命令手册",
+            "/exit": "安全退出应用"
         }
 
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
-        if not text.startswith("/"):
+        if not text.startswith("/"): return
+        parts = text.split()
+        
+        # 1. 路径与文件动态补全 (针对路径指令)
+        path_cmds = {"/pdf2md", "/docx2md", "/xlsx2md", "/kbpath", "/patch", "/review"}
+        if len(parts) >= 1 and parts[0] in path_cmds:
+            prefix = parts[0]
+            current_arg = parts[1] if len(parts) > 1 and not text.endswith(" ") else ""
+            try:
+                import glob
+                if prefix == "/kbpath":
+                    entries = glob.glob(f"{current_arg}*") + glob.glob(f"{current_arg}**/", recursive=True)
+                    files = [e for e in entries if os.path.isdir(e)]
+                else:
+                    ext_map = {"/pdf2md": ".pdf", "/docx2md": ".docx", "/xlsx2md": ".xlsx"}
+                    ext = ext_map.get(prefix, "")
+                    files = glob.glob(f"*{ext}") + glob.glob(f"**/*{ext}", recursive=True)
+                for f in sorted(list(set(files))):
+                    if f == current_arg: continue
+                    if not current_arg or f.lower().startswith(current_arg.lower()):
+                        yield Completion(f, start_position=-len(current_arg), display_meta="路径联想")
+            except: pass
             return
 
-        parts = text.split()
-        # 如果还在输入主命令（没有空格或只有一个斜杠）
-        if len(parts) <= 1 and not text.endswith(" "):
-            for cmd, content in self.cmd_structure.items():
-                if cmd.startswith(text):
-                    desc = content if isinstance(content, str) else "子命令导航"
-                    yield Completion(cmd, start_position=-len(text), display=cmd, display_meta=desc)
-            # 进入参数补全阶段
-            prefix = parts[0]
-            
-            # --- 插件增强：动态路径补全 ---
-            # 如果是转换类插件命令，自动补全当前目录下的对应后缀文件
-            plugin_ext_map = {
-                "/xlsx2md": ".xlsx",
-                "/pdf2md": ".pdf",
-                "/docx2md": ".docx",
-                "/md2canvas": ".md",
-                "/md2canvas_ai": ".md"
-            }
-            if prefix in plugin_ext_map:
-                import glob
-                ext = plugin_ext_map[prefix]
-                current_arg = parts[1] if len(parts) > 1 else ""
-                files = glob.glob(f"*{ext}") + glob.glob(f"**/*{ext}", recursive=True)
-                for f_path in files:
-                    if f_path.startswith(current_arg):
-                        yield Completion(f_path, start_position=-len(current_arg), display=f_path, display_meta=f"检测到 {ext} 资源")
-                return # 插件路径补全后直接返回
+        # 2. 级联二级菜单
+        if len(parts) >= 1:
+            root = parts[0]
+            if root in self.cmd_tree and isinstance(self.cmd_tree[root], dict):
+                sub_dict = self.cmd_tree[root]
+                if len(parts) == 1 and text.endswith(" "):
+                    for sub, desc in sub_dict.items():
+                        yield Completion(sub, start_position=0, display_meta=desc)
+                    return
+                elif len(parts) > 1:
+                    query = parts[1]
+                    for sub, desc in sub_dict.items():
+                        if sub == query: continue 
+                        if sub.startswith(query):
+                            yield Completion(sub, start_position=-len(query), display_meta=desc)
+                    return
 
-            if prefix in self.cmd_structure and isinstance(self.cmd_structure[prefix], dict):
-                sub_dict = self.cmd_structure[prefix]
-                # 目前支持到第二级参数
-                current_arg = parts[1] if len(parts) > 1 else ""
-                if not text.endswith(" ") and len(parts) > 1:
-                    # 正在输入参数中
-                    for arg, desc in sub_dict.items():
-                        if arg.startswith(current_arg):
-                            display_desc = desc if isinstance(desc, str) else "点击进入下一级"
-                            yield Completion(arg, start_position=-len(current_arg), display=arg, display_meta=display_desc)
-                else:
-                    # 刚敲完空格，展示所有可选参数
-                    for arg, desc in sub_dict.items():
-                        display_desc = desc if isinstance(desc, str) else "点击进入下一级"
-                        yield Completion(arg, display=arg, display_meta=display_desc)
+        # 3. 基础一级命令补全
+        if len(parts) <= 1 and not text.endswith(" "):
+            query = parts[0] if parts else ""
+            for cmd, info in self.cmd_tree.items():
+                if cmd == query: continue 
+                if cmd.startswith(query):
+                    desc = info if isinstance(info, str) else "包含二级选项..."
+                    yield Completion(cmd, start_position=-len(query), display_meta=desc)
 
 
 def build_key_bindings() -> KeyBindings:
+    """构建 TUI 全局快捷键绑定：极简版（修复 key_name 报错与连续空格问题）"""
+    from prompt_toolkit.key_binding import KeyBindings
     kb = KeyBindings()
+
+    @kb.add("c-c")
+    def _(event):
+        """Ctrl+C 立即退出"""
+        event.app.exit()
 
     @kb.add("escape")
     def _(event):
+        """ESC 取消补全"""
         buf = event.app.current_buffer
         if buf.complete_state:
             buf.cancel_completion()
 
     @kb.add("enter")
     def _(event):
+        """回车：选中并提交"""
         buf = event.app.current_buffer
-        if buf.complete_state and buf.complete_state.current_completion is not None:
-            # 回车：选中当前下拉项后直接发送命令
+        if buf.complete_state and buf.complete_state.current_completion:
             buf.apply_completion(buf.complete_state.current_completion)
-            buf.validate_and_handle()
-            return
-        # 若已弹出补全但未显式选中，回车默认选择第一项并执行
-        if buf.complete_state and getattr(buf.complete_state, "completions", None):
-            first = buf.complete_state.completions[0]
-            if first is not None:
-                buf.apply_completion(first)
-                buf.validate_and_handle()
-                return
-        # 若没有弹层但输入是斜杠命令前缀，自动补全唯一命令并执行（如 /e -> /exit）
-        text = (buf.text or "").strip()
-        comp = getattr(buf, "completer", None)
-        cmd_list = getattr(comp, "commands", None)
-        if text.startswith("/") and isinstance(cmd_list, list):
-            matches = [c for c, _ in cmd_list if c.startswith(text)]
-            if len(matches) == 1:
-                buf.text = matches[0]
-                buf.cursor_position = len(matches[0])
-                buf.validate_and_handle()
-                return
         buf.validate_and_handle()
+
+    @kb.add(" ")
+    def _(event):
+        """空格：仅在有补全项时选中，否则仅输入普通空格"""
+        buf = event.app.current_buffer
+        # 核心修复：显式判断是否有“选中项”
+        if buf.complete_state and buf.complete_state.current_completion:
+            buf.apply_completion(buf.complete_state.current_completion)
+            if not buf.text.endswith(" "):
+                buf.insert_text(" ")
+        else:
+            # 正常打字输入空格，绝不触发额外逻辑
+            buf.insert_text(" ")
+    
+    return kb
 
     return kb
 
@@ -2373,12 +2386,13 @@ def chat(
         )
 
     agent = build_agent(config)
-    session = PromptSession(
-        "wikicoder> ",
-        completer=SlashCommandCompleter(),
-        complete_while_typing=True,
-        key_bindings=build_key_bindings(),
-    )
+    from src.tui_engine import run_tui
+    run_tui(config, agent, lambda: BuildAgent(config), SlashCommandCompleter(), build_key_bindings())
+    return
+
+    # --- [OLD] 经典模式 (已停用) ---
+    # 已迁移至 tui_engine.py
+
 
     show_trace = trace
     show_stream = stream

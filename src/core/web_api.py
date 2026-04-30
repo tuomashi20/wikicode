@@ -5,6 +5,7 @@ import traceback
 import threading
 import queue
 from typing import AsyncGenerator
+import uuid
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +18,9 @@ from src.main import build_agent, run_sync, build_llm, _save_memory_markdown
 from src.core.build_agent import BuildAgent, BuildStep
 
 app = FastAPI(title="WikiCoder API", version="0.1.0")
+
+# 全局阻塞确认存储
+PENDING_CONFIRMATIONS = {}
 
 # 配置 CORS，允许 Obsidian 跨域访问
 app.add_middleware(
@@ -80,13 +84,29 @@ async def chat(request: ChatRequest):
                     status_queue.put({"type": "status", "content": "Build 模式交互引擎已启动，正在分析任务..."})
 
                     def _on_step(step: BuildStep) -> bool:
-                        # 将步骤推送到队列，供 SSE 发送
-                        status_queue.put({
+                        is_dangerous = step.action_type in ["shell", "python", "edit_file"]
+                        confirm_id = str(uuid.uuid4()) if is_dangerous else ""
+                        
+                        event_data = {
                             "type": "step", 
                             "thought": step.thought,
+                            "action_type": step.action_type,
                             "action": f"{step.action_type}: {step.action_input}",
-                            "observation": step.observation
-                        })
+                            "observation": step.observation,
+                            "tasks": step.tasks,
+                            "require_confirm": is_dangerous,
+                            "confirm_id": confirm_id
+                        }
+                        status_queue.put(event_data)
+                        
+                        if is_dangerous:
+                            event = threading.Event()
+                            PENDING_CONFIRMATIONS[confirm_id] = {"event": event, "approved": False}
+                            event.wait() # 阻塞大模型线程，等待前端确认
+                            result = PENDING_CONFIRMATIONS.pop(confirm_id, {"approved": False})
+                            if not result["approved"]:
+                                return False # 如果被拒绝，则终止执行
+
                         return True
 
                     def _run_agent():
@@ -107,7 +127,7 @@ async def chat(request: ChatRequest):
                                 status_msg = f"**思考**: {item['thought']}\n\n**执行**: `{item['action']}`"
                                 if item.get("observation"):
                                     status_msg += f"\n\n**结果**:\n```\n{item['observation']}\n```"
-                                yield f"data: {json.dumps({'status': status_msg}, ensure_ascii=False)}\n\n"
+                                yield f"data: {json.dumps({'status': status_msg, 'tasks': item.get('tasks', []), 'action_type': item.get('action_type', ''), 'require_confirm': item.get('require_confirm', False), 'confirm_id': item.get('confirm_id', '')}, ensure_ascii=False)}\n\n"
                             elif item["type"] == "done":
                                 yield f"data: {json.dumps({'thought': '任务完成', 'output': item['output']}, ensure_ascii=False)}\n\n"
                                 break
@@ -161,6 +181,19 @@ async def sync_knowledge(mode: str = "incremental", path: str = None):
         return {"status": "success", "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+class ConfirmRequest(BaseModel):
+    confirm_id: str
+    approved: bool
+
+@app.post("/v1/confirm")
+async def confirm_action(request: ConfirmRequest):
+    """前端发送执行确认结果"""
+    if request.confirm_id in PENDING_CONFIRMATIONS:
+        PENDING_CONFIRMATIONS[request.confirm_id]["approved"] = request.approved
+        PENDING_CONFIRMATIONS[request.confirm_id]["event"].set()
+        return {"status": "success"}
+    return {"status": "error", "message": "Confirmation ID not found or expired."}
 
 class CmdRequest(BaseModel):
     command: str
@@ -244,8 +277,8 @@ async def exec_cmd(request: CmdRequest):
             return {"status": "success" if ok else "error", "output": msg}
 
         if cmd == "/mode":
-            if not args or args[0] not in {"auto", "wiki_only", "general_only"}:
-                return {"status": "error", "output": "### 🛠️ 模式选择范围\n- `/mode auto`: 智能检索 (默认)\n- `/mode wiki_only`: 严格仅使用本地知识库\n- `/mode general_only`: 跳过知识库，直接问 AI"}
+            if not args or args[0] not in {"auto", "wiki_only", "general_only", "build"}:
+                return {"status": "error", "output": "### 🛠️ 模式选择范围\n- `/mode auto`: 智能检索 (默认)\n- `/mode wiki_only`: 严格仅使用本地知识库\n- `/mode general_only`: 跳过知识库，直接问 AI\n- `/mode build`: 全自动构建模式"}
             # 注意：mode 需要修改全局配置或会话状态，这里示例修改配置
             return {"status": "success", "output": f"✅ 切换成功: 模式 = `{args[0]}`"}
 
@@ -316,6 +349,7 @@ async def exec_cmd(request: CmdRequest):
             return {"status": "success" if outs else "error", "output": "\n".join(msg_lines)}
 
         # 9. 帮助内容
+        if cmd == "/help":
             return {"status": "success", "output": (
                 "### 📖 Wikicodian 指令手册\n"
                 "| 指令 | 说明 | 必选参数 |\n"

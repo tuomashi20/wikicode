@@ -21,8 +21,12 @@ dependencies = [
   "fastapi",
   "uvicorn",
   "sse-starlette",
-  "pandas>=2.3.3",
+  "pandas[excel]>=2.3.3",
   "trafilatura>=2.0.0",
+  "pillow>=12.2.0",
+  "pdfplumber>=0.11.9",
+  "pyperclip>=1.11.0",
+  "python-dateutil>=2.9.0.post0",
 ]
 
 [project.scripts]

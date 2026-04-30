@@ -54,13 +54,21 @@ class BuildAgent:
             f"你是一个顶级的系统自动化与情报分析专家。\n{os_note}\n"
             "你可以通过以下动作完成任务：\n"
             "1. shell: 执行终端命令。\n"
-            "2. python: 执行 Python 脚本。处理文件、分析数据或【绕过反爬/模拟搜索】的首选方式。\n"
-            "3. edit_file: 精准编辑文件。input 格式: {\"path\": \"...\", \"old\": \"...\", \"new\": \"...\"}。\n"
-            "4. read_url: 获取网页内容。输入必须是确切的 URL。如果遭遇 403/SSL 错误，严禁重试相同 URL，必须切换策略。\n"
-            "5. finish: 任务完成。填写最终报告。\n\n"
-            "输出格式严格为 JSON：\n"
+            "执行准则与环境说明：\n"
+            "1. **文件查看**: 使用 `cat <文件>` 或 `Get-Content` (Windows) 查看文件内容，或编写 Python 脚本读取。\n"
+            "2. **执行 Python 脚本**: \n"
+            "    - 【绝对禁令】：严禁使用 `uv add`、`pip install` 或任何命令全局/本地安装依赖！这会极其浪费时间！\n"
+            "    - 【唯一正确方式】：如果你的脚本需要用到第三方库（如 pandas, openpyxl, requests 等），必须使用 `uv` 的动态挂载功能直接执行：\n"
+            "      例如：`uv run --with pandas --with openpyxl python your_script.py`\n"
+            "    - 当前已配置好底层环境，切勿在环境配置上浪费任何步骤。\n\n"
+            "3. python: 执行 Python 脚本。处理文件、分析数据或【绕过反爬/模拟搜索】的首选方式。\n"
+            "4. edit_file: 精准编辑文件。input 格式: {\"path\": \"...\", \"old\": \"...\", \"new\": \"...\"}。\n"
+            "5. read_url: 获取网页内容。输入必须是确切的 URL。如果遭遇 403/SSL 错误，严禁重试相同 URL，必须切换策略。\n"
+            "6. finish: 任务完成。填写最终报告。\n\n"
+            "输出格式严格为 JSON（注意区分已完成和未完成任务）：\n"
             "{\n"
-            '  "tasks": ["任务1", "任务2", ...], \n'
+            '  "completed_tasks": ["已完成的任务1", "已完成的任务2"], // 把已经完成的任务移到这里！\n'
+            '  "pending_tasks": ["尚未开始的任务3", "尚未开始的任务4"], // 还要继续做的任务留在这里！\n'
             '  "self_criticism": "【复盘与分析】：详细解释上一步为何失败（或成功）。如果是执行错误，分析其底层原因（如权限、环境缺失、网络波动）。", \n'
             '  "thought": "基于反思后的下一步具体计划。如果前一种方法失败，必须在此提出完全不同的替代路径。", \n'
             '  "action": "shell|python|edit_file|read_url|finish", \n'
@@ -94,7 +102,17 @@ class BuildAgent:
                 decision = self._parse_and_clean_decision(resp_text)
                 if not decision: return f"解析决策失败: {resp_text}"
                 
-                if "tasks" in decision and isinstance(decision["tasks"], list):
+                merged_tasks = []
+                if "completed_tasks" in decision and isinstance(decision["completed_tasks"], list):
+                    for ct in decision["completed_tasks"]:
+                        merged_tasks.append(f"[x] {ct}")
+                if "pending_tasks" in decision and isinstance(decision["pending_tasks"], list):
+                    for pt in decision["pending_tasks"]:
+                        merged_tasks.append(pt)
+                
+                if merged_tasks:
+                    self.tasks = merged_tasks
+                elif "tasks" in decision and isinstance(decision["tasks"], list):
                     self.tasks = decision["tasks"]
                 
                 step = BuildStep(
