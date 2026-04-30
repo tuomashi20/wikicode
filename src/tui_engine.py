@@ -374,6 +374,7 @@ class TUIApp:
                             import re
                             active_this_round = []
                             for t in step.tasks:
+                                t = str(t)
                                 is_done = False
                                 clean_t = t
                                 if t.lower().startswith("[x]") or t.startswith("✅"):
@@ -404,12 +405,12 @@ class TUIApp:
                             self.completed_tasks_text = set()
                             self._update_task_panel()
                             def run_build():
-                                clean_hist = [(q, a[:200] + "..." if len(a)>200 else a) for q, a in self.session_history]
+                                clean_hist = [(q, a[:1000] + "..." if len(a)>1000 else a) for q, a in self.session_history]
                                 return agent_build.run(processed_cmd, history=clean_hist, on_step=on_build_step)
                             final_out = await asyncio.get_event_loop().run_in_executor(None, run_build)
                             self.current_answer = final_out
                             self.append_text(f"\n\n[bold green]✅ 构建完成: {escape(final_out)}[/bold green]\n", is_rich=True)
-                            self.session_history.append((cmd, f"✅ [Build模式执行完成。具体执行流水日志未计入上下文]"))
+                            self.session_history.append((cmd, f"✅ 构建完成：{final_out}"))
                             from src.main import _save_session_state; _save_session_state(self.session_history, mode=self.session_mode)
                         else:
                             await asyncio.get_event_loop().run_in_executor(None, lambda: self.agent.run(processed_cmd, mode=self.session_mode, on_token=on_token))

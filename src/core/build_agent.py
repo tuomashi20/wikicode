@@ -102,29 +102,33 @@ class BuildAgent:
                 decision = self._parse_and_clean_decision(resp_text)
                 if not decision: return f"解析决策失败: {resp_text}"
                 
+                action_input = decision.get("input", "")
+                if isinstance(action_input, (dict, list)):
+                    action_input = json.dumps(action_input, ensure_ascii=False)
+                
                 merged_tasks = []
                 if "completed_tasks" in decision and isinstance(decision["completed_tasks"], list):
                     for ct in decision["completed_tasks"]:
-                        merged_tasks.append(f"[x] {ct}")
+                        merged_tasks.append(f"[x] {str(ct)}")
                 if "pending_tasks" in decision and isinstance(decision["pending_tasks"], list):
                     for pt in decision["pending_tasks"]:
-                        merged_tasks.append(pt)
+                        merged_tasks.append(str(pt))
                 
                 if merged_tasks:
                     self.tasks = merged_tasks
                 elif "tasks" in decision and isinstance(decision["tasks"], list):
-                    self.tasks = decision["tasks"]
+                    self.tasks = [str(t) for t in decision["tasks"]]
                 
                 step = BuildStep(
                     self_criticism=decision.get("self_criticism", ""),
                     thought=decision.get("thought", ""),
                     action_type=decision.get("action", "finish").lower(),
-                    action_input=decision.get("input", ""),
+                    action_input=action_input,
                     tasks=list(self.tasks)
                 )
                 
                 # --- 死循环硬检测 ---
-                action_hash = f"{step.action_type}:{step.action_input.strip()}"
+                action_hash = f"{step.action_type}:{str(step.action_input).strip()}"
                 repeat_count = 0
                 for h in reversed(self._action_history_hashes):
                     if h == action_hash:
