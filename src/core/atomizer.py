@@ -21,6 +21,7 @@ class Chunk:
     content: str
     parent_file: str
     raw_file_path: str
+    breadcrumb: str
 
 
 class Atomizer:
@@ -128,6 +129,7 @@ class Atomizer:
                 title=c.title,
                 parent_file=c.parent_file,
                 raw_file_path=c.raw_file_path,
+                breadcrumb=c.breadcrumb,
                 tags=tags,
                 content_path=content_path,
                 content_text=c.content,
@@ -192,14 +194,15 @@ class Atomizer:
                 title=title,
                 content=full_content,
                 parent_file=rel_raw_path,
-                raw_file_path=rel_raw_path
+                raw_file_path=rel_raw_path,
+                breadcrumb=breadcrumb
             )
 
         for line in lines:
             header_match = re.match(r"^(#+)\s+(.+)$", line)
             if header_match:
                 # 发现新标题，如果之前有内容，先封装成块
-                if current_body and any(current_headers):
+                if current_body:
                     chunks.append(_create_chunk(current_headers, current_body, chunk_idx))
                     chunk_idx += 1
                     current_body = []
@@ -226,7 +229,8 @@ class Atomizer:
                 title=default_title,
                 content=text.strip(),
                 parent_file=rel_raw_path,
-                raw_file_path=rel_raw_path
+                raw_file_path=rel_raw_path,
+                breadcrumb=default_title
             ))
             
         return chunks

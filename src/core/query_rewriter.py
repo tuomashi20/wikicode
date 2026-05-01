@@ -136,65 +136,76 @@ def load_synonyms(path: Path | str | None) -> dict[str, list[str]]:
 
 
 
+from functools import lru_cache
+
+@lru_cache(maxsize=128)
+def _get_llm_terms(llm: Any, query: str) -> list[str]:
+    """缓存 LLM 重写结果，减少重复开销"""
+    try:
+        prompt = (
+            f"你是一个知识库检索专家。请将以下用户口语转化为 3 个可能出现在专业 Wiki 文档中的核心关键词。\n"
+            f"用户问题：{query}\n"
+            f"要求：只返回关键词，用逗号隔开。"
+        )
+        llm_text = llm.generate(system_prompt="Query Rewriter", user_prompt=prompt)
+        if llm_text:
+            return [t.strip().lower() for t in re.split(r"[,，、\s]+", llm_text) if t.strip()]
+    except Exception:
+        pass
+    return []
+
 def rewrite_query(
     query: str, 
     synonyms: dict[str, list[str]] | None = None,
     core_keywords: list[str] | None = None,
     llm: Any | None = None,
-    priority: str = "append"
+    priority: str = "append",
+    skip_llm: bool = False
 ) -> QueryRewrite:
     """
-    [重写版] 混合动力查询重写：
-    1. 基础分词与静态同义词扩展。
-    2. (可选) LLM 语义意图重构。
+    [极致性能与精度平衡版] 混合动力查询重写：
+    1. 基础分词与精准同义词扩展。
+    2. (可选) LLM 语义意图重构（带缓存）。
     """
     keywords = _tokenize(query, core_keywords=core_keywords)
     expanded: list[str] = []
     seen: set[str] = set()
     syn_map = synonyms or _DEFAULT_SYNONYMS
 
-    # 基础层：智能同义词全组扩展
+    # 基础层：精准同义词扩展
     for kw in keywords:
         if kw not in seen:
             expanded.append(kw)
             seen.add(kw)
         
-        # 遍历所有同义词组，寻找命中的词组
+        # 优化点：只有长度大于 1 的词才进行同义词扩展，防止单字污染
+        if len(kw) < 2: continue
+
         for k, syns in syn_map.items():
-            # 定义组内所有成员：键 + 所有值
             group_members = [k] + syns
-            
-            # 只要关键字命中了组内任何一个成员（互为子串或完全匹配）
-            if any(m in kw or kw in m for m in group_members):
+            # 优化点：必须是包含关系且字符匹配度较高
+            if any(m == kw or (len(kw) >= 2 and (m in kw or kw in m)) for m in group_members):
+                added_in_group = 0
                 for m in group_members:
                     if m not in seen:
                         expanded.append(m)
                         seen.add(m)
+                        added_in_group += 1
+                        if added_in_group >= 3: break # 每组最多扩展 3 个，防止噪声
 
-    # 增强层：LLM 语义重写（如果传入了 LLM 客户端）
-    if llm is not None and len(query) >= 4:
-        try:
-            # 极速 Prompt：要求返回 3-5 个专业关键词
-            prompt = (
-                f"你是一个知识库检索专家。请将以下用户口语转化为 3 个可能出现在专业 Wiki 文档中的核心关键词。\n"
-                f"用户问题：{query}\n"
-                f"要求：只返回关键词，用逗号隔开。"
-            )
-            llm_text = llm.generate(system_prompt="Query Rewriter", user_prompt=prompt)
-            if llm_text:
-                llm_terms = [t.strip().lower() for t in re.split(r"[,，、\s]+", llm_text) if t.strip()]
-                for lt in llm_terms:
-                    if lt not in seen:
-                        if priority == "prepend":
-                            expanded.insert(0, lt)
-                        else:
-                            expanded.append(lt)
-                        seen.add(lt)
-        except Exception:
-            pass
+    # 增强层：只有在非跳过模式且静态结果较少时才调用 LLM
+    if llm is not None and len(query) >= 4 and not skip_llm:
+        if len(expanded) < 6: # 阈值微调
+            llm_terms = _get_llm_terms(llm, query)
+            for lt in llm_terms:
+                if lt not in seen:
+                    if priority == "prepend": expanded.insert(0, lt)
+                    else: expanded.append(lt)
+                    seen.add(lt)
 
-    expanded = expanded[:25] 
-    fts_query = " OR ".join([f'"{t}"' for t in expanded[:18]]) if expanded else ""
+    expanded = expanded[:20] # 进一步精简到 20 个词
+    # 构造 FTS 查询：原始词排在前，增加权重感
+    fts_query = " OR ".join([f'"{t}"' for t in expanded[:15]]) if expanded else ""
     suggest_terms = expanded[:10]
 
     return QueryRewrite(

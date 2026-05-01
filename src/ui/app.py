@@ -110,6 +110,11 @@ class WikiCoderApp(App):
     
     #history-panel {
         background: #0f0f0f;
+        overflow-x: hidden;
+    }
+    
+    #main-log {
+        overflow-x: hidden;
     }
     
     #sidebar {
@@ -233,7 +238,7 @@ class WikiCoderApp(App):
         "/exit": "退出 WikiCoder"
     }
 
-    COMMANDS = list(COMMAND_HELP.keys())
+    WIKI_COMMANDS = list(COMMAND_HELP.keys())
 
     COMMAND_METADATA = {
         "/mode": ["plan", "build"],
@@ -257,7 +262,7 @@ class WikiCoderApp(App):
         
         with Container(id="main-container"):
             with VerticalScroll(id="history-panel"):
-                yield RichLog(id="main-log", highlight=True, markup=True)
+                yield RichLog(id="main-log", highlight=True, markup=True, wrap=True)
             
             with Vertical(id="sidebar"):
                 yield Label("[bold cyan]Quick check-in[/bold cyan]", variant="title")
@@ -329,7 +334,7 @@ class WikiCoderApp(App):
             else:
                 popup.styles.display = "block"
                 self.menu_stage = 0
-                self.refresh_menu_items(self.COMMANDS, text.lower(), "Commands")
+                self.refresh_menu_items(self.WIKI_COMMANDS, text.lower(), "Commands")
             cmd_list = self.query_one("#cmd-list", ListView)
             if len(cmd_list.query(ListItem)) == 0: popup.styles.display = "none"
             elif cmd_list.index is None: cmd_list.index = 0
@@ -392,11 +397,42 @@ class WikiCoderApp(App):
 
     def route_command(self, cmd: str):
         parts = cmd.split(); root = parts[0].lower(); arg = cmd[len(root):].strip()
+        
+        # 1. 处理 UI 状态同步指令（立即执行）
         if root == "/mode":
-            if arg in ["plan", "build"]: self.session_mode = arg
+            if arg in ["plan", "build"]: 
+                self.session_mode = arg
+                from src.main import _save_session_state
+                _save_session_state(self.session_history, mode=self.session_mode)
+            else: self.log_area.write("[yellow]Usage: /mode plan|build[/yellow]")
+        elif root == "/reset":
+            self.log_area.clear(); self.agent = None; self.session_history = []
+            from src.main import _clear_session_state_file; _clear_session_state_file()
+            self.log_area.write("[cyan]System: Conversation reset.[/cyan]")
+        elif root == "/resume":
+            from src.main import _load_session_state
+            h, m = _load_session_state()
+            if h:
+                self.session_history = h; self.session_mode = m
+                self.log_area.write(f"[cyan]System: Resumed {len(h)} turns.[/cyan]")
+            else: self.log_area.write("[yellow]No session state found to resume.[/yellow]")
+        elif root == "/model":
+            if not arg: self.log_area.write("[yellow]Usage: /model <name>[/yellow]")
+            else:
+                from src.main import _set_model_config; ok, msg = _set_model_config(arg)
+                self.log_area.write(f"[{'green' if ok else 'red'}]{msg}[/]")
+                if ok: 
+                    self.config = __import__("src.utils.config", fromlist=["load_config"]).load_config()
+                    self.agent = None; self.update_status_bar()
+        elif root == "/version": self.log_area.write("[bold cyan]WikiCoder Pro TUI v3.2.0[/bold cyan]")
         elif root == "/exit": self.exit()
-        elif root == "/help": self.log_area.write("\n" + "\n".join([f"{k:12} - {v}" for k, v in self.COMMAND_HELP.items()]))
-        else: self.log_area.write(f"\n[magenta]Running:[/magenta] {cmd}"); self.is_processing = True; self.current_worker = self.run_background_cmd(root, arg)
+        elif root == "/help":
+             self.log_area.write("\n[bold cyan]Command Help:[/bold cyan]\n" + "\n".join([f" {k:12} - {v}" for k, v in self.COMMAND_HELP.items()]))
+        else:
+            # 2. 委托给后台调度器的耗时指令
+            self.log_area.write(f"\n[bold magenta]Running Command:[/bold magenta] {cmd}")
+            self.is_processing = True
+            self.current_worker = self.run_background_cmd(root, arg)
 
     @work(exclusive=True, thread=True)
     def run_background_cmd(self, root: str, arg: str = ""):

@@ -1,32 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from src.core.query_rewriter import QueryRewrite, load_synonyms, rewrite_query, load_business_terms
 from src.utils.config import PROJECT_ROOT
 from src.utils.db_manager import get_chunk_by_id, list_structure, search_chunks
-
-
-
-def _build_hit_reason(row: dict[str, Any], terms: list[str]) -> str:
-    title = str(row.get("title", "")).lower()
-    tags = str(row.get("tags", "")).lower()
-    content = str(row.get("content_text", "")).lower()
-    reasons: list[str] = []
-    for t in terms[:8]:
-        if t and t in title:
-            reasons.append(f"title:{t}")
-            continue
-        if t and t in tags:
-            reasons.append(f"tags:{t}")
-            continue
-        if t and t in content:
-            reasons.append(f"content:{t}")
-    if not reasons:
-        return "fallback"
-    return ", ".join(reasons[:3])
-
 
 
 def wiki_search_v2(
@@ -37,46 +17,85 @@ def wiki_search_v2(
     llm: Any | None = None,
     fanout_limit: int = 12,
     rewrite_priority: str = "append",
+    skip_llm: bool = False
 ) -> tuple[list[dict[str, Any]], QueryRewrite]:
-    syns = load_synonyms(synonyms_path)
-    cores = load_business_terms(business_terms_path)
-    # 接入配置化的语义重写逻辑
-    rw = rewrite_query(query, synonyms=syns, core_keywords=cores, llm=llm, priority=rewrite_priority)
+    """[标准数据版] 检索知识库，返回原始行数据，用于 UI 和测评"""
+    rw = rewrite_query(query, llm=llm, skip_llm=skip_llm)
     if not query.strip():
         return [], rw
 
-    fanout = [query.strip()]
-    for t in rw.expanded_terms[:fanout_limit]:  # 受配置管控的名额
-        if t not in fanout:
-            fanout.append(t)
-
-    scored: dict[str, dict[str, Any]] = {}
-    for i, q in enumerate(fanout):
-        rows = search_chunks(query=q, limit=max(limit, 8))
-        for rank, r in enumerate(rows):
-            d = dict(r)
-            cid = str(d["chunk_id"])
-            score = (100 - rank) + (12 if i == 0 else max(0, 8 - i))
-            prev = scored.get(cid)
-            if prev is None:
-                d["_score"] = score
-                d["_hit_reason"] = _build_hit_reason(d, rw.expanded_terms or rw.keywords)
-                scored[cid] = d
-            else:
-                prev["_score"] = max(float(prev.get("_score", 0)), score)
-
-    ordered = sorted(scored.values(), key=lambda x: float(x.get("_score", 0)), reverse=True)
-    return ordered[:limit], rw
+    rows = search_chunks(query=rw.fts_query, limit=limit)
+    results = []
+    for r in rows:
+        d = dict(r)
+        # 补全 breadcrumb 逻辑
+        if not d.get("breadcrumb"):
+            d["breadcrumb"] = f"{d.get('parent_file')} > {d.get('title')}"
+        results.append(d)
+    return results, rw
 
 
+def wiki_search(
+    query: str,
+    limit: int = 5,
+    llm: Any | None = None,
+    skip_llm: bool = False
+) -> str:
+    """[Agent 专用版] 返回带路径背书的格式化字符串"""
+    results, _ = wiki_search_v2(query, limit=limit, llm=llm, skip_llm=skip_llm)
+    if not results:
+        return f"Wiki: 未找到关于 '{query}' 的匹配。建议使用 wiki_list 查看相关目录。"
 
-def wiki_search(query: str, limit: int = 20) -> list[dict[str, Any]]:
-    rows, _ = wiki_search_v2(query=query, limit=limit)
-    return rows
+    output = []
+    for r in results:
+        path = r.get("breadcrumb")
+        content = r.get("content_text") or ""
+        output.append(f"### [路径背书]: {path}\n{content[:2000]}")
+    
+    return "\n\n---\n\n".join(output)
 
+
+def wiki_list(sub_dir: str = "") -> str:
+    """[Agent 专用版] 列出知识库目录结构"""
+    from src.utils.config import load_config
+    config = load_config()
+    base_path = Path(config.wiki_strategy.raw_path)
+    
+    target = base_path
+    if sub_dir:
+        target = base_path / sub_dir
+    
+    if not target.exists():
+        return f"Error: 路径 '{sub_dir}' 不存在。"
+    
+    files = []
+    for p in target.glob("**/*"):
+        if p.is_file() and p.suffix in [".md", ".txt", ".docx", ".pdf"]:
+            files.append(str(p.relative_to(base_path)))
+    
+    if not files:
+        return f"Wiki: 在 '{sub_dir}' 下未发现规范文件。"
+        
+    return "知识库文件列表:\n" + "\n".join([f"- {f}" for f in sorted(files)])
+
+
+def wiki_read(rel_path: str) -> str:
+    """[Agent 专用版] 通读规范文件"""
+    from src.utils.config import load_config
+    config = load_config()
+    p = Path(config.wiki_strategy.raw_path) / rel_path
+    if not p.exists():
+        return f"Error: 未找到文件 '{rel_path}'。"
+        
+    try:
+        content = p.read_text(encoding="utf-8", errors="ignore")
+        return f"--- 文件内容预览: {rel_path} ---\n{content[:10000]}"
+    except Exception as e:
+        return f"Error reading file: {str(e)}"
 
 
 def wiki_read_chunk(chunk_id: str) -> str:
+    """按 ID 读取知识片段内容 (向下兼容)"""
     row = get_chunk_by_id(chunk_id)
     if not row:
         return ""
@@ -85,18 +104,17 @@ def wiki_read_chunk(chunk_id: str) -> str:
     if not p.exists():
         return ""
     try:
-        # 优先尝试 UTF-8
-        return p.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        # 降级尝试 GBK (常见于 Windows 中文环境)
-        try:
-            return p.read_text(encoding="gbk")
-        except:
-            # 最后的保底措施
-            return p.read_text(encoding="utf-8", errors="ignore")
-
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
 
 
 def wiki_list_structure() -> list[dict[str, Any]]:
+    """供 UI 使用的结构化列表"""
     items = list_structure()
     return [{"parent_file": p, "chunk_count": c} for p, c in items]
+
+
+# --- 别名兼容 ---
+wiki_list_files = wiki_list
+wiki_read_file = wiki_read

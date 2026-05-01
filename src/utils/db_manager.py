@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS chunks (
   title TEXT NOT NULL,
   parent_file TEXT NOT NULL,
   raw_file_path TEXT NOT NULL,
+  breadcrumb TEXT DEFAULT '',
   tags TEXT DEFAULT '',
   content_path TEXT NOT NULL,
   content_text TEXT DEFAULT '',
@@ -34,6 +35,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   title,
   tags,
   parent_file,
+  breadcrumb,
   content_text,
   tokenize='unicode61'
 );
@@ -41,6 +43,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 
 
 _resolved_db_path: Path | None = None
+
 
 
 def configure_db_path(path: Path | str) -> None:
@@ -65,13 +68,15 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(chunks)").fetchall()}
     if "content_text" not in cols:
         conn.execute("ALTER TABLE chunks ADD COLUMN content_text TEXT DEFAULT ''")
+    if "breadcrumb" not in cols:
+        conn.execute("ALTER TABLE chunks ADD COLUMN breadcrumb TEXT DEFAULT ''")
 
     # backfill fts from chunks
     conn.execute("DELETE FROM chunks_fts")
     conn.execute(
         """
-        INSERT INTO chunks_fts (chunk_id, title, tags, parent_file, content_text)
-        SELECT chunk_id, title, tags, parent_file, content_text
+        INSERT INTO chunks_fts (chunk_id, title, tags, parent_file, breadcrumb, content_text)
+        SELECT chunk_id, title, tags, parent_file, breadcrumb, content_text
         FROM chunks
         """
     )
@@ -126,15 +131,16 @@ def _fts_upsert(
     title: str,
     tags: str,
     parent_file: str,
+    breadcrumb: str,
     content_text: str,
 ) -> None:
     conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk_id,))
     conn.execute(
         """
-        INSERT INTO chunks_fts (chunk_id, title, tags, parent_file, content_text)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO chunks_fts (chunk_id, title, tags, parent_file, breadcrumb, content_text)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (chunk_id, title, tags, parent_file, content_text),
+        (chunk_id, title, tags, parent_file, breadcrumb, content_text),
     )
 
 
@@ -144,6 +150,7 @@ def upsert_chunk(
     title: str,
     parent_file: str,
     raw_file_path: str,
+    breadcrumb: str,
     tags: str,
     content_path: str,
     content_text: str,
@@ -151,25 +158,27 @@ def upsert_chunk(
     db_path: Path | None = None,
 ) -> None:
     sql = """
-    INSERT INTO chunks (chunk_id, title, parent_file, raw_file_path, tags, content_path, content_text, last_modified)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO chunks (chunk_id, title, parent_file, raw_file_path, breadcrumb, tags, content_path, content_text, last_modified)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(chunk_id) DO UPDATE SET
       title=excluded.title,
       parent_file=excluded.parent_file,
       raw_file_path=excluded.raw_file_path,
+      breadcrumb=excluded.breadcrumb,
       tags=excluded.tags,
       content_path=excluded.content_path,
       content_text=excluded.content_text,
       last_modified=excluded.last_modified
     """
     with get_conn(db_path) as conn:
-        conn.execute(sql, (chunk_id, title, parent_file, raw_file_path, tags, content_path, content_text, last_modified))
+        conn.execute(sql, (chunk_id, title, parent_file, raw_file_path, breadcrumb, tags, content_path, content_text, last_modified))
         _fts_upsert(
             conn,
             chunk_id=chunk_id,
             title=title,
             tags=tags,
             parent_file=parent_file,
+            breadcrumb=breadcrumb,
             content_text=content_text,
         )
         conn.commit()
@@ -251,7 +260,7 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
             fts_query = " OR ".join([f'"{t.replace("\"", "")}"' for t in tokens[:12]])
             fts_rows = conn.execute(
                 """
-                SELECT c.chunk_id, c.title, c.parent_file, c.raw_file_path, c.tags, c.content_path, c.content_text, c.last_modified,
+                SELECT c.chunk_id, c.title, c.parent_file, c.raw_file_path, c.breadcrumb, c.tags, c.content_path, c.content_text, c.last_modified,
                        bm25(chunks_fts) AS rank
                 FROM chunks_fts
                 JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
@@ -265,7 +274,7 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                 # rank smaller is better
                 score = 1000.0 - float(i)
                 # 原始核心片段匹配（暴力加权 V3）
-                text_low = f"{r['title']} {r['content_text']} {r['parent_file']}".lower()
+                text_low = f"{r['title']} {r['content_text']} {r['parent_file']} {r['breadcrumb']}".lower()
                 has_core = False
                 for ph in core_phrases:
                     if ph.lower() in text_low:
@@ -275,31 +284,32 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                         score += 500.0 # 标题命中：额外再奖励
                 # 业务路径命中奖励
                 for ph in core_phrases:
-                    if ph.lower() in str(r['parent_file']).lower():
+                    if ph.lower() in str(r['parent_file']).lower() or ph.lower() in str(r['breadcrumb']).lower():
                         score += 400.0
                 scored_rows.append((r, score))
         except Exception:
             pass
 
-        # 2) LIKE retrieval over title/tags/parent/content_text
+        # 2) LIKE retrieval over title/tags/parent/breadcrumb/content_text
         like_sql = """
-        SELECT chunk_id, title, parent_file, raw_file_path, tags, content_path, content_text, last_modified
+        SELECT chunk_id, title, parent_file, raw_file_path, breadcrumb, tags, content_path, content_text, last_modified
         FROM chunks
-        WHERE title LIKE ? OR tags LIKE ? OR parent_file LIKE ? OR content_text LIKE ?
+        WHERE title LIKE ? OR tags LIKE ? OR parent_file LIKE ? OR breadcrumb LIKE ? OR content_text LIKE ?
         LIMIT ?
         """
         for idx, t in enumerate(tokens[:16]):
             like = f"%{t}%"
-            rows = conn.execute(like_sql, (like, like, like, like, max(limit * 2, 40))).fetchall()
+            rows = conn.execute(like_sql, (like, like, like, like, like, max(limit * 2, 40))).fetchall()
             for r in rows:
                 score = 200.0 - (idx * 2)
                 t_low = t.lower()
                 title_low = str(r["title"]).lower()
-                if title_low.find(t_low) >= 0:
+                breadcrumb_low = str(r["breadcrumb"]).lower()
+                if title_low.find(t_low) >= 0 or breadcrumb_low.find(t_low) >= 0:
                     score += 80 # 基础命中分
                 # 若命中的是用户原始的长语块，给予极致分
                 for ph in core_phrases:
-                    if ph.lower() in title_low:
+                    if ph.lower() in title_low or ph.lower() in breadcrumb_low:
                         score += 600
                     if ph.lower() in str(r['parent_file']).lower():
                         score += 300
@@ -312,7 +322,7 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
         # 3) Robust fallback: scan chunk markdown files directly.
         rows_all = conn.execute(
             """
-            SELECT chunk_id, title, parent_file, raw_file_path, tags, content_path, content_text, last_modified
+            SELECT chunk_id, title, parent_file, raw_file_path, breadcrumb, tags, content_path, content_text, last_modified
             FROM chunks
             """
         ).fetchall()
@@ -326,7 +336,7 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                 p = Path(cp) if Path(cp).is_absolute() else (PROJECT_ROOT / cp)
                 if p.exists():
                     content_text = p.read_text(encoding="utf-8", errors="ignore")
-            hay = f"{r['title']} {r['tags']} {r['parent_file']} {content_text}".lower()
+            hay = f"{r['title']} {r['tags']} {r['parent_file']} {r['breadcrumb']} {content_text}".lower()
             score = 0.0
             for t in tokens[:20]:
                 c = hay.count(t.lower())
@@ -351,7 +361,7 @@ def get_chunk_by_id(chunk_id: str, db_path: Path | None = None) -> sqlite3.Row |
     with get_conn(db_path) as conn:
         row = conn.execute(
             """
-            SELECT chunk_id, title, parent_file, raw_file_path, tags, content_path, content_text, last_modified
+            SELECT chunk_id, title, parent_file, raw_file_path, breadcrumb, tags, content_path, content_text, last_modified
             FROM chunks
             WHERE chunk_id = ?
             LIMIT 1
