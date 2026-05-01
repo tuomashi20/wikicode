@@ -69,7 +69,8 @@ async def chat(request: ChatRequest):
     """
     try:
         config = load_config()
-        agent = build_agent(config)
+        # 统一使用 BuildAgent 引擎，支持 Plan 和 Build 模式的任务流推送
+        agent_build = BuildAgent(config, cwd=request.cwd)
         history_tuples = format_history(request.history)
         
         import queue
@@ -77,81 +78,68 @@ async def chat(request: ChatRequest):
 
         async def event_generator():
             try:
-                if request.mode == "build":
-                    # Build 模式：运行交互式命令流 Agent
-                    agent_build = BuildAgent(config, cwd=request.cwd)
+                # 发送启动信号
+                status_queue.put({"type": "status", "content": f"WikiCoder {request.mode.upper()} 引擎已就绪..."})
+
+                def _on_step(step: BuildStep) -> bool:
+                    is_dangerous = step.action_type in ["shell", "python", "edit_file"]
+                    confirm_id = str(uuid.uuid4()) if is_dangerous else ""
                     
-                    # 立即发送启动信号
-                    status_queue.put({"type": "status", "content": "Build 模式交互引擎已启动，正在分析任务..."})
+                    event_data = {
+                        "type": "step", 
+                        "thought": step.thought,
+                        "action_type": step.action_type,
+                        "action": f"{step.action_type}: {step.action_input}",
+                        "observation": step.observation,
+                        "tasks": step.tasks,
+                        "require_confirm": is_dangerous,
+                        "confirm_id": confirm_id
+                    }
+                    status_queue.put(event_data)
+                    
+                    if is_dangerous:
+                        event = threading.Event()
+                        PENDING_CONFIRMATIONS[confirm_id] = {"event": event, "approved": False}
+                        event.wait() 
+                        result = PENDING_CONFIRMATIONS.pop(confirm_id, {"approved": False})
+                        if not result["approved"]: return False
 
-                    def _on_step(step: BuildStep) -> bool:
-                        is_dangerous = step.action_type in ["shell", "python", "edit_file"]
-                        confirm_id = str(uuid.uuid4()) if is_dangerous else ""
-                        
-                        event_data = {
-                            "type": "step", 
-                            "thought": step.thought,
-                            "action_type": step.action_type,
-                            "action": f"{step.action_type}: {step.action_input}",
-                            "observation": step.observation,
-                            "tasks": step.tasks,
-                            "require_confirm": is_dangerous,
-                            "confirm_id": confirm_id
-                        }
-                        status_queue.put(event_data)
-                        
-                        if is_dangerous:
-                            event = threading.Event()
-                            PENDING_CONFIRMATIONS[confirm_id] = {"event": event, "approved": False}
-                            event.wait() # 阻塞大模型线程，等待前端确认
-                            result = PENDING_CONFIRMATIONS.pop(confirm_id, {"approved": False})
-                            if not result["approved"]:
-                                return False # 如果被拒绝，则终止执行
+                    return True
 
-                        return True
+                def _run_agent():
+                    try:
+                        # 将模式参数透传给 run 方法
+                        output = agent_build.run(request.query, history_tuples, on_step=_on_step, mode=request.mode)
+                        status_queue.put({"type": "done", "output": output})
+                    except Exception as e:
+                        status_queue.put({"type": "error", "content": str(e)})
 
-                    def _run_agent():
-                        try:
-                            output = agent_build.run(request.query, history_tuples, on_step=_on_step)
-                            status_queue.put({"type": "done", "output": output})
-                        except Exception as e:
-                            status_queue.put({"type": "error", "content": str(e)})
+                threading.Thread(target=_run_agent, daemon=True).start()
 
-                    threading.Thread(target=_run_agent, daemon=True).start()
-
-                    while True:
-                        try:
-                            item = await anyio.to_thread.run_sync(lambda: status_queue.get(timeout=0.1))
-                            if item["type"] == "status":
-                                yield f"data: {json.dumps({'status': item['content']}, ensure_ascii=False)}\n\n"
-                            elif item["type"] == "step":
+                while True:
+                    try:
+                        item = await anyio.to_thread.run_sync(lambda: status_queue.get(timeout=0.1))
+                        if item["type"] == "status":
+                            yield f"data: {json.dumps({'status': item['content']}, ensure_ascii=False)}\n\n"
+                        elif item["type"] == "step":
+                            if request.mode == "plan":
+                                # Plan 模式视觉降噪：只显示思考和简单的动作提示，隐藏大段原文
+                                status_msg = f"🔍 **思考**: {item['thought']}\n\n⚙️ **正在执行**: `{item['action']}`"
+                            else:
+                                # Build 模式保持透明：显示完整过程和执行结果
                                 status_msg = f"**思考**: {item['thought']}\n\n**执行**: `{item['action']}`"
                                 if item.get("observation"):
                                     status_msg += f"\n\n**结果**:\n```\n{item['observation']}\n```"
-                                yield f"data: {json.dumps({'status': status_msg, 'tasks': item.get('tasks', []), 'action_type': item.get('action_type', ''), 'require_confirm': item.get('require_confirm', False), 'confirm_id': item.get('confirm_id', '')}, ensure_ascii=False)}\n\n"
-                            elif item["type"] == "done":
-                                yield f"data: {json.dumps({'thought': '任务完成', 'output': item['output']}, ensure_ascii=False)}\n\n"
-                                break
-                            elif item["type"] == "error":
-                                yield f"data: {json.dumps({'error': item['content']}, ensure_ascii=False)}\n\n"
-                                break
-                        except queue.Empty:
-                            await anyio.sleep(0.1)
-                else:
-                    # Plan 模式：正常的 Agent 问答
-                    response: AgentResponse = await anyio.to_thread.run_sync(
-                        agent.run, 
-                        request.query, 
-                        False, 
-                        request.mode, 
-                        "", 
-                        "answer", 
-                        "", 
-                        history_tuples
-                    )
-                    if response.thought:
-                        yield f"data: {json.dumps({'thought': response.thought, 'output': ''}, ensure_ascii=False)}\n\n"
-                    yield f"data: {json.dumps({'thought': '', 'output': response.output}, ensure_ascii=False)}\n\n"
+                            
+                            yield f"data: {json.dumps({'status': status_msg, 'tasks': item.get('tasks', []), 'action_type': item.get('action_type', ''), 'require_confirm': item.get('require_confirm', False), 'confirm_id': item.get('confirm_id', '')}, ensure_ascii=False)}\n\n"
+                        elif item["type"] == "done":
+                            yield f"data: {json.dumps({'thought': '任务完成', 'output': item['output']}, ensure_ascii=False)}\n\n"
+                            break
+                        elif item["type"] == "error":
+                            yield f"data: {json.dumps({'error': item['content']}, ensure_ascii=False)}\n\n"
+                            break
+                    except queue.Empty:
+                        await anyio.sleep(0.1)
                 
                 yield "data: [DONE]\n\n"
             except Exception as e:

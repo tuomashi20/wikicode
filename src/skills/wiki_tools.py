@@ -84,7 +84,16 @@ def wiki_read_chunk(chunk_id: str) -> str:
     p = Path(cp) if Path(cp).is_absolute() else (PROJECT_ROOT / cp)
     if not p.exists():
         return ""
-    return p.read_text(encoding="utf-8", errors="ignore")
+    try:
+        # 优先尝试 UTF-8
+        return p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # 降级尝试 GBK (常见于 Windows 中文环境)
+        try:
+            return p.read_text(encoding="gbk")
+        except:
+            # 最后的保底措施
+            return p.read_text(encoding="utf-8", errors="ignore")
 
 
 

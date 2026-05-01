@@ -20,7 +20,9 @@ from prompt_toolkit.filters import has_focus
 from prompt_toolkit.mouse_events import MouseEventType, MouseButton
 
 # 专用 Rich 渲染器与线程锁
-rich_console = Console(file=StringIO(), force_terminal=True, color_system="256", width=120)
+# 专用 Rich 渲染器与线程锁
+# 增加 legacy_windows 支持以更好地处理 Windows 终端编码，设置较大的宽度防止 Rich 强制换行
+rich_console = Console(file=StringIO(), force_terminal=True, color_system="256", width=200, legacy_windows=True)
 ansi_lock = threading.Lock()
 
 def to_ansi(rich_text: str) -> str:
@@ -36,8 +38,10 @@ def system_copy(text: str):
         pyperclip.copy(text)
     except:
         try:
-            process = subprocess.Popen(['clip'], stdin=subprocess.PIPE, shell=True)
-            process.communicate(input=text.encode('gbk'))
+            # 兼容处理：使用 utf-8 写入并尝试 clip
+            import subprocess
+            p = subprocess.Popen(['clip'], stdin=subprocess.PIPE, shell=True)
+            p.communicate(input=text.encode('utf-16')) # Windows clip 更好地支持 utf-16
         except: pass
 
 class SimpleAnsiLexer(Lexer):
@@ -65,6 +69,7 @@ class TUIApp:
         self.is_first_token = True 
         self.current_build_tasks = []  # 保存构建模式下的任务清单
         self.completed_build_tasks = set()  # 保存已完成的任务名称或索引
+        self.modified_files = set()  # 保存已操作的文件路径
         self.full_history_text = to_ansi("[bold cyan]WikiCoder Professional TUI[/bold cyan]\n[dim]输入问题开始对话，或输入 /help 查看命令[/dim]\n")
         self.history_area = TextArea(read_only=True, scrollbar=True, lexer=SimpleAnsiLexer(), text=self.full_history_text)
 
@@ -94,30 +99,66 @@ class TUIApp:
             if cmd: asyncio.create_task(self.handle_input(cmd)); return False
             return True
 
-        self.input_field = TextArea(height=3, multiline=False, prompt=HTML('<b><style color="cyan">WikiCoder</style></b> <style color="gray">></style> '),
-                                    completer=cmd_completer, complete_while_typing=True, accept_handler=accept_handler)
+        self.input_field = TextArea(
+            height=3, 
+            multiline=True, 
+            wrap_lines=True,
+            prompt=HTML('<b><style color="cyan">WikiCoder</style></b> <style color="gray">></style> '),
+            completer=cmd_completer, 
+            complete_while_typing=True, 
+            accept_handler=accept_handler
+        )
+        
+        # 增加输入框专用的按键绑定：Enter 发送，Control-J 或 Alt+Enter 换行
+        input_kb = KeyBindings()
+        @input_kb.add("enter")
+        def _(event):
+            # 模拟提交
+            accept_handler(event.app.current_buffer)
+        @input_kb.add("c-j")
+        @input_kb.add("escape", "enter") # Alt+Enter 作为换行方案
+        def _(event):
+            event.app.current_buffer.insert_text("\n")
+        self.input_field.key_bindings = input_kb
+
         self.input_field.control.mouse_handler = make_copy_handler(self.input_field)
 
-        self.task_area = TextArea(read_only=True, scrollbar=True, lexer=SimpleAnsiLexer(), text=to_ansi("[cyan]>> 任务清单[/cyan]\n\n[dim](未处于 Build 模式或无任务)[/dim]"))
-        self.task_window_wrapper = Window(content=self.task_area.control, wrap_lines=True, width=40)
+        self.task_area = TextArea(read_only=True, scrollbar=True, lexer=SimpleAnsiLexer(), 
+                                  text=to_ansi("[cyan]>> 任务清单[/cyan]\n\n[dim](未处于 Build 模式或无任务)[/dim]"),
+                                  width=40)
 
         self.stats_control = FormattedTextControl(text=self._get_stats_text)
-        self.history_window_wrapper = Window(content=self.history_area.control, wrap_lines=True)
+        
+        # 建立更底层的窗口引用，绕过 TextArea 复杂的嵌套布局，提升渲染稳定性
+        self.history_window = Window(content=self.history_area.control, wrap_lines=True)
+        self.task_window = Window(content=self.task_area.control, wrap_lines=True, width=40, style="bg:#121212")
         
         main_split = VSplit([
-            self.history_window_wrapper, 
+            self.history_window, 
             Window(width=1, char="│", style="fg:ansigray"), 
-            self.task_window_wrapper
+            self.task_window
         ])
         
-        content_layout = HSplit([main_split, Window(height=1, char="─", style="fg:ansigray"), self.input_field, Window(content=self.stats_control, height=1, style="bg:ansigray fg:ansiblack")])
-        self.root_container = FloatContainer(content_layout, floats=[Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=16))])
+        content_layout = HSplit([
+            main_split, 
+            Window(height=1, char="─", style="fg:ansigray"), 
+            self.input_field, 
+            Window(content=self.stats_control, height=1, style="bg:ansigray fg:ansiblack")
+        ])
+        self.root_container = FloatContainer(
+            content_layout, 
+            floats=[Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=16))]
+        )
         self.kb = key_bindings
         @self.kb.add("escape")
         def _(event):
             buf = event.app.current_buffer
             if buf.complete_state: buf.cancel_completion(); return
-            if self.is_processing: self.stop_requested = True; self.append_text("\n[bold orange3]>> 终止输出...[/bold orange3]\n", is_rich=True)
+            if self.is_processing: 
+                self.stop_requested = True
+                if hasattr(self, 'current_running_agent'):
+                    setattr(self.current_running_agent, '_stop_requested', True)
+                self.append_text("\n[bold orange3]>> 终止输出...[/bold orange3]\n", is_rich=True)
         @self.kb.add("tab")
         def _(event): self.session_mode = "build" if self.session_mode == "plan" else "plan"; self.app.invalidate()
         @self.kb.add("c-w")
@@ -138,7 +179,11 @@ class TUIApp:
             model_name = getattr(self.config.llm, 'model', '未知模型')
         except:
             model_name = "未知模型"
-        return HTML(f'<style bg="{color}" fg="ansiwhite"><b> {mode_label} </b></style> <style fg="ansicyan">🤖 {model_name}</style> | [ESC:终止] | [右键:复制] | Tab:切换 | Ctrl+W:换窗')
+        cwd = os.getcwd()
+        if len(cwd) > 25: cwd = "..." + cwd[-22:]
+        cwd_safe = escape(cwd)
+        model_safe = escape(model_name)
+        return HTML(f'<style bg="{color}" fg="ansiwhite"><b> {mode_label} </b></style> <style fg="ansicyan">🤖 {model_safe}</style> | <style fg="gray">📂 {cwd_safe}</style> | [Enter:发送] | [Ctrl+J:换行] | [ESC:终止] | Tab:切换')
 
     def _update_task_panel(self):
         if self.session_mode != "build":
@@ -153,6 +198,13 @@ class TUIApp:
                     out += f"[dim gray][x] [strike]{safe_t}[/strike][/dim gray]\n"
                 else:
                     out += f"[bold green][ ] {safe_t}[/bold green]\n"
+            
+            if self.modified_files:
+                out += "\n[yellow]>> 已操作文件[/yellow]\n\n"
+                for f in sorted(self.modified_files):
+                    # 只显示文件名，悬停或完整路径暂不处理
+                    out += f"  - [dim gray]{escape(os.path.basename(f))}[/dim gray]\n"
+                    
             text = to_ansi(out)
             
         def _set():
@@ -365,7 +417,16 @@ class TUIApp:
                         if self.stop_requested: raise InterruptedError("Stopped")
                         msg = f"\n[bold magenta]► Thought:[/bold magenta] [magenta]{escape(step.thought)}[/magenta]\n"
                         msg += f"[bold cyan]► Action:[/bold cyan] [cyan]{escape(step.action_type)}[/cyan]"
-                        if step.action_input: msg += f"\n[dim]{escape(step.action_input[:500] + ('...' if len(step.action_input)>500 else ''))}[/dim]"
+                        if step.action_input: 
+                            msg += f"\n[dim]{escape(step.action_input[:500] + ('...' if len(step.action_input)>500 else ''))}[/dim]"
+                            # 提取操作的文件路径
+                            if step.action_type in ["edit_file", "write_file", "read_file", "patch_apply"]:
+                                try:
+                                    import json
+                                    data = json.loads(step.action_input)
+                                    path = data.get("path")
+                                    if path: self.modified_files.add(path)
+                                except: pass
                         self.append_text(msg + "\n", is_rich=True)
                         if step.action_type == "finish":
                             for t in self.all_seen_tasks:
@@ -401,6 +462,7 @@ class TUIApp:
                     try:
                         if self.session_mode == "build" and not save_after_done:
                             agent_build = self.build_agent_factory()
+                            self.current_running_agent = agent_build # 挂载实例以便 ESC 终止
                             self.all_seen_tasks = []
                             self.completed_tasks_text = set()
                             self._update_task_panel()
@@ -413,7 +475,9 @@ class TUIApp:
                             self.session_history.append((cmd, f"✅ 构建完成：{final_out}"))
                             from src.main import _save_session_state; _save_session_state(self.session_history, mode=self.session_mode)
                         else:
-                            await asyncio.get_event_loop().run_in_executor(None, lambda: self.agent.run(processed_cmd, mode=self.session_mode, on_token=on_token))
+                            agent_plan = self.agent
+                            self.current_running_agent = agent_plan
+                            await asyncio.get_event_loop().run_in_executor(None, lambda: agent_plan.run(processed_cmd, mode=self.session_mode, on_token=on_token))
                             if save_after_done and not self.stop_requested:
                                 vp = getattr(self.config.wiki_strategy, "vault_path", os.getcwd()); target_path = os.path.join(vp, "raw", "faq", f"{save_title}.md")
                                 os.makedirs(os.path.dirname(target_path), exist_ok=True); 

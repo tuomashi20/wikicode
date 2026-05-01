@@ -51,8 +51,8 @@ fi
 if ! cat <<EOF > "$LAUNCHER"
 #!/bin/bash
 # WikiCoder 启动器 (uv run 规范版)
-cd "$PROJECT_DIR"
-uv run python src/main.py "\$@"
+# 使用 --project 保持当前工作目录并正确加载环境
+uv --project "$PROJECT_DIR" run python "$PROJECT_DIR/src/main.py" "\$@"
 EOF
 then
     echo "❌ [WikiCoder] 错误：无法在 $LAUNCHER 创建启动文件，请检查目录权限或手动创建。"

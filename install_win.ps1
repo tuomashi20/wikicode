@@ -47,8 +47,8 @@ if (!(Test-Path $LauncherDir)) {
 }
 
 $ProjectDir = $PSScriptRoot
-# Use absolute paths for both pushd and python execution to prevent path loss
-$BatContent = "@echo off`r`npushd ""$ProjectDir""`r`nuv run python ""$ProjectDir\src\main.py"" %*`r`npopd"
+# Use uv --project to keep current working directory while using project environment
+$BatContent = "@echo off`r`nuv --project ""$ProjectDir"" run python ""$ProjectDir\src\main.py"" %*"
 
 Set-Content -Path "$LauncherDir\wikicoder.bat" -Value $BatContent -Encoding Ascii
 

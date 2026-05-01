@@ -153,17 +153,23 @@ def rewrite_query(
     seen: set[str] = set()
     syn_map = synonyms or _DEFAULT_SYNONYMS
 
-    # 基础层：静态同义词
+    # 基础层：智能同义词全组扩展
     for kw in keywords:
         if kw not in seen:
             expanded.append(kw)
             seen.add(kw)
+        
+        # 遍历所有同义词组，寻找命中的词组
         for k, syns in syn_map.items():
-            if k in kw or kw in k:
-                for s in syns:
-                    if s not in seen:
-                        expanded.append(s)
-                        seen.add(s)
+            # 定义组内所有成员：键 + 所有值
+            group_members = [k] + syns
+            
+            # 只要关键字命中了组内任何一个成员（互为子串或完全匹配）
+            if any(m in kw or kw in m for m in group_members):
+                for m in group_members:
+                    if m not in seen:
+                        expanded.append(m)
+                        seen.add(m)
 
     # 增强层：LLM 语义重写（如果传入了 LLM 客户端）
     if llm is not None and len(query) >= 4:

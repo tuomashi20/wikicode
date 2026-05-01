@@ -1,0 +1,60 @@
+
+[TIME]: 2026-05-01 16:31:54
+[CMD]: npx create-next-app@latest . --yes --typescript --tailwind --eslint --app --src-dir --import-alias '@/*'
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand bgBwAHgAIABjAHIAZQBhAHQAZQAtAG4AZQB4AHQALQBhAHAAcABAAGwAYQB0AGUAcwB0ACAALgAgAC0ALQB5AGUAcwAgAC0ALQB0AHkAcABlAHMAYwByAGkAcAB0ACAALQAtAHQAYQBpAGwAdwBpAG4AZAAgAC0ALQBlAHMAbABpAG4AdAAgAC0ALQBhAHAAcAAgAC0ALQBzAHIAYwAtAGQAaQByACAALQAtAGkAbQBwAG8AcgB0AC0AYQBsAGkAYQBzACAAJwBAAC8AKgAnAA==
+
+[TIME]: 2026-05-01 17:29:12
+[CMD]: mkdir src/app/api ; mkdir public/images ; mkdir supabase ; mkdir src/app/components ; mkdir public/images ; mkdir supabase ; mkdir src/app/lib ; mkdir public/images ; mkdir supabase ; mkdir src/app/styles ; mkdir public/images ; mkdir supabase ; mkdir src/app/types ; mkdir public/images ; mkdir supabase ; mkdir src/app/utils ; mkdir public/images ; mkdir supabase
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand bQBrAGQAaQByACAAcwByAGMALwBhAHAAcAAvAGEAcABpACAAOwAgAG0AawBkAGkAcgAgAHAAdQBiAGwAaQBjAC8AaQBtAGEAZwBlAHMAIAA7ACAAbQBrAGQAaQByACAAcwB1AHAAYQBiAGEAcwBlACAAOwAgAG0AawBkAGkAcgAgAHMAcgBjAC8AYQBwAHAALwBjAG8AbQBwAG8AbgBlAG4AdABzACAAOwAgAG0AawBkAGkAcgAgAHAAdQBiAGwAaQBjAC8AaQBtAGEAZwBlAHMAIAA7ACAAbQBrAGQAaQByACAAcwB1AHAAYQBiAGEAcwBlACAAOwAgAG0AawBkAGkAcgAgAHMAcgBjAC8AYQBwAHAALwBsAGkAYgAgADsAIABtAGsAZABpAHIAIABwAHUAYgBsAGkAYwAvAGkAbQBhAGcAZQBzACAAOwAgAG0AawBkAGkAcgAgAHMAdQBwAGEAYgBhAHMAZQAgADsAIABtAGsAZABpAHIAIABzAHIAYwAvAGEAcABwAC8AcwB0AHkAbABlAHMAIAA7ACAAbQBrAGQAaQByACAAcAB1AGIAbABpAGMALwBpAG0AYQBnAGUAcwAgADsAIABtAGsAZABpAHIAIABzAHUAcABhAGIAYQBzAGUAIAA7ACAAbQBrAGQAaQByACAAcwByAGMALwBhAHAAcAAvAHQAeQBwAGUAcwAgADsAIABtAGsAZABpAHIAIABwAHUAYgBsAGkAYwAvAGkAbQBhAGcAZQBzACAAOwAgAG0AawBkAGkAcgAgAHMAdQBwAGEAYgBhAHMAZQAgADsAIABtAGsAZABpAHIAIABzAHIAYwAvAGEAcABwAC8AdQB0AGkAbABzACAAOwAgAG0AawBkAGkAcgAgAHAAdQBiAGwAaQBjAC8AaQBtAGEAZwBlAHMAIAA7ACAAbQBrAGQAaQByACAAcwB1AHAAYQBiAGEAcwBlAA==
+
+[TIME]: 2026-05-01 17:29:58
+[CMD]: npm install
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand bgBwAG0AIABpAG4AcwB0AGEAbABsAA==
+
+[TIME]: 2026-05-01 17:30:20
+[CMD]: dir
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ZABpAHIA
+
+[TIME]: 2026-05-01 17:30:30
+[CMD]: npm install --verbose
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand bgBwAG0AIABpAG4AcwB0AGEAbABsACAALQAtAHYAZQByAGIAbwBzAGUA
+
+[TIME]: 2026-05-01 17:30:41
+[CMD]: yarn install
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand eQBhAHIAbgAgAGkAbgBzAHQAYQBsAGwA
+
+[TIME]: 2026-05-01 17:30:52
+[CMD]: uv pip install --system next react react-dom tailwindcss supabase lucide-react clsx tailwind-merge
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand dQB2ACAAcABpAHAAIABpAG4AcwB0AGEAbABsACAALQAtAHMAeQBzAHQAZQBtACAAbgBlAHgAdAAgAHIAZQBhAGMAdAAgAHIAZQBhAGMAdAAtAGQAbwBtACAAdABhAGkAbAB3AGkAbgBkAGMAcwBzACAAcwB1AHAAYQBiAGEAcwBlACAAbAB1AGMAaQBkAGUALQByAGUAYQBjAHQAIABjAGwAcwB4ACAAdABhAGkAbAB3AGkAbgBkAC0AbQBlAHIAZwBlAA==
+
+[TIME]: 2026-05-01 17:31:04
+[CMD]: pwd
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand cAB3AGQA
+
+[TIME]: 2026-05-01 17:31:16
+[CMD]: npx create-next-app@latest . --use-npm --typescript --tailwind --eslint --app --src-dir --import-alias '@/*'
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand bgBwAHgAIABjAHIAZQBhAHQAZQAtAG4AZQB4AHQALQBhAHAAcABAAGwAYQB0AGUAcwB0ACAALgAgAC0ALQB1AHMAZQAtAG4AcABtACAALQAtAHQAeQBwAGUAcwBjAHIAaQBwAHQAIAAtAC0AdABhAGkAbAB3AGkAbgBkACAALQAtAGUAcwBsAGkAbgB0ACAALQAtAGEAcABwACAALQAtAHMAcgBjAC0AZABpAHIAIAAtAC0AaQBtAHAAbwByAHQALQBhAGwAaQBhAHMAIAAnAEAALwAqACcA
+
+[TIME]: 2026-05-01 17:31:43
+[CMD]: Remove-Item -Recurse -Force package.json public src supabase ; npx create-next-app@latest . --use-npm --typescript --tailwind --eslint --app --src-dir --import-alias '@/*'
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABwAGEAYwBrAGEAZwBlAC4AagBzAG8AbgAgAHAAdQBiAGwAaQBjACAAcwByAGMAIABzAHUAcABhAGIAYQBzAGUAIAA7ACAAbgBwAHgAIABjAHIAZQBhAHQAZQAtAG4AZQB4AHQALQBhAHAAcABAAGwAYQB0AGUAcwB0ACAALgAgAC0ALQB1AHMAZQAtAG4AcABtACAALQAtAHQAeQBwAGUAcwBjAHIAaQBwAHQAIAAtAC0AdABhAGkAbAB3AGkAbgBkACAALQAtAGUAcwBsAGkAbgB0ACAALQAtAGEAcABwACAALQAtAHMAcgBjAC0AZABpAHIAIAAtAC0AaQBtAHAAbwByAHQALQBhAGwAaQBhAHMAIAAnAEAALwAqACcA
+
+[TIME]: 2026-05-01 17:32:12
+[CMD]: rmdir /s /q * 2>nul ; del /q *.* 2>nul ; echo "清理完成或无文件可删除"
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand cgBtAGQAaQByACAALwBzACAALwBxACAAKgAgADIAPgBuAHUAbAAgADsAIABkAGUAbAAgAC8AcQAgACoALgAqACAAMgA+AG4AdQBsACAAOwAgAGUAYwBoAG8AIAAiAAVuBnSMWxBiFmLgZYdl9k7vUyBSZJYiAA==
+
+[TIME]: 2026-05-01 17:32:25
+[CMD]: rmdir /s /q * 2>nul ; del /q *.* 2>nul ; echo "清理完成或无文件可删除"
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand cgBtAGQAaQByACAALwBzACAALwBxACAAKgAgADIAPgBuAHUAbAAgADsAIABkAGUAbAAgAC8AcQAgACoALgAqACAAMgA+AG4AdQBsACAAOwAgAGUAYwBoAG8AIAAiAAVuBnSMWxBiFmLgZYdl9k7vUyBSZJYiAA==
+
+[TIME]: 2026-05-01 17:34:16
+[CMD]: rmdir /s /q * 2>nul ; del /q *.* 2>nul ; echo "清理完成或无文件可删除"
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand cgBtAGQAaQByACAALwBzACAALwBxACAAKgAgADIAPgBuAHUAbAAgADsAIABkAGUAbAAgAC8AcQAgACoALgAqACAAMgA+AG4AdQBsACAAOwAgAGUAYwBoAG8AIAAiAAVuBnSMWxBiFmLgZYdl9k7vUyBSZJYiAA==
+
+[TIME]: 2026-05-01 17:34:31
+[CMD]: npx create-next-app@latest . --use-npm --typescript --tailwind --eslint --app --src-dir --import-alias '@/*'
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand bgBwAHgAIABjAHIAZQBhAHQAZQAtAG4AZQB4AHQALQBhAHAAcABAAGwAYQB0AGUAcwB0ACAALgAgAC0ALQB1AHMAZQAtAG4AcABtACAALQAtAHQAeQBwAGUAcwBjAHIAaQBwAHQAIAAtAC0AdABhAGkAbAB3AGkAbgBkACAALQAtAGUAcwBsAGkAbgB0ACAALQAtAGEAcABwACAALQAtAHMAcgBjAC0AZABpAHIAIAAtAC0AaQBtAHAAbwByAHQALQBhAGwAaQBhAHMAIAAnAEAALwAqACcA
+
+[TIME]: 2026-05-01 17:34:48
+[CMD]: del /q *.* 2>nul ; rmdir /s /q * 2>nul ; echo "清理完成或无文件可删除"
+[FINAL]: powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ZABlAGwAIAAvAHEAIAAqAC4AKgAgADIAPgBuAHUAbAAgADsAIAByAG0AZABpAHIAIAAvAHMAIAAvAHEAIAAqACAAMgA+AG4AdQBsACAAOwAgAGUAYwBoAG8AIAAiAAVuBnSMWxBiFmLgZYdl9k7vUyBSZJYiAA==

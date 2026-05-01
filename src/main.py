@@ -2385,9 +2385,10 @@ def chat(
             f"chunks={result['chunks']} wiki_pages={wp}"
         )
 
-    agent = build_agent(config)
-    from src.tui_engine import run_tui
-    run_tui(config, agent, lambda: BuildAgent(config), SlashCommandCompleter(), build_key_bindings())
+    agent_factory = lambda cfg: BuildAgent(cfg)
+    from src.ui.app import WikiCoderApp
+    app = WikiCoderApp(config, agent_factory)
+    app.run()
     return
 
     # --- [OLD] 经典模式 (已停用) ---

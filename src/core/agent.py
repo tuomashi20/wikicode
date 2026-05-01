@@ -31,6 +31,7 @@ class WikiFirstAgent:
         self.logger = get_file_logger("session", "session.log")
         self.llm = LLMClient(config.llm)
         self.core_keywords = load_business_terms(config.wiki_strategy.business_terms_path)
+        self._stop_requested = False
 
     def run(
         self,
@@ -342,6 +343,8 @@ class WikiFirstAgent:
                 on_status("llm_generate: wiki-grounded started")
             parts: list[str] = []
             for tok in self.llm.generate_stream(system_prompt=system_prompt, user_prompt=user_prompt):
+                if getattr(self, '_stop_requested', False):
+                    raise InterruptedError("Stopped by user")
                 if not tok:
                     continue
                 parts.append(tok)
