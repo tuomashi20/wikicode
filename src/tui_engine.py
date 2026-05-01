@@ -435,5 +435,12 @@ class TUIApp:
         await self.app.run_async()
 
 def run_tui(config, agent, build_agent_factory, cmd_completer, key_bindings):
-    app = TUIApp(config, agent, build_agent_factory, cmd_completer, key_bindings)
-    asyncio.run(app.run())
+    try:
+        app = TUIApp(config, agent, build_agent_factory, cmd_completer, key_bindings)
+        asyncio.run(app.run())
+    except KeyboardInterrupt:
+        # 捕获 Ctrl+C，实现静默退出
+        print("\n[WikiCoder] 已安全退出。")
+    except Exception as e:
+        # 捕获其他非预期的启动错误
+        print(f"\n[WikiCoder] 意外退出: {e}")
