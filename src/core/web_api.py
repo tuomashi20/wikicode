@@ -44,6 +44,7 @@ class ChatRequest(BaseModel):
     query: str
     mode: str = "auto" # auto, wiki_only, general_only, build
     history: list[dict[str, str]] = []
+    cwd: str = None
 
 def format_history(history: list[dict[str, str]]) -> list[tuple[str, str]]:
     return [(h["q"], h["a"]) for h in history]
@@ -78,7 +79,7 @@ async def chat(request: ChatRequest):
             try:
                 if request.mode == "build":
                     # Build 模式：运行交互式命令流 Agent
-                    agent_build = BuildAgent(config)
+                    agent_build = BuildAgent(config, cwd=request.cwd)
                     
                     # 立即发送启动信号
                     status_queue.put({"type": "status", "content": "Build 模式交互引擎已启动，正在分析任务..."})

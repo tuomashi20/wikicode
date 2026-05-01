@@ -25,8 +25,9 @@ class BuildStep:
 class BuildAgent:
     """交互式增量执行 Agent (V2.2: 环境感知增强版)"""
     
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, cwd: str = None):
         self.config = config
+        self.cwd = cwd or os.getcwd()
         self.llm = LLMClient(config.llm)
         self.steps: list[BuildStep] = []
         self.tasks: list[str] = []
@@ -43,9 +44,9 @@ class BuildAgent:
         
         current_os = platform.system()
         wiki_path = str(self.config.wiki_strategy.raw_path)
-        project_root = os.getcwd()
+        project_root = self.cwd
         
-        os_note = f"【环境】{current_os}。项目根目录: {project_root}\n"
+        os_note = f"【环境】{current_os}。当前工作目录: {project_root}\n"
         os_note += f"【重要】本地 Wiki 存放路径为: {wiki_path}\n"
         if current_os == "Windows":
             os_note += "【提醒】Windows 下请使用 dir, type 等命令，或直接在 Python 中操作路径。PowerShell 语法已自动支持。"
@@ -213,7 +214,7 @@ class BuildAgent:
                             final_cmd = f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{encoded_cmd}"'
                     final_cmd = f"chcp 65001 > nul && {final_cmd}"
                 
-                res = subprocess.run(final_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env, **run_kwargs)
+                res = subprocess.run(final_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=env, cwd=self.cwd, **run_kwargs)
                 return f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}\nExitCode: {res.returncode}"
             except Exception as e: return str(e)
         
@@ -232,7 +233,8 @@ class BuildAgent:
                     encoding="utf-8",
                     errors="replace",
                     timeout=60,
-                    env=env
+                    env=env,
+                    cwd=self.cwd
                 )
                 return f"Output:\n{result.stdout}\n{result.stderr}"
             except subprocess.TimeoutExpired:
