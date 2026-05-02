@@ -37,7 +37,7 @@ class BuildStep:
 class BuildAgent:
     """双模式 AI 编码助手（Plan / Build）"""
 
-    MAX_STEPS_BUILD = 30
+    MAX_STEPS_BUILD = 100
 
     def __init__(self, config: AppConfig, cwd: str = None, depth: int = 0):
         self.config = config
