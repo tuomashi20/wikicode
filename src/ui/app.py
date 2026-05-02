@@ -463,25 +463,81 @@ class WikiCoderApp(App):
     @work(exclusive=True, thread=True)
     def run_agent_task(self, query: str) -> None:
         try:
-            if not self.agent: self.agent = self.agent_factory(self.config)
-            def on_step(step): self.post_message(AgentStepMessage(step)); return True
-            rep = self.agent.run(query, history=self.session_history, on_step=on_step, mode=self.session_mode)
-            self.session_history.append((query, rep)); self.post_message(AgentLogMessage(f"\n[green]Report:[/green]\n{rep}"))
-        except Exception as e: self.post_message(AgentLogMessage(f"[red]Error: {e}[/red]"))
-        finally: self.is_processing = False
+            if not self.agent:
+                self.agent = self.agent_factory(self.config)
+
+            def on_step(step):
+                self.post_message(AgentStepMessage(step))
+                return True
+
+            def on_log(msg):
+                self.post_message(AgentLogMessage(msg, style="dim"))
+
+            rep = self.agent.run(
+                query,
+                history=self.session_history,
+                on_step=on_step,
+                on_log=on_log,
+                mode=self.session_mode
+            )
+            self.session_history.append((query, rep))
+            self.post_message(AgentLogMessage(f"\n[green]Report:[/green]\n{rep}"))
+        except Exception as e:
+            self.post_message(AgentLogMessage(f"[red]Error: {e}[/red]"))
+        finally:
+            self.is_processing = False
 
     @on(AgentStepMessage)
     def handle_agent_step(self, message: AgentStepMessage) -> None:
         s = message.step
-        self.log_area.write(f"\n[magenta]Thought:[/magenta] {s.thought}\n[cyan]Action:[/cyan] {s.action_type}")
+        # 思考过程
+        self.log_area.write(f"\n[magenta]Thought:[/magenta] {s.thought}")
+        # 自我反思
+        if s.self_criticism:
+            self.log_area.write(f"[dim cyan]Reflection: {s.self_criticism}[/dim cyan]")
+        # 动作
+        action_color = {
+            "bash": "yellow", "write": "green", "edit": "orange3",
+            "view": "blue", "grep": "cyan", "fetch": "deep_sky_blue1",
+            "finish": "bold green"
+        }.get(s.action_type, "white")
+        self.log_area.write(f"[{action_color}]Action: {s.action_type}[/{action_color}]")
+        # 观察结果（截断显示）
+        if s.observation:
+            obs = s.observation[:500]
+            self.log_area.write(f"[dim]{obs}[/dim]")
+        # 跟踪修改的文件
+        if s.action_type in ("write", "edit"):
+            try:
+                params = __import__('json').loads(s.action_input)
+                fp = params.get('file_path', '')
+                if fp:
+                    self.modified_files.add(fp)
+                    self._refresh_file_list()
+            except Exception:
+                pass
+        # 任务面板
         if s.tasks:
             self.task_tree.clear()
-            for t in s.tasks: self.task_tree.root.add_leaf(t)
+            for t in s.tasks:
+                self.task_tree.root.add_leaf(t)
             self.task_tree.root.expand()
 
     @on(AgentLogMessage)
-    def handle_log_message(self, message: AgentLogMessage) -> None: self.log_area.write(message.text)
-    def action_clear_history(self) -> None: self.log_area.clear()
+    def handle_log_message(self, message: AgentLogMessage) -> None:
+        self.log_area.write(message.text)
+
+    def action_clear_history(self) -> None:
+        self.log_area.clear()
+
+    def _refresh_file_list(self) -> None:
+        """刷新侧边栏的修改文件列表"""
+        try:
+            self.file_list.clear()
+            for fp in sorted(self.modified_files):
+                self.file_list.append(ListItem(Label(f"📄 {fp}")))
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     from src.utils.config import load_config; from src.core.build_agent import BuildAgent
