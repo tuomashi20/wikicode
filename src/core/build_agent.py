@@ -154,7 +154,9 @@ class BuildAgent:
             "- 先理解项目结构（ls, glob），再定位代码（grep, view），最后修改（edit, write）\n"
             "- 每步都要有清晰的思考过程\n"
             "- 修改代码后请运行测试验证\n"
-            "- 遇到错误时分析原因并尝试修复\n\n"
+            "- 遇到错误时分析原因并尝试修复\n"
+            "- 【重要】bash 命令每次只执行一条，不要用 && 或 ; 连接多条命令。如果需要多步，请分多次 bash 调用\n"
+            "- 在 Windows 上使用 PowerShell 语法，不要用 bash 特有语法\n\n"
             "【输出格式 - 严格 JSON】：\n"
             "{\n"
             '  "completed_tasks": ["已完成"],\n'
@@ -313,7 +315,8 @@ class BuildAgent:
         try:
             current_os = platform.system()
             if current_os == "Windows":
-                # Windows: 使用 PowerShell
+                # 自动兼容：将 && 替换为 ; 以适配 PowerShell
+                cmd = cmd.replace(" && ", "; ")
                 result = subprocess.run(
                     ["powershell", "-NoProfile", "-Command", cmd],
                     capture_output=True, text=True, encoding="utf-8",
