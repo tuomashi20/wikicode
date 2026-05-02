@@ -543,36 +543,114 @@ class BuildAgent:
     # JSON 解析工具
     # ========================
     def _parse_json_robustly(self, text: str) -> Dict[str, Any] | None:
-        """增强型 JSON 解析器"""
+        """
+        增强型 JSON 解析器 - 多层容错策略
+        
+        LLM 生成 write 动作时经常在 content 字段中嵌入大段代码，
+        导致引号/换行破坏 JSON 格式。本方法通过多层策略依次尝试恢复。
+        """
+        if not text or not text.strip():
+            return None
+
+        # 策略1: 直接 JSON 解析（最快路径）
         try:
             start = text.find('{')
             end = text.rfind('}')
             if start == -1 or end == -1:
                 return None
-            json_str = text[start:end+1]
+            return json.loads(text[start:end+1])
+        except json.JSONDecodeError:
+            pass
 
-            # 修复字符串内部的物理换行
+        # 策略2: 修复物理换行后重试
+        try:
+            json_str = text[text.find('{'):text.rfind('}')+1]
             def _fix_newlines(m):
-                content = m.group(2).replace('\n', '\\n').replace('\r', '\\r')
+                content = m.group(2).replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                 return f'{m.group(1)}"{content}"{m.group(3)}'
-            json_str = re.sub(
-                r'(\":\s*)\"(.*?)\"(\s*[,}])',
+            fixed = re.sub(
+                r'(":\s*)"(.*?)"(\s*[,}])',
                 _fix_newlines, json_str, flags=re.DOTALL
             )
+            return json.loads(fixed)
+        except (json.JSONDecodeError, Exception):
+            pass
 
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            # 正则保底提取
-            res = {}
-            for key in ["action", "thought", "self_criticism"]:
-                m = re.search(fr'"{key}"\s*:\s*"([^"]+)"', text)
-                if m:
-                    res[key] = m.group(1)
-            inp_m = re.search(r'"input"\s*:\s*(\{.*?\}|"([^"]*)")', text, re.DOTALL)
-            if inp_m:
-                val = inp_m.group(1)
+        # 策略3: 正则逐字段提取（最强容错）
+        res = {}
+
+        # 提取简单字符串字段
+        for key in ["action", "thought", "self_criticism"]:
+            # 贪婪匹配到下一个 "key": 或 } 之前
+            m = re.search(fr'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+            if m:
+                res[key] = m.group(1).replace('\\n', '\n').replace('\\t', '\t')
+
+        # 提取 input 字段（最复杂，可能包含嵌套 JSON 或大段文本）
+        # 尝试1: input 是一个 JSON 对象
+        inp_obj_m = re.search(r'"input"\s*:\s*(\{)', text)
+        if inp_obj_m:
+            # 手动匹配大括号配对
+            brace_start = inp_obj_m.start(1)
+            depth = 0
+            in_str = False
+            escape = False
+            brace_end = -1
+            for ci in range(brace_start, len(text)):
+                c = text[ci]
+                if escape:
+                    escape = False
+                    continue
+                if c == '\\':
+                    escape = True
+                    continue
+                if c == '"' and not escape:
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        brace_end = ci
+                        break
+            if brace_end > 0:
+                raw_input = text[brace_start:brace_end+1]
                 try:
-                    res["input"] = json.loads(val) if val.startswith('{') else inp_m.group(2)
+                    res["input"] = json.dumps(json.loads(raw_input), ensure_ascii=False)
                 except json.JSONDecodeError:
-                    res["input"] = inp_m.group(2) or val
-            return res if "action" in res else None
+                    # 尝试修复内部换行
+                    fixed_input = raw_input.replace('\n', '\\n').replace('\r', '\\r')
+                    try:
+                        res["input"] = json.dumps(json.loads(fixed_input), ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        res["input"] = raw_input
+
+        # 尝试2: input 是纯字符串
+        if "input" not in res:
+            inp_str_m = re.search(r'"input"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+            if inp_str_m:
+                res["input"] = inp_str_m.group(1).replace('\\n', '\n').replace('\\t', '\t')
+
+        # 尝试3: input 到文本末尾（最后手段）
+        if "input" not in res and "action" in res:
+            inp_last_m = re.search(r'"input"\s*:\s*"(.*)', text, re.DOTALL)
+            if inp_last_m:
+                raw = inp_last_m.group(1)
+                # 去掉尾部的 "} 和多余内容
+                raw = re.sub(r'"\s*\}\s*$', '', raw)
+                res["input"] = raw.replace('\\n', '\n')
+
+        # 提取任务列表
+        tasks_m = re.search(r'"pending_tasks"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+        if tasks_m:
+            try:
+                res["pending_tasks"] = json.loads(f"[{tasks_m.group(1)}]")
+            except json.JSONDecodeError:
+                # 简单提取引号内的字符串
+                res["pending_tasks"] = re.findall(r'"([^"]+)"', tasks_m.group(1))
+
+        return res if "action" in res else None
+
