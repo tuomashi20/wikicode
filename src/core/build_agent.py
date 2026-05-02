@@ -216,6 +216,11 @@ class BuildAgent:
                     self_criticism=decision.get("self_criticism", "")
                 )
 
+                # 归一化 Hash（忽略空白和路径斜杠差异）
+                normalized_input = re.sub(r'[\s/\\\\]+', ' ', action_input).strip()
+                action_hash = f"{action_type}:{normalized_input}"
+                repeat_count = self._action_history_hashes.count(action_hash)
+
                 if action_type == "finish":
                     step.observation = "任务完成"
                     self.steps.append(step)
@@ -224,19 +229,21 @@ class BuildAgent:
                     return action_input
 
                 # 智能死循环拦截
-                action_hash = f"{action_type}:{action_input}".strip()
-                repeat_count = self._action_history_hashes.count(action_hash)
-                
                 if repeat_count == 1:
-                    # 第一次重复：尝试唤醒 Agent
-                    step.observation = f"[系统警告] 检测到动作重复执行：{action_type}。你刚才已经做过完全一样的操作了，请检查是否参数有误、路径不对或文件状态不符。禁止再次重复，请尝试更换策略（如先 ls 确认目录或用 write 覆盖）。"
+                    # 第一次重复：强制干预，喂给它真实的文件列表
+                    real_context = self._execute("ls", ".")
+                    step.observation = (
+                        f"[系统强力警告] 检测到动作完全重复：{action_type}。\n"
+                        f"你正在陷入死循环！请立即停止重试刚才的操作。\n"
+                        f"【当前目录真实状态】:\n{real_context}\n"
+                        "请重新审视路径和命令，尝试完全不同的方案（例如：如果启动失败，先查日志或看 package.json）。"
+                    )
                     self._action_history_hashes.append(action_hash)
                     self.steps.append(step)
                     if on_step and not on_step(step): break
-                    continue # 跳过执行，让 Agent 重新思考
+                    continue # 强制重思考
                 elif repeat_count >= 2:
-                    # 第二次重复：强制中止以节省 Token
-                    return f"ERROR: 动作死循环（已重复3次：{action_type}），已自动中止以保护系统。建议检查项目路径或权限。"
+                    return f"ERROR: 动作死循环（已重复3次：{action_type}）。Agent 无法自主破局，已中止。"
                 
                 self._action_history_hashes.append(action_hash)
 
