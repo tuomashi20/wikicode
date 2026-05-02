@@ -359,7 +359,7 @@ class BuildAgent:
             return f"Error: {e}"
 
     def _exec_edit(self, params: dict) -> str:
-        """精确替换文件内容"""
+        """精确替换文件内容（带空白容错）"""
         file_path = params.get("file_path", "")
         old_text = params.get("old_text", "")
         new_text = params.get("new_text", "")
@@ -372,15 +372,46 @@ class BuildAgent:
                 return f"Error: 文件不存在 {file_path}"
 
             content = p.read_text(encoding="utf-8")
-            count = content.count(old_text)
-            if count == 0:
-                return f"Error: 未找到匹配文本（可能有空白差异）"
-            if count > 1:
-                return f"Warning: 找到 {count} 处匹配，请提供更精确的上下文。仅替换第一处。"
 
-            new_content = content.replace(old_text, new_text, 1)
-            p.write_text(new_content, encoding="utf-8")
-            return f"OK: 已编辑 {file_path}（替换了 {len(old_text)} → {len(new_text)} 字符）"
+            # 精确匹配
+            if old_text in content:
+                count = content.count(old_text)
+                if count > 1:
+                    new_content = content.replace(old_text, new_text, 1)
+                    p.write_text(new_content, encoding="utf-8")
+                    return f"OK: 已编辑 {file_path}（找到 {count} 处，替换了第一处）"
+                new_content = content.replace(old_text, new_text, 1)
+                p.write_text(new_content, encoding="utf-8")
+                return f"OK: 已编辑 {file_path}（替换了 {len(old_text)} → {len(new_text)} 字符）"
+
+            # 容错：去除行尾空白后再匹配
+            def normalize(s):
+                return "\n".join(line.rstrip() for line in s.splitlines())
+
+            norm_content = normalize(content)
+            norm_old = normalize(old_text)
+            if norm_old in norm_content:
+                # 找到归一化匹配的位置，在原文中做逐行替换
+                lines = content.splitlines(keepends=True)
+                old_lines = old_text.splitlines()
+                for i in range(len(lines)):
+                    if lines[i].rstrip() == old_lines[0].rstrip():
+                        match = True
+                        for j in range(len(old_lines)):
+                            if i + j >= len(lines) or lines[i+j].rstrip() != old_lines[j].rstrip():
+                                match = False
+                                break
+                        if match:
+                            new_lines = new_text.splitlines(keepends=True)
+                            if new_text and not new_text.endswith("\n"):
+                                new_lines[-1] = new_lines[-1] if new_lines[-1].endswith("\n") else new_lines[-1] + "\n"
+                            result_lines = lines[:i] + new_lines + lines[i+len(old_lines):]
+                            p.write_text("".join(result_lines), encoding="utf-8")
+                            return f"OK: 已编辑 {file_path}（空白容错匹配成功）"
+
+            # 匹配失败：返回文件片段帮助 Agent 修正
+            preview = content[:1500] if len(content) < 3000 else content[:800] + "\n...\n" + content[-700:]
+            return f"Error: 未找到匹配文本。文件实际内容预览:\n{preview}"
         except Exception as e:
             return f"Error: {e}"
 
