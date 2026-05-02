@@ -156,6 +156,7 @@ class BuildAgent:
             "- 每步都要有清晰的思考过程\n"
             "- 修改代码后请运行测试验证\n"
             "- 遇到错误时分析原因并尝试修复\n"
+            "- 【循环避让】：如果你的某个动作返回了错误，或者你发现自己想重复执行刚才的操作，**禁止盲目重试**。你必须先使用 ls 或 view 确认文件是否存在、内容是否符合预期，或者尝试更换不同的工具（例如用 write 替代失败的 edit）。\n"
             "- 【重要】bash 命令每次只执行一条，不要用 && 或 ; 连接多条命令。如果需要多步，请分多次 bash 调用\n"
             "- 在 Windows 上使用 PowerShell 语法，不要用 bash 特有语法\n\n"
             "【输出格式 - 严格 JSON】：\n"
@@ -222,10 +223,21 @@ class BuildAgent:
                         on_step(step)
                     return action_input
 
-                # 死循环拦截
+                # 智能死循环拦截
                 action_hash = f"{action_type}:{action_input}".strip()
-                if self._action_history_hashes.count(action_hash) >= 2:
-                    return "ERROR: 检测到动作死循环，已自动中止。"
+                repeat_count = self._action_history_hashes.count(action_hash)
+                
+                if repeat_count == 1:
+                    # 第一次重复：尝试唤醒 Agent
+                    step.observation = f"[系统警告] 检测到动作重复执行：{action_type}。你刚才已经做过完全一样的操作了，请检查是否参数有误、路径不对或文件状态不符。禁止再次重复，请尝试更换策略（如先 ls 确认目录或用 write 覆盖）。"
+                    self._action_history_hashes.append(action_hash)
+                    self.steps.append(step)
+                    if on_step and not on_step(step): break
+                    continue # 跳过执行，让 Agent 重新思考
+                elif repeat_count >= 2:
+                    # 第二次重复：强制中止以节省 Token
+                    return f"ERROR: 动作死循环（已重复3次：{action_type}），已自动中止以保护系统。建议检查项目路径或权限。"
+                
                 self._action_history_hashes.append(action_hash)
 
                 # 执行动作
