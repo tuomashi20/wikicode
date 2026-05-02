@@ -257,6 +257,7 @@ class WikiCoderApp(App):
         self.input_history = []
         self.history_index = -1
         self.modified_files: Set[str] = set()
+        self.initial_cwd = __import__('os').getcwd() # 记录启动目录
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -276,6 +277,7 @@ class WikiCoderApp(App):
             with Horizontal(id="status-bar"):
                 yield Label("●", classes="status-dot", id="status-dot")
                 yield Label("Mode: ", id="status-text")
+                yield Label("", id="cwd-text") 
                 yield Label("", id="loading-dots")
                 yield Label("", id="interrupt-hint")
 
@@ -377,7 +379,11 @@ class WikiCoderApp(App):
         try: model_name = getattr(self.config.llm, 'model', '未知')
         except: model_name = "未知"
         mode_str = "Build" if self.session_mode == "build" else "Plan"
-        status = f"[bold white]{mode_str}[/bold white] · [dim]{model_name}[/dim]"
+        
+        # 获取当前工作目录
+        current_path = self.agent.cwd if (self.agent and hasattr(self.agent, 'cwd')) else self.initial_cwd
+        
+        status = f"[bold white]{mode_str}[/bold white] · [dim]{model_name}[/dim] · [dim]{current_path}[/dim]"
         self.status_dot.styles.color = "#fbbf24" if self.is_processing else "#22c55e"
         self.status_text.update(status)
 

@@ -2385,7 +2385,9 @@ def chat(
             f"chunks={result['chunks']} wiki_pages={wp}"
         )
 
-    agent_factory = lambda cfg: BuildAgent(cfg)
+    # 获取用户启动时的当前工作目录
+    current_cwd = os.getcwd()
+    agent_factory = lambda cfg: BuildAgent(cfg, cwd=current_cwd)
     from src.ui.app import WikiCoderApp
     app = WikiCoderApp(config, agent_factory)
     app.run()
