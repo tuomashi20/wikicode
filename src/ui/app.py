@@ -446,14 +446,17 @@ class WikiCoderApp(App):
     def action_toggle_mouse(self) -> None:
         """F2 切换鼠标模式：滚动 ↔ 划选"""
         self._mouse_disabled = not getattr(self, '_mouse_disabled', False)
+        sidebar = self.query_one("#sidebar")
         if self._mouse_disabled:
             if self._driver:
                 self._driver._disable_mouse_support()
-            self.notify("划选模式：可直接拖选文字复制", title="🖱️ F2", severity="warning")
+            sidebar.styles.display = "none"
+            self.notify("划选模式：侧栏已隐藏，可直接拖选文字", title="🖱️ F2", severity="warning")
         else:
             if self._driver:
                 self._driver._enable_mouse_support()
-            self.notify("滚动模式：鼠标控制界面", title="🖱️ F2", severity="information")
+            sidebar.styles.display = "block"
+            self.notify("滚动模式：侧栏已恢复", title="🖱️ F2", severity="information")
     def action_stop_task(self):
         if self.current_worker: self.current_worker.cancel(); self.is_processing = False
 
