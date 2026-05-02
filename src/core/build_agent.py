@@ -130,6 +130,7 @@ class BuildAgent:
     ) -> str:
         """Build 模式：复刻 OpenCode 的 Agent Loop"""
         self._action_history_hashes = []
+        self._consecutive_errors = 0
         self.steps = []
         self.tasks = []
 
@@ -230,6 +231,14 @@ class BuildAgent:
                 # 执行动作
                 step.observation = self._execute(action_type, action_input)
                 self.steps.append(step)
+
+                # 连续错误检测：如果连续多次报错，注入强制提示
+                if step.observation.startswith("Error"):
+                    self._consecutive_errors += 1
+                    if self._consecutive_errors >= 3:
+                        step.observation += "\n\n[系统警告] 已连续失败3次。请立即更换策略：使用 ls 查看目录、用 write 创建新文件而非 edit，或改用不同的命令。"
+                else:
+                    self._consecutive_errors = 0
 
                 if on_step and not on_step(step):
                     break
@@ -416,7 +425,7 @@ class BuildAgent:
             return f"Error: {e}"
 
     def _exec_view(self, params: dict) -> str:
-        """查看文件内容"""
+        """查看文件内容（目录自动转为 ls）"""
         file_path = params.get("file_path") or params.get("raw", "")
         offset = params.get("offset", 0)
         limit = params.get("limit", 100)
@@ -427,6 +436,10 @@ class BuildAgent:
             p = Path(self.cwd) / file_path
             if not p.exists():
                 return f"Error: 文件不存在 {file_path}"
+
+            # 如果是目录，自动转为 ls 操作
+            if p.is_dir():
+                return self._exec_ls({"path": file_path})
 
             lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
             total = len(lines)
