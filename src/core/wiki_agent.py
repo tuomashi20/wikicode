@@ -38,14 +38,15 @@ class WikiAgent:
             "1. wiki_search: 语义搜索知识库片段。格式: {\"query\": \"关键词\"}\n"
             "2. wiki_list: 查看知识库目录结构。格式: {\"sub_dir\": \"\"}\n"
             "3. wiki_read: 通读指定的规范文件。格式: {\"path\": \"文件路径\"}\n"
-            "4. finish: 检索完成，输出汇总结果。\n\n"
+            "4. finish: 检索完成，输出汇总结果。注意：汇总结果必须是结构化的 Markdown，包含清晰的标题和要点。每条关键结论必须在末尾使用 [Source: 相对路径] 标注出处。\n\n"
             "【决策准则】：\n"
             "- 先用 wiki_search 快速定位，再用 wiki_read 深挖关键文件\n"
-            "- 每条结论必须标注知识来源路径\n"
+            "- 汇总结果必须高度整理，禁止简单堆砌原文\n"
+            "- 必须标注知识来源路径，且路径应为真实的相对路径\n"
             "- 如果搜索无结果，尝试换关键词或用 wiki_list 浏览目录\n"
             "- 最多执行 10 步，尽快得出结论\n\n"
             "【输出格式 - JSON】：\n"
-            '{"thought": "思考过程", "action": "wiki_search|wiki_list|wiki_read|finish", "input": "参数"}'
+            '{"thought": "思考过程", "action": "wiki_search|wiki_list|wiki_read|finish", "input": "汇总后的结构化内容"}'
         )
 
         context = f"用户查询: {query}\n"

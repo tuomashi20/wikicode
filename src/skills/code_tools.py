@@ -521,3 +521,25 @@ def list_backups(limit: int = 20) -> list[dict[str, str]]:
                 pass
         items.append({"id": d.name, "created_at": created, "file_count": file_count})
     return items
+
+
+def backup_and_apply_single(file: str, patch_output: str) -> tuple[bool, str, str]:
+    """备份文件并应用补丁。"""
+    ok_b, backup_id, _ = create_backup([file])
+    if not ok_b:
+        return False, "", "Failed to create backup."
+    ok, msg = apply_unified_diff(file, patch_output)
+    if ok:
+        return True, backup_id, f"{msg} (backup_id={backup_id})"
+    return False, backup_id, f"{msg} (backup_id={backup_id})"
+
+
+def backup_and_apply_multi(allowed_files: set[str], patch_output: str) -> tuple[bool, str, list[str]]:
+    """备份多个文件并应用补丁。"""
+    files = sorted(allowed_files)
+    ok_b, backup_id, _ = create_backup(files)
+    if not ok_b:
+        return False, "", ["Failed to create backup."]
+    ok, msgs = apply_unified_diff_multi(patch_output, allowed_files=allowed_files)
+    msgs.append(f"backup_id={backup_id}")
+    return ok, backup_id, msgs

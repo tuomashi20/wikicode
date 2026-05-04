@@ -31,13 +31,6 @@ class LLMConfig:
 @dataclass
 class WikiStrategyConfig:
     vault_path: Path | None
-    temperature: float
-    timeout_seconds: int
-
-
-@dataclass
-class WikiStrategyConfig:
-    vault_path: Path | None
     raw_path: Path
     wiki_path: Path
     processed_path: Path
@@ -73,6 +66,9 @@ class WikiStrategyConfig:
     rag_core_boost_score: float         # 核心业务词加权分 (默认 1000)
     rag_link_follow_limit: int          # 双链联动感知深度 (默认 3)
     rag_context_max_chars: int          # 单个 Chunk 注入上下文的最大长度
+    rag_filename_boost_terms: list[str] # 文件名/路径命中奖励关键词
+    rag_filename_boost_score: float     # 文件名命中奖励分
+    agent_search_limit: int             # WikiAgent 检索时的默认召回条数
 
 
 @dataclass
@@ -234,6 +230,9 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
         rag_core_boost_score=float(rules_data.get("rag_core_boost_score", default_rules.get("rag_core_boost_score", 1000.0))),
         rag_link_follow_limit=max(0, _rule_int("rag_link_follow_limit", 3)),
         rag_context_max_chars=max(100, _rule_int("rag_context_max_chars", 2400)),
+        rag_filename_boost_terms=_rule_list("rag_filename_boost_terms"),
+        rag_filename_boost_score=float(rules_data.get("rag_filename_boost_score", default_rules.get("rag_filename_boost_score", 500.0))),
+        agent_search_limit=max(1, _rule_int("agent_search_limit", 5)),
     )
 
 

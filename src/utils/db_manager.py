@@ -55,7 +55,8 @@ def configure_db_path(path: Path | str) -> None:
 
 def _try_open(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # 增加超时时间并允许跨线程访问，解决插件与 TUI 并发导致的 database locked 崩溃
+    conn = sqlite3.connect(path, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("SELECT 1")
     return conn
@@ -245,8 +246,20 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
     if not q:
         return []
 
-    # 提取中文核心片段用于 LIKE 奖励
-    core_phrases = re.findall(r"[\u4e00-\u9fff]{3,}", q)
+    # 提取核心关键词用于加权
+    core_phrases = re.findall(r"[\u4e00-\u9fff]{2,}", q)
+    
+    # 针对业务高频词的特殊加权名单 (优先从配置读取)
+    try:
+        from src.utils.config import load_config
+        config = load_config()
+        # 修正路径：这些参数在 config.yaml 的 rules 下
+        business_boost_words = config.wiki_strategy.rules.rag_filename_boost_terms
+        if not business_boost_words:
+             business_boost_words = ["结算", "标准", "规则", "费用", "纪要", "2024", "66号"]
+    except:
+        business_boost_words = ["结算", "标准", "规则", "费用", "纪要", "2024", "66号"]
+    
     tokens = _tokenize_query(q)
     if not tokens:
         tokens = [q]
@@ -282,10 +295,18 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                         has_core = True
                     if ph.lower() in str(r['title']).lower():
                         score += 500.0 # 标题命中：额外再奖励
-                # 业务路径命中奖励
-                for ph in core_phrases:
-                    if ph.lower() in str(r['parent_file']).lower() or ph.lower() in str(r['breadcrumb']).lower():
-                        score += 400.0
+                # 业务核心词路径奖励 (V4 强化：仅当查询包含核心词且路径命时加分)
+                query_low = q.lower()
+                for bw in business_boost_words:
+                    bw_low = bw.lower()
+                    if bw_low in query_low:
+                        # 如果用户问了核心词，且文件名或路径中包含该词，给予统治级加分
+                        path_hit = bw_low in str(r['parent_file']).lower() or bw_low in str(r['breadcrumb']).lower()
+                        if path_hit:
+                            score += 2000.0 # 路径命中核心业务词：绝对置顶
+                        elif bw_low in str(r['title']).lower():
+                            score += 1000.0 # 标题命中核心业务词：高优先
+                
                 scored_rows.append((r, score))
         except Exception:
             pass

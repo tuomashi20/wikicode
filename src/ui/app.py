@@ -10,16 +10,19 @@ from typing import Optional, List, Set, Iterable, Dict, Any, Callable
 
 from textual import on, work, events
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Header, Footer, Input, Static, Label, Tree, RichLog, Button, ListItem, ListView, TextArea
 from textual.reactive import reactive
 from textual.message import Message
+from textual.screen import Screen
 from rich.text import Text
 from rich.panel import Panel
 from rich.markdown import Markdown
 
 # 模拟之前的配置结构
 from src.core.build_agent import BuildStep
+from src.core.constants import CORE_COMMANDS
 
 class AgentStepMessage(Message):
     """自定义消息：用于从后台线程向 UI 传递 Agent 步进信息"""
@@ -28,17 +31,49 @@ class AgentStepMessage(Message):
         super().__init__()
 
 class AgentLogMessage(Message):
-    """自定义消息：用于传递原始日志信息"""
-    def __init__(self, text: str, style: str = "white") -> None:
-        self.text = text
+    """自定义消息：用于传递原始日志信息或 Rich 可渲染对象"""
+    def __init__(self, content: Any, style: str = "white") -> None:
+        self.content = content
         self.style = style
         super().__init__()
+
+class ReaderScreen(Screen):
+    BINDINGS = [
+        Binding("c", "copy_all", "复制全文"),
+        Binding("escape,q", "pop_screen", "关闭"),
+    ]
+
+    def __init__(self, content: str):
+        super().__init__()
+        self.content = content
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        # 直接使用带 Markdown 语法高亮的 TextArea，实现划选与阅读的统一
+        # 暂时关闭高亮，防止由于环境缺失 tree-sitter-markdown 导致崩溃
+        yield TextArea(self.content, id="reader-raw", read_only=True, language=None)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#reader-raw").focus()
+
+    def action_copy_all(self) -> None:
+        try:
+            import pyperclip
+            pyperclip.copy(self.content)
+            self.notify("内容已全部复制到剪贴板", title="📋 复制成功")
+        except Exception as e:
+            self.notify(f"复制失败: {e}", severity="error")
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
 
 class WikiInput(TextArea):
     """自定义多行输入框，支持特定的按键逻辑"""
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.language = "markdown"
+        # 移除强制的 markdown 语言设置，防止 tree-sitter 缺失报错
+        self.show_line_numbers = False 
 
     def _on_key(self, event) -> None:
         popup = self.app.query_one("#command-popup")
@@ -60,6 +95,9 @@ class WikiInput(TextArea):
                 popup.styles.display = "none"
                 event.stop(); event.prevent_default(); return
         else:
+            if event.key == "escape":
+                # 让 Esc 键冒泡到 App 级别触发 stop_task 绑定
+                return
             if event.key == "up":
                 if self.app.input_history:
                     if self.app.history_index == -1:
@@ -203,17 +241,37 @@ class WikiCoderApp(App):
         background: transparent;
         color: #00ff00;
     }
+
+    .message-user {
+        background: #1a1a1a;
+        margin: 1 2;
+        padding: 0 1;
+        border-left: solid cyan;
+    }
+
+    .message-bot {
+        margin: 1 2;
+        padding: 0 1;
+    }
+
+    .message-system {
+        color: #666;
+        margin: 0 2;
+        text-style: italic;
+    }
     """
 
     BINDINGS = [
         ("ctrl+q", "quit", "退出"),
-        ("ctrl+l", "clear_history", "清空"),
-        ("f2", "toggle_mouse", "鼠标切换"),
-        ("tab", "toggle_mode", "切换模式"),
-        ("escape", "stop_task", "终止任务"),
+        Binding("f1", "toggle_wiki", "Wiki增强", show=True),
+        Binding("ctrl+l", "clear_screen", "清空", show=True),
+        Binding("escape", "stop_task", "终止任务", show=True),
+        Binding("ctrl+v", "open_reader", "双击文本划选", show=True),
+        Binding("ctrl+p", "palette", "命令面板", show=False),
     ]
 
     session_mode = reactive("plan")
+    wiki_enabled = reactive(False)
     is_processing = reactive(False)
     loading_dots = reactive("...")
     
@@ -223,21 +281,7 @@ class WikiCoderApp(App):
     current_parent_cmd = reactive("")
     _ignore_input_change = False 
 
-    COMMAND_HELP = {
-        "/sync": "同步知识库",
-        "/kbpath": "设置库路径",
-        "/mode": "切换模式",
-        "/model": "切换模型",
-        "/reset": "重置会话",
-        "/resume": "恢复会话",
-        "/kbclear": "清除索引",
-        "/kbbackups": "备份列表",
-        "/kbrestore": "恢复备份",
-        "/undo": "撤销写入",
-        "/version": "查看版本",
-        "/help": "命令手册",
-        "/exit": "退出 WikiCoder"
-    }
+    COMMAND_HELP = CORE_COMMANDS
 
     WIKI_COMMANDS = list(COMMAND_HELP.keys())
 
@@ -258,13 +302,15 @@ class WikiCoderApp(App):
         self.history_index = -1
         self.modified_files: Set[str] = set()
         self.initial_cwd = __import__('os').getcwd() # 记录启动目录
+        self._last_click_time = 0
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         
         with Container(id="main-container"):
             with VerticalScroll(id="history-panel"):
-                yield RichLog(id="main-log", highlight=True, markup=True, wrap=True)
+                # 这里不再使用 RichLog，而是动态挂载 Static 组件
+                yield Static("[dim]Welcome to WikiCoder. Type /help for commands.[/dim]\n", id="init-msg", classes="message-system")
             
             with Vertical(id="sidebar"):
                 yield Label("[bold cyan]Quick check-in[/bold cyan]", variant="title")
@@ -277,6 +323,8 @@ class WikiCoderApp(App):
             with Horizontal(id="status-bar"):
                 yield Label("●", classes="status-dot", id="status-dot")
                 yield Label("Mode: ", id="status-text")
+                yield Label(" Wiki: OFF", id="wiki-status")
+                yield Label(" 🖱️ 双击文本划选", id="mouse-hint")
                 yield Label("", id="cwd-text") 
                 yield Label("", id="loading-dots")
                 yield Label("", id="interrupt-hint")
@@ -307,7 +355,7 @@ class WikiCoderApp(App):
         except: pass
 
     def on_mount(self) -> None:
-        self.log_area = self.query_one("#main-log", RichLog)
+        self.history_panel = self.query_one("#history-panel", VerticalScroll)
         self.task_tree = self.query_one("#task-tree", Tree)
         self.file_list = self.query_one("#file-list", ListView)
         self.input_field = self.query_one("#user-input", WikiInput)
@@ -384,23 +432,58 @@ class WikiCoderApp(App):
         current_path = self.agent.cwd if (self.agent and hasattr(self.agent, 'cwd')) else self.initial_cwd
         
         status = f"[bold white]{mode_str}[/bold white] · [dim]{model_name}[/dim] · [dim]{current_path}[/dim]"
-        self.status_dot.styles.color = "#fbbf24" if self.is_processing else "#22c55e"
+        self.status_dot.styles.color = "#fbbf24" if self.is_processing else ("#a855f7" if self.wiki_enabled else "#22c55e")
         self.status_text.update(status)
+
+    def watch_wiki_enabled(self, enabled: bool) -> None:
+        try:
+            ws = self.query_one("#wiki-status", Label)
+            if enabled:
+                ws.update(" 专家模型: ON")
+                ws.styles.color = "#a855f7"
+                ws.styles.text_style = "bold"
+            else:
+                ws.update(" 专家模型: OFF")
+                ws.styles.color = "#d1d5db"
+                ws.styles.text_style = "none"
+            self.update_status_bar()
+        except: pass
 
     def watch_session_mode(self, mode: str):
         self.update_status_bar()
-        self.log_area.write(f"\n[cyan]System: Switched to {mode.upper()} mode[/cyan]")
+        self.append_message("system", f"System: Switched to {mode.upper()} mode")
 
     def action_submit(self) -> None:
         if self.is_processing:
-            self.log_area.write("[yellow]Busy... Press ESC to stop.[/yellow]"); return
+            self.append_message("system", "[yellow]Busy... Press ESC to stop.[/yellow]"); return
         raw_cmd = self.input_field.text.strip()
         if not raw_cmd: return
         if not self.input_history or self.input_history[-1] != raw_cmd: self.input_history.append(raw_cmd)
         self.history_index = -1; self.input_field.text = ""; self.query_one("#command-popup").styles.display = "none"
         if raw_cmd.startswith("/"): self.route_command(raw_cmd); return
-        self.log_area.write(f"\n[bold cyan]You:[/bold cyan] {raw_cmd}"); self.is_processing = True
-        self.current_worker = self.run_agent_task(raw_cmd)
+        
+        # Wiki 全局逻辑注入
+        processed_cmd = raw_cmd
+        if self.wiki_enabled and "@wikiagent" not in raw_cmd.lower():
+            processed_cmd = f"@wikiagent {raw_cmd}"
+            
+        self.append_message("user", raw_cmd)
+        self.is_processing = True
+        self.current_worker = self.run_agent_task(processed_cmd)
+
+    def append_message(self, role: str, content: Any = "") -> Static:
+        """向消息流中添加一个新的消息块"""
+        if role == "user":
+            new_msg = Static(Text.assemble(("\n You: ", "bold cyan"), f"{content}\n"), classes="message-user")
+        elif role == "system":
+            new_msg = Static(f"{content}", classes="message-system")
+        else:
+            # Bot 消息，支持 Markdown
+            new_msg = Static(Markdown(content) if content else "", classes="message-bot")
+        
+        self.history_panel.mount(new_msg)
+        new_msg.scroll_visible()
+        return new_msg
 
     def route_command(self, cmd: str):
         parts = cmd.split(); root = parts[0].lower(); arg = cmd[len(root):].strip()
@@ -409,35 +492,64 @@ class WikiCoderApp(App):
         if root == "/mode":
             if arg in ["plan", "build"]: 
                 self.session_mode = arg
-                from src.main import _save_session_state
+                from src.cli.repl import _save_session_state
                 _save_session_state(self.session_history, mode=self.session_mode)
-            else: self.log_area.write("[yellow]Usage: /mode plan|build[/yellow]")
+            else: self.append_message("system", "[yellow]Usage: /mode plan|build[/yellow]")
         elif root == "/reset":
-            self.log_area.clear(); self.agent = None; self.session_history = []
-            from src.main import _clear_session_state_file; _clear_session_state_file()
-            self.log_area.write("[cyan]System: Conversation reset.[/cyan]")
+            # 清空 UI 历史
+            for child in self.history_panel.children: child.remove()
+            self.agent = None; self.session_history = []
+            from src.cli.base import SESSION_STATE_PATH
+            SESSION_STATE_PATH.unlink(missing_ok=True)
+            self.append_message("system", "[cyan]System: Conversation reset.[/cyan]")
         elif root == "/resume":
-            from src.main import _load_session_state
+            from src.cli.repl import _load_session_state
             h, m = _load_session_state()
             if h:
                 self.session_history = h; self.session_mode = m
-                self.log_area.write(f"[cyan]System: Resumed {len(h)} turns.[/cyan]")
-            else: self.log_area.write("[yellow]No session state found to resume.[/yellow]")
+                # 清空初始信息
+                for child in self.history_panel.children: child.remove()
+                
+                for q, a in h:
+                    self.append_message("user", q)
+                    self.append_message("bot", a)
+                self.append_message("system", f"System: Resumed {len(h)} turns.")
+                self.update_status_bar()
+            else: self.append_message("system", "No session state found to resume.")
+        elif root == "/copy": self.action_copy_last()
+        elif root == "/view": self.action_open_reader()
+        elif root == "/export":
+            from src.cli.repl import _save_session_state
+            from src.cli.base import PROJECT_ROOT
+            import os
+            path = PROJECT_ROOT / f"export_{__import__('datetime').datetime.now().strftime('%m%d_%H%M%S')}.md"
+            summary = "\n\n".join([f"### You: {q}\n\n{a}" for q, a in self.session_history])
+            path.write_text(f"# WikiCoder Export\n\n{summary}", encoding="utf-8")
+            self.append_message("system", f"\n[bold green]Exported to: {path}[/bold green]")
         elif root == "/model":
-            if not arg: self.log_area.write("[yellow]Usage: /model <name>[/yellow]")
+            if not arg: self.append_message("system", "[yellow]Usage: /model <name>[/yellow]")
             else:
-                from src.main import _set_model_config; ok, msg = _set_model_config(arg)
-                self.log_area.write(f"[{'green' if ok else 'red'}]{msg}[/]")
+                from src.utils.config import DEFAULT_CONFIG_PATH
+                import yaml
+                ok, msg = False, "Config not found"
+                if DEFAULT_CONFIG_PATH.exists():
+                    try:
+                        data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+                        data.setdefault("llm", {})["model"] = arg
+                        DEFAULT_CONFIG_PATH.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+                        ok, msg = True, f"Model updated to: {arg}"
+                    except Exception as e: msg = str(e)
+                self.append_message("system", f"[{'green' if ok else 'red'}]{msg}[/]")
                 if ok: 
                     self.config = __import__("src.utils.config", fromlist=["load_config"]).load_config()
                     self.agent = None; self.update_status_bar()
-        elif root == "/version": self.log_area.write("[bold cyan]WikiCoder Pro TUI v3.2.0[/bold cyan]")
+        elif root == "/version": self.append_message("system", "[bold cyan]WikiCoder Pro TUI v3.2.0[/bold cyan]")
         elif root == "/exit": self.exit()
         elif root == "/help":
-             self.log_area.write("\n[bold cyan]Command Help:[/bold cyan]\n" + "\n".join([f" {k:12} - {v}" for k, v in self.COMMAND_HELP.items()]))
+             self.append_message("system", "\n[bold cyan]Command Help:[/bold cyan]\n" + "\n".join([f" {k:12} - {v}" for k, v in self.COMMAND_HELP.items()]))
         else:
             # 2. 委托给后台调度器的耗时指令
-            self.log_area.write(f"\n[bold magenta]Running Command:[/bold magenta] {cmd}")
+            self.append_message("system", f"\n[bold magenta]Running Command:[/bold magenta] {cmd}")
             self.is_processing = True
             self.current_worker = self.run_background_cmd(root, arg)
 
@@ -449,69 +561,122 @@ class WikiCoderApp(App):
 
     def action_toggle_mode(self): self.session_mode = "build" if self.session_mode == "plan" else "plan"
 
-    def action_toggle_mouse(self) -> None:
-        """F2 切换鼠标模式：滚动 ↔ 划选"""
-        self._mouse_disabled = not getattr(self, '_mouse_disabled', False)
-        sidebar = self.query_one("#sidebar")
-        if self._mouse_disabled:
-            if self._driver:
-                self._driver._disable_mouse_support()
-            sidebar.styles.display = "none"
-            self.notify("划选模式：侧栏已隐藏，可直接拖选文字", title="🖱️ F2", severity="warning")
-        else:
-            if self._driver:
-                self._driver._enable_mouse_support()
-            sidebar.styles.display = "block"
-            self.notify("滚动模式：侧栏已恢复", title="🖱️ F2", severity="information")
+    def action_toggle_wiki(self):
+        self.wiki_enabled = not self.wiki_enabled
+        state = "开启" if self.wiki_enabled else "关闭"
+        self.notify(f"专家模型增强已{state}", title="🧠 Expert Intelligence", severity="information")
+
+    def action_open_reader(self):
+        if not self.session_history:
+            self.notify("没有历史内容可查看", severity="error")
+            return
+        summary = "\n\n".join([f"### You: {q}\n\n{a}" for q, a in self.session_history])
+        self.push_screen(ReaderScreen(summary))
+
+    def action_copy_last(self):
+        if not self.session_history: 
+            self.notify("没有可复制的历史记录", severity="error")
+            return
+        last_rep = self.session_history[-1][1]
+        try:
+            import pyperclip
+            pyperclip.copy(last_rep)
+            self.notify("最后一条回复已复制到剪贴板", title="📋 复制成功")
+        except ImportError:
+            self.notify("请先运行 'uv add pyperclip' 以启用复制功能", severity="warning")
+        except Exception as e:
+            self.notify(f"复制失败: {e}", severity="error")
+
     def action_stop_task(self):
-        if self.current_worker: self.current_worker.cancel(); self.is_processing = False
+        if self.current_worker: 
+            self.current_worker.cancel()
+            self.is_processing = False
+            self.append_message("system", "正在尝试终止当前任务...")
+            self.append_message("system", "System: Stop signal sent. Waiting for agent to safely exit...")
 
     @work(exclusive=True, thread=True)
     def run_agent_task(self, query: str) -> None:
         try:
-            if not self.agent:
-                self.agent = self.agent_factory(self.config)
+            # --- 实时 Markdown 生长模式 ---
+            # 在线程中通过 call_from_thread 安全创建 UI 组件
+            bot_msg = self.call_from_thread(self.append_message, "bot", "")
+            full_rep = ""
+
+            def safe_update_ui(content):
+                if bot_msg:
+                    bot_msg.update(Markdown(content))
+                    bot_msg.scroll_visible()
 
             def on_step(step):
+                nonlocal full_rep
+                # 协作式终止检查
+                from textual.worker import get_current_worker
+                worker = get_current_worker()
+                if worker and worker.is_cancelled: return False
+                
+                # 实时更新思维链与动作流
+                details = []
+                if step.thought:
+                    details.append(f"🧠 {step.thought}")
+                
+                # 根据动作类型增加视觉图标
+                if step.action_type == "search_web": details.append(f"🌐 正在搜索网页: {step.action_input}")
+                elif step.action_type == "search_chunks": details.append(f"🔍 正在检索知识库: {step.action_input}")
+                elif step.action_type == "graph_reasoning":
+                    details.append(f"🧠 **[逻辑官 @graphagent] 会诊见解**：{step.action_input}")
+                elif step.action_type == "wiki_discussion":
+                    details.append(f"📚 **[知识官 @wikiagent] 对话回应**：{step.action_input}")
+                elif step.action_type == "wiki_search_v2":
+                    details.append(f"📚 正在深度研读 Wiki 文档: {step.action_input}")
+                elif step.action_type == "write_file": details.append(f"📝 正在写入文件: {step.action_input}")
+                elif step.action_type: details.append(f"🛠️ 执行操作 ({step.action_type}): {step.action_input}")
+
+                if details:
+                    full_rep += "\n> " + "\n> ".join(details) + "\n"
+                    self.call_from_thread(safe_update_ui, full_rep)
+                
                 self.post_message(AgentStepMessage(step))
                 return True
 
             def on_log(msg):
-                self.post_message(AgentLogMessage(msg, style="dim"))
+                nonlocal full_rep
+                # 记录并实时更新内容
+                full_rep += msg
+                self.call_from_thread(safe_update_ui, full_rep)
+
+            from textual.worker import get_current_worker
+            worker = get_current_worker()
+
+            # 懒加载检查：防止 Agent 为 None 时崩溃
+            if self.agent is None:
+                self.agent = self.agent_factory(self.config)
 
             rep = self.agent.run(
                 query,
                 history=self.session_history,
                 on_step=on_step,
                 on_log=on_log,
-                mode=self.session_mode
+                mode=self.session_mode,
+                should_stop=lambda: worker.is_cancelled if worker else False
             )
             self.session_history.append((query, rep))
-            self.post_message(AgentLogMessage(f"\n[green]Report:[/green]\n{rep}"))
+            
+            # 最终呈现结果（替换生长中的临时内容）
+            self.call_from_thread(safe_update_ui, rep)
         except Exception as e:
-            self.post_message(AgentLogMessage(f"[red]Error: {e}[/red]"))
+            self.call_from_thread(self.append_message, "system", f"[red]Error: {e}[/red]")
         finally:
             self.is_processing = False
+            # 自动保存会话
+            try:
+                from src.cli.repl import _save_session_state
+                _save_session_state(self.session_history, mode=self.session_mode)
+            except: pass
 
     @on(AgentStepMessage)
     def handle_agent_step(self, message: AgentStepMessage) -> None:
         s = message.step
-        # 思考过程
-        self.log_area.write(f"\n[magenta]Thought:[/magenta] {s.thought}")
-        # 自我反思
-        if s.self_criticism:
-            self.log_area.write(f"[dim cyan]Reflection: {s.self_criticism}[/dim cyan]")
-        # 动作
-        action_color = {
-            "bash": "yellow", "write": "green", "edit": "orange3",
-            "view": "blue", "grep": "cyan", "fetch": "deep_sky_blue1",
-            "finish": "bold green"
-        }.get(s.action_type, "white")
-        self.log_area.write(f"[{action_color}]Action: {s.action_type}[/{action_color}]")
-        # 观察结果（截断显示）
-        if s.observation:
-            obs = s.observation[:500]
-            self.log_area.write(f"[dim]{obs}[/dim]")
+        # 注意：这里的逻辑现在主要用于更新侧边栏和任务树，日志已由流式 Markdown 承接
         # 跟踪修改的文件
         if s.action_type in ("write", "edit"):
             try:
@@ -529,12 +694,23 @@ class WikiCoderApp(App):
                 self.task_tree.root.add_leaf(t)
             self.task_tree.root.expand()
 
+    @on(events.Click, ".message-user, .message-bot, .message-system, #history-panel")
+    def handle_log_double_click(self, event: events.Click) -> None:
+        current_time = time.time()
+        if current_time - self._last_click_time < 0.5:
+            self.action_open_reader()
+            self._last_click_time = 0 # 重置，防止连续三击触发两次
+        else:
+            self._last_click_time = current_time
+
     @on(AgentLogMessage)
     def handle_log_message(self, message: AgentLogMessage) -> None:
-        self.log_area.write(message.text)
+        self.append_message("system", message.content)
 
-    def action_clear_history(self) -> None:
-        self.log_area.clear()
+    def action_clear_screen(self) -> None:
+        for child in self.history_panel.children:
+            child.remove()
+        self.append_message("system", "Screen cleared.")
 
     def _refresh_file_list(self) -> None:
         """刷新侧边栏的修改文件列表"""

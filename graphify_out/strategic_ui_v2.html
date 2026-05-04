@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WikiCoder Strategic Commander</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0b1015;
+            --sidebar: #0f171e;
+            --accent: #00f2ff;
+            --warning: #ff9d00;
+            --danger: #ef4444;
+            --success: #10b981;
+            --card: rgba(255, 255, 255, 0.03);
+            --border: rgba(255, 255, 255, 0.08);
+            --text: #e2e8f0;
+            --text-dim: #64748b;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            background: var(--bg); 
+            color: var(--text); 
+            font-family: 'Inter', sans-serif; 
+            height: 100vh; 
+            overflow: hidden;
+            display: flex;
+        }
+
+        /* 侧边导航 */
+        .sidebar {
+            width: 240px;
+            background: var(--sidebar);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 20px 0;
+            z-index: 100;
+        }
+        .nav-header { padding: 0 20px 30px; font-weight: 600; color: var(--accent); font-size: 18px; letter-spacing: 1px; }
+        .nav-group { margin-bottom: 30px; }
+        .nav-label { padding: 0 20px 10px; font-size: 11px; text-transform: uppercase; color: var(--text-dim); letter-spacing: 0.1em; }
+        .nav-item {
+            padding: 12px 20px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 14px;
+            color: #94a3b8;
+        }
+        .nav-item:hover { background: rgba(255, 255, 255, 0.03); color: var(--text); }
+        .nav-item.active { background: rgba(0, 242, 255, 0.08); color: var(--accent); border-right: 3px solid var(--accent); }
+
+        /* 主工作区 */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* 顶部栏 */
+        .top-bar {
+            height: 64px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            padding: 0 30px;
+            justify-content: space-between;
+        }
+        .breadcrumb { font-size: 14px; color: var(--text-dim); }
+        .breadcrumb span { color: var(--text); font-weight: 500; }
+
+        /* 内容网格 */
+        .grid-container {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 350px 1fr 380px;
+            overflow: hidden;
+        }
+
+        /* 区域 A：KPI 自由配置区 */
+        .config-area {
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            background: rgba(15, 23, 30, 0.2);
+        }
+        .area-header { padding: 20px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; }
+        .config-scroll { flex: 1; overflow-y: auto; padding: 20px; }
+        .kpi-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .kpi-card:hover { border-color: var(--accent); }
+        .kpi-card.selected { border-color: var(--accent); background: rgba(0, 242, 255, 0.03); }
+        .kpi-tag { font-size: 10px; padding: 2px 6px; border-radius: 4px; background: rgba(0, 242, 255, 0.1); color: var(--accent); margin-bottom: 8px; display: inline-block; }
+        .kpi-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+        .kpi-input-group { margin-top: 12px; display: flex; gap: 8px; align-items: center; }
+        .kpi-input { background: #000; border: 1px solid var(--border); color: var(--accent); padding: 4px 8px; border-radius: 4px; width: 60px; font-family: 'JetBrains Mono'; font-size: 12px; }
+
+        /* 区域 B：实时审计流与会话 */
+        .audit-main {
+            display: flex;
+            flex-direction: column;
+            background: #0d1217;
+        }
+        .chat-stream { flex: 1; overflow-y: auto; padding: 30px; display: flex; flex-direction: column; gap: 20px; }
+        .message { max-width: 85%; }
+        .msg-bot { background: var(--card); border: 1px solid var(--border); padding: 20px; border-radius: 0 20px 20px 20px; }
+        .msg-user { align-self: flex-end; background: var(--accent); color: #000; padding: 12px 20px; border-radius: 20px 20px 0 20px; font-weight: 500; }
+        
+        .audit-log { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-dim); margin-top: 10px; padding-left: 15px; border-left: 1px solid var(--border); }
+        .log-item { margin-bottom: 4px; }
+        .log-item.warn { color: var(--warning); }
+
+        .input-box {
+            padding: 24px 30px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            gap: 16px;
+        }
+        .chat-input {
+            flex: 1;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 20px;
+            color: #fff;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+        .chat-input:focus { border-color: var(--accent); }
+
+        /* 区域 C：报告与决策 */
+        .report-area {
+            border-left: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            background: rgba(15, 23, 30, 0.4);
+        }
+        .report-content { padding: 30px; flex: 1; overflow-y: auto; font-size: 14px; line-height: 1.7; }
+        .report-h2 { font-size: 16px; font-weight: 600; margin: 24px 0 12px; color: var(--accent); border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+        .report-p { margin-bottom: 12px; color: #cbd5e1; }
+        .decision-card { background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 12px; padding: 16px; margin-top: 20px; }
+
+        /* 按钮 */
+        .primary-btn { background: var(--accent); color: #000; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; transition: 0.2s; }
+        .primary-btn:hover { opacity: 0.9; transform: translateY(-1px); }
+    </style>
+</head>
+<body>
+    <!-- 左侧主导航 -->
+    <nav class="sidebar">
+        <div class="nav-header">WIKICODER</div>
+        
+        <div class="nav-group">
+            <div class="nav-label">Core</div>
+            <div class="nav-item">💬 专家会话中心 (Textual)</div>
+            <div class="nav-item">🔄 全量语义同步</div>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-label">Strategy</div>
+            <div class="nav-item active">🛡️ 运营审计沙盘</div>
+            <div class="nav-item">📊 KPI 知识图谱</div>
+        </div>
+
+        <div class="nav-group">
+            <div class="nav-label">System</div>
+            <div class="nav-item">⚙️ 设置与路径</div>
+        </div>
+
+        <div style="margin-top: auto; padding: 20px;">
+            <div style="font-size: 10px; color: var(--text-dim);">WikiCoder Pro v3.5.0</div>
+        </div>
+    </nav>
+
+    <!-- 主工作区 -->
+    <main class="main-content">
+        <header class="top-bar">
+            <div class="breadcrumb">Strategy / <span>运营审计沙盘</span></div>
+            <div style="display: flex; gap: 15px;">
+                <button class="primary-btn" style="background: rgba(255,255,255,0.05); color: #fff; border: 1px solid var(--border);">📂 导入运营数据</button>
+                <button class="primary-btn">⚡ 开始全量审计</button>
+            </div>
+        </header>
+
+        <div class="grid-container">
+            <!-- 区域 A：KPI 自由配置 -->
+            <aside class="config-area">
+                <div class="area-header">
+                    <span>考核指标配置</span>
+                    <span style="color: var(--accent); cursor: pointer;">+ 智能提取</span>
+                </div>
+                <div class="config-scroll">
+                    <!-- KPI 1 -->
+                    <div class="kpi-card selected">
+                        <div class="kpi-tag">故障处理</div>
+                        <div class="kpi-title">跨地域故障处理及时率</div>
+                        <div style="font-size: 12px; color: var(--text-dim);">源自: 2026年运维能力评价办法.md</div>
+                        <div class="kpi-input-group">
+                            <span style="font-size: 12px;">目标值 ≥</span>
+                            <input type="text" class="kpi-input" value="95%">
+                            <span style="font-size: 12px; color: var(--text-dim);">现行标准</span>
+                        </div>
+                    </div>
+
+                    <!-- KPI 2 -->
+                    <div class="kpi-card">
+                        <div class="kpi-tag">满意度</div>
+                        <div class="kpi-title">代维满意度得分 (KPI)</div>
+                        <div style="font-size: 12px; color: var(--text-dim);">源自: 附件五：代维质量规范.md</div>
+                        <div class="kpi-input-group">
+                            <span style="font-size: 12px;">警戒线 <</span>
+                            <input type="text" class="kpi-input" value="85">
+                        </div>
+                    </div>
+
+                    <!-- KPI 3 -->
+                    <div class="kpi-card">
+                        <div class="kpi-tag">结算</div>
+                        <div class="kpi-title">FTTR 超级礼包结算单价</div>
+                        <div class="kpi-input-group">
+                            <span style="font-size: 12px;">限额:</span>
+                            <input type="text" class="kpi-input" value="399">
+                        </div>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- 区域 B：实时审计流 (保留 Textual 灵魂) -->
+            <section class="audit-main">
+                <div class="chat-stream">
+                    <div class="message msg-user">帮我根据“2026年评价办法”，审计 4 月份的代维故障处理数据。</div>
+                    
+                    <div class="message msg-bot">
+                        <div style="font-weight: 600; color: var(--accent); margin-bottom: 10px;">🛡️ 逻辑官 (@graphagent) 正在工作...</div>
+                        已锁定配置指标：<strong>跨地域故障处理及时率 (阈值: 95%)</strong>
+                        
+                        <div class="audit-log">
+                            <div class="log-item">→ 正在读取 [D:\Audit\Data\April_Faults.csv]...</div>
+                            <div class="log-item">→ 正在匹配 2,500 条故障工单记录...</div>
+                            <div class="log-item warn">! 警告: 发现 12 处记录低于 95% 阈值。</div>
+                            <div class="log-item">→ 正在研读近期运营报告 [QA_Summary.md] 以获取异常解释...</div>
+                        </div>
+
+                        <div style="margin-top: 15px;">
+                            审计发现：4月平均及时率为 **92.4%**，未达标。但在运营报告中发现“4.12 暴雨橙色预警”免责声明，需进一步对齐时间戳。
+                        </div>
+                    </div>
+                </div>
+
+                <div class="input-box">
+                    <input type="text" class="chat-input" placeholder="输入审计指令，或直接追问决策详情...">
+                    <button class="primary-btn">发送</button>
+                </div>
+            </section>
+
+            <!-- 区域 C：报告与决策 -->
+            <aside class="report-area">
+                <div class="area-header">决策方案输出</div>
+                <div class="report-content">
+                    <div class="report-h2">📊 4月运维能力审计综述</div>
+                    <div class="report-p">
+                        基于《2026年运维综合能力评价办法》第 3.2 节要求，本月核心 KPI **处理及时率** 出现偏离。
+                    </div>
+
+                    <div class="report-h2">⚠️ 关键发现</div>
+                    <ul style="padding-left: 18px; color: #cbd5e1; font-size: 13px; line-height: 2;">
+                        <li><strong>指标越线</strong>：4.12-4.15 期间，及时率跌至 78%。</li>
+                        <li><strong>逻辑不一</strong>：运营报告声称全量修复，但结算数据存在 5% 的退单。</li>
+                    </ul>
+
+                    <div class="decision-card">
+                        <div style="color: var(--success); font-weight: 600; font-size: 13px; margin-bottom: 8px;">💡 AI 辅助决策建议</div>
+                        <div style="font-size: 12px; color: #94a3b8; line-height: 1.6;">
+                            1. **免责对齐**：核实暴雨期间的工单是否已标记“不可抗力”。<br>
+                            2. **考核扣减**：建议对非异常天气的超时工单，依据原子 #A55 进行 0.5 权重扣减。
+                        </div>
+                        <button class="primary-btn" style="width: 100%; margin-top: 15px; font-size: 12px;">生成正式考核通知单</button>
+                    </div>
+                </div>
+            </aside>
+        </div>
+    </main>
+</body>
+</html>

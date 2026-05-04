@@ -1,456 +1,289 @@
 from __future__ import annotations
-
 import json
 import traceback
 import threading
 import queue
+import asyncio
 from typing import AsyncGenerator
 import uuid
+import os
+import platform
+import subprocess
+import sys
+import time
+from pathlib import Path
+import yaml
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import anyio
 
-from src.core.agent import WikiFirstAgent, AgentResponse
-from src.utils.config import load_config
-from src.main import build_agent, run_sync, build_llm, _save_memory_markdown
+from src.utils.config import load_config, PROJECT_ROOT, DEFAULT_CONFIG_PATH, ensure_workspace
 from src.core.build_agent import BuildAgent, BuildStep
+from src.cli.commands_wiki import run_sync
+from src.skills.chat_archive_skill import archive_chat_to_md, mem_draft_archive
+from src.core.constants import CORE_COMMANDS, get_command_list
+from src.core.business_ops import get_pure_business_graph, run_business_audit
 
-app = FastAPI(title="WikiCoder API", version="0.1.0")
+app = FastAPI(title="WikiCoder API")
 
-# 全局阻塞确认存储
-PENDING_CONFIRMATIONS = {}
-
-# 配置 CORS，允许 Obsidian 跨域访问
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    error_msg = traceback.format_exc()
-    print(f"Server Error:\n{error_msg}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": str(exc), "traceback": error_msg}
-    )
+PENDING_CONFIRMATIONS = {}
+
+# [关键修复]：启动即加载配置，确保数据库路径（vault_path）正确锚定
+try:
+    load_config()
+except:
+    pass
+
+@app.post("/v1/archive")
+async def archive_history(req: dict):
+    history = req.get("history", [])
+    ok, path = archive_chat_to_md(history)
+    if ok:
+        return {"status": "success", "output": f"✅ 对话已成功总结并存档到：\n`{path}`"}
+    return {"status": "error", "message": path}
 
 class ChatRequest(BaseModel):
     query: str
-    mode: str = "auto" # auto, wiki_only, general_only, build
-    history: list[dict[str, str]] = []
-    cwd: str = None
+    history: list = []
+    cwd: str = "."
+    mode: str = "plan"
+    agent_search_limit: int | None = None
+    rag_filename_boost_terms: list | None = None
 
-def format_history(history: list[dict[str, str]]) -> list[tuple[str, str]]:
-    return [(h["q"], h["a"]) for h in history]
-
-class DraftRequest(BaseModel):
-    history: list[dict[str, str]]
-    title_hint: str = ""
-
-class SaveRequest(BaseModel):
-    title: str
-    content: str
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "app": "wikicoder"}
+def format_history(history):
+    result = []
+    for h in history:
+        if isinstance(h, dict):
+            result.append((h.get("q", ""), h.get("a", "")))
+        elif isinstance(h, (list, tuple)) and len(h) >= 2:
+            result.append((h[0], h[1]))
+    return result
 
 @app.post("/v1/chat")
-async def chat(request: ChatRequest):
-    """
-    流式问答接口。
-    支持 Plan (auto/wiki_only/general_only) 和 Build 模式。
-    """
+async def chat(chat_request: ChatRequest, request: Request):
     try:
         config = load_config()
-        # 统一使用 BuildAgent 引擎，支持 Plan 和 Build 模式的任务流推送
-        agent_build = BuildAgent(config, cwd=request.cwd)
-        history_tuples = format_history(request.history)
+        agent_build = BuildAgent(config, cwd=chat_request.cwd)
+        history_tuples = format_history(chat_request.history)
         
-        import queue
-        status_queue = queue.Queue()
-
         async def event_generator():
+            status_queue = queue.Queue()
+            agent_done = False
+            
+            def _on_step(step: BuildStep) -> bool:
+                is_dangerous = step.action_type in ["shell", "python", "edit_file"]
+                confirm_id = str(uuid.uuid4()) if is_dangerous else ""
+                thought_prefix = ""
+                if step.action_type == "search_chunks": thought_prefix = "🔍 正在深入检索知识库..."
+                elif step.action_type == "read_file": thought_prefix = "📖 正在调阅相关文档..."
+                elif step.action_type == "search_web": thought_prefix = "🌐 正在接入互联网检索..."
+                elif step.action_type == "write_file": thought_prefix = "📝 正在根据构思同步文件..."
+                display_thought = f"{thought_prefix}\n{step.thought}" if thought_prefix else step.thought
+
+                status_queue.put({
+                    "type": "step", 
+                    "thought": display_thought,
+                    "action_type": step.action_type,
+                    "tasks": step.tasks,
+                    "require_confirm": is_dangerous,
+                    "confirm_id": confirm_id
+                })
+                
+                if is_dangerous:
+                    event = threading.Event()
+                    PENDING_CONFIRMATIONS[confirm_id] = {"event": event, "approved": False}
+                    event.wait() 
+                    result = PENDING_CONFIRMATIONS.pop(confirm_id, {"approved": False})
+                    return result["approved"]
+                return True
+
+            def _on_log(content: str) -> bool:
+                if content.startswith("[") or "步骤" in content:
+                    status_queue.put({"type": "step", "thought": content, "action_type": "info"})
+                else:
+                    status_queue.put({"type": "log", "content": content})
+                return True
+
+            def _run_agent():
+                nonlocal agent_done
+                try:
+                    out = agent_build.run(chat_request.query, history_tuples, on_step=_on_step, on_log=_on_log, mode=chat_request.mode)
+                    status_queue.put({"type": "done", "output": out})
+                except Exception as e:
+                    status_queue.put({"type": "error", "content": str(e)})
+                finally:
+                    agent_done = True
+
+            status_queue.put({"type": "step", "thought": "🚀 正在启动 WikiCoder 智能引擎...", "action_type": "init", "tasks": []})
+            threading.Thread(target=_run_agent, daemon=True).start()
+
+            yield f"data: {json.dumps({'status': 'WikiCoder 引擎已就绪...'}, ensure_ascii=False)}\n\n"
+
+            last_act = asyncio.get_running_loop().time()
             try:
-                # 发送启动信号
-                status_queue.put({"type": "status", "content": f"WikiCoder {request.mode.upper()} 引擎已就绪..."})
-
-                def _on_step(step: BuildStep) -> bool:
-                    is_dangerous = step.action_type in ["shell", "python", "edit_file"]
-                    confirm_id = str(uuid.uuid4()) if is_dangerous else ""
-                    
-                    event_data = {
-                        "type": "step", 
-                        "thought": step.thought,
-                        "action_type": step.action_type,
-                        "action": f"{step.action_type}: {step.action_input}",
-                        "observation": step.observation,
-                        "tasks": step.tasks,
-                        "require_confirm": is_dangerous,
-                        "confirm_id": confirm_id
-                    }
-                    status_queue.put(event_data)
-                    
-                    if is_dangerous:
-                        event = threading.Event()
-                        PENDING_CONFIRMATIONS[confirm_id] = {"event": event, "approved": False}
-                        event.wait() 
-                        result = PENDING_CONFIRMATIONS.pop(confirm_id, {"approved": False})
-                        if not result["approved"]: return False
-
-                    return True
-
-                def _run_agent():
+                while not agent_done or not status_queue.empty():
+                    if await request.is_disconnected():
+                        agent_build.interrupt_signal = True
+                        break
                     try:
-                        # 将模式参数透传给 run 方法
-                        output = agent_build.run(request.query, history_tuples, on_step=_on_step, mode=request.mode)
-                        status_queue.put({"type": "done", "output": output})
-                    except Exception as e:
-                        status_queue.put({"type": "error", "content": str(e)})
-
-                threading.Thread(target=_run_agent, daemon=True).start()
-
-                while True:
-                    try:
-                        item = await anyio.to_thread.run_sync(lambda: status_queue.get(timeout=0.1))
-                        if item["type"] == "status":
-                            yield f"data: {json.dumps({'status': item['content']}, ensure_ascii=False)}\n\n"
-                        elif item["type"] == "step":
-                            if request.mode == "plan":
-                                # Plan 模式视觉降噪：只显示思考和简单的动作提示，隐藏大段原文
-                                status_msg = f"🔍 **思考**: {item['thought']}\n\n⚙️ **正在执行**: `{item['action']}`"
-                            else:
-                                # Build 模式保持透明：显示完整过程和执行结果
-                                status_msg = f"**思考**: {item['thought']}\n\n**执行**: `{item['action']}`"
-                                if item.get("observation"):
-                                    status_msg += f"\n\n**结果**:\n```\n{item['observation']}\n```"
-                            
-                            yield f"data: {json.dumps({'status': status_msg, 'tasks': item.get('tasks', []), 'action_type': item.get('action_type', ''), 'require_confirm': item.get('require_confirm', False), 'confirm_id': item.get('confirm_id', '')}, ensure_ascii=False)}\n\n"
+                        item = status_queue.get_nowait()
+                        last_act = asyncio.get_running_loop().time()
+                        if item["type"] == "step":
+                            yield f"data: {json.dumps({'status': item['thought'], 'tasks': item.get('tasks', []), 'action_type': item.get('action_type', ''), 'require_confirm': item.get('require_confirm', False), 'confirm_id': item.get('confirm_id', '')}, ensure_ascii=False)}\n\n"
+                            await asyncio.sleep(0) 
+                        elif item["type"] == "log":
+                            yield f"data: {json.dumps({'output': item['content']}, ensure_ascii=False)}\n\n"
+                            await asyncio.sleep(0) 
                         elif item["type"] == "done":
                             yield f"data: {json.dumps({'thought': '任务完成', 'output': item['output']}, ensure_ascii=False)}\n\n"
-                            break
+                            await asyncio.sleep(0) 
+                            agent_done = True
                         elif item["type"] == "error":
                             yield f"data: {json.dumps({'error': item['content']}, ensure_ascii=False)}\n\n"
+                            agent_done = True
                             break
                     except queue.Empty:
-                        await anyio.sleep(0.1)
-                
-                yield "data: [DONE]\n\n"
+                        elapsed = int(asyncio.get_running_loop().time() - last_act)
+                        if elapsed >= 2:
+                            yield f"data: {json.dumps({'status': f'🧠 WikiCoder 正在全速构思中 (已耗时 {elapsed}s)...'}, ensure_ascii=False)}\n\n"
+                        await asyncio.sleep(0.05)
             except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     except Exception as e:
-        print(f"Chat Error: {e}")
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/v1/sync")
-async def sync_knowledge(mode: str = "incremental", path: str = None):
-    """触发本地知识库同步"""
-    try:
-        if mode == "full":
-            from src.utils.db_manager import clear_index_store
-            config = load_config()
-            clear_index_store(config.wiki_strategy.processed_path)
-            results = run_sync()
-        elif mode == "clear":
-            from src.utils.db_manager import clear_index_store
-            config = load_config()
-            messages = clear_index_store(config.wiki_strategy.processed_path)
-            return {"status": "success", "results": {"cleared": True, "details": messages}}
-        else:
-            results = run_sync()
-        return {"status": "success", "results": results}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-class ConfirmRequest(BaseModel):
-    confirm_id: str
-    approved: bool
 
 @app.post("/v1/confirm")
-async def confirm_action(request: ConfirmRequest):
-    """前端发送执行确认结果"""
-    if request.confirm_id in PENDING_CONFIRMATIONS:
-        PENDING_CONFIRMATIONS[request.confirm_id]["approved"] = request.approved
-        PENDING_CONFIRMATIONS[request.confirm_id]["event"].set()
+async def confirm_action(req: dict):
+    cid = req.get("confirm_id")
+    if cid in PENDING_CONFIRMATIONS:
+        PENDING_CONFIRMATIONS[cid]["approved"] = req.get("approved", False)
+        PENDING_CONFIRMATIONS[cid]["event"].set()
         return {"status": "success"}
-    return {"status": "error", "message": "Confirmation ID not found or expired."}
+    return {"status": "error"}
 
-class CmdRequest(BaseModel):
-    command: str
+@app.get("/v1/commands")
+async def get_commands():
+    return get_command_list()
+
+# --- [NEW] 业务运营分析接口 (WebUI 专用) ---
+@app.get("/v1/ops/graph")
+async def get_ops_graph():
+    """获取全量业务逻辑图谱"""
+    return get_pure_business_graph()
+
+@app.get("/v1/ops/audit")
+async def get_ops_audit():
+    """获取业务违规审计报表"""
+    return run_business_audit()
 
 @app.post("/v1/exec")
-async def exec_cmd(request: CmdRequest):
-    """处理斜杠命令及其参数引导逻辑"""
-    cmd_full = request.command.strip()
-    parts = cmd_full.split(" ")
-    cmd = parts[0].lower()
-    args = parts[1:] if len(parts) > 1 else []
-
+async def execute_command(req: dict):
+    full_cmd = req.get("command", "").strip()
+    if not full_cmd: return {"status": "error", "output": "无效命令"}
+    parts = full_cmd.split()
+    cmd_name = parts[0].replace("/", "")
+    arg = " ".join(parts[1:]) if len(parts) > 1 else ""
+    history = req.get("history", [])
+    
     try:
-        # 1. 基础状态与配置查看
-        if cmd == "/status":
-            config = load_config()
-            return {"status": "success", "output": (
-                f"### ⚙️ 系统当前状态\n"
-                f"- **文本模型**: `{config.llm.model}`\n"
-                f"- **知识库**: `{config.wiki_strategy.vault_path or '未激活'}`\n"
-                f"- **服务器**: `running at 127.0.0.1:8000`"
-            )}
+        # [1] 核心业务逻辑
+        if cmd_name == "sync":
+            result = run_sync()
+            return {"status": "success", "output": f"✅ **同步完成**\n- 修改文件: `{result.get('files', 0)}`"}
+            
+        elif cmd_name == "structure":
+            from src.skills.wiki_tools import wiki_list_structure
+            items = wiki_list_structure()
+            if not items: return {"status": "success", "output": "📭 当前知识库索引为空。"}
+            table = "| 文件名 | 切片数 |\n| :--- | :--- |\n"
+            for it in items: table += f"| {it['parent_file']} | {it['chunk_count']} |\n"
+            return {"status": "success", "output": f"📊 **知识库物理结构**:\n\n{table}"}
 
-        # 2. 知识库路径
-        if cmd == "/vaultpath":
-            if not args:
-                return {"status": "error", "output": "### ⚠️ 参数缺失\n用法: `/vaultpath <本地目录路径>`\n示例: `/vaultpath D:\\MyNotes`"}
-            from src.main import _set_vault_path
-            ok, msg = _set_vault_path(" ".join(args))
+        elif cmd_name in ["vaultpath", "kbpath"]:
+            if not arg: return {"status": "error", "output": "❌ 请指定路径"}
+            from src.cli.commands_wiki import _set_vault_path
+            ok, msg = _set_vault_path(arg)
+            if ok: ensure_workspace(load_config())
             return {"status": "success" if ok else "error", "output": msg}
 
-        # 3. 同步管理
-        if cmd == "/sync":
-            results = run_sync()
-            return {"status": "success", "output": f"### ✅ 同步结果\n- 新增/修改文件: {results['files']}\n- 本次生成分片: {results['chunks']}"}
-        
-        if cmd == "/kbclear":
-            if "yes" not in args:
-                return {"status": "error", "output": "### 🗑️ 清理确认\n此操作不可逆，请确认为：\n- `/kbclear yes`: 仅清理索引\n- `/kbclear all yes`: 清理索引及 Wiki 页面"}
-            from src.utils.db_manager import clear_index_store
-            config = load_config()
-            msgs = clear_index_store(config.wiki_strategy.processed_path)
-            if "all" in args:
-                from src.main import _clear_wiki_output
-                msgs.extend(_clear_wiki_output(config.wiki_strategy.wiki_path))
-            return {"status": "success", "output": "### ✨ 已手动执行清理\n" + "\n".join([f"- {m}" for m in msgs])}
+        elif cmd_name == "status":
+            cfg = load_config()
+            out = f"📊 **运行状态**\n- 模型: `{cfg.llm.model}`\n- 知识库: `{cfg.wiki_strategy.vault_path}`\n- 工作目录: `{os.getcwd()}`"
+            return {"status": "success", "output": out}
 
-        # 4. 备份与恢复
-        if cmd == "/kbbackups":
-            from src.main import list_kb_backups
-            items = list_kb_backups(limit=20)
-            if not items: return {"status": "success", "output": "未发现备份快照。"}
-            return {"status": "success", "output": "### 💾 备份列表\n" + "\n".join([f"- `{it['id']}` - {it['created_at']}" for it in items])}
+        elif cmd_name == "help":
+            from src.core.web_api import get_commands
+            cmds = await get_commands()
+            lines = [f"- **{c['name']}**: {c['desc']}" for c in cmds]
+            return {"status": "success", "output": "📖 **WikiCoder 指令手册**\n\n" + "\n".join(lines)}
 
-        if cmd == "/kbsave":
-            from src.main import save_kb_backup
-            bid, msgs = save_kb_backup(load_config(), name=args[0] if args else None)
-            return {"status": "success", "output": f"### 📦 备份完成\nID: `{bid}`"}
+        elif cmd_name == "exit":
+            return {"status": "success", "output": "👋 感谢使用 WikiCoder！您可以直接点击侧边栏顶部的关闭图标或切换到其他插件。"}
 
-        if cmd == "/kbrestore":
-            if not args:
-                return {"status": "error", "output": "### ⚠️ 请提供备份 ID\n用法: `/kbrestore <backup_id>`\n提示: 输入 `/kbbackups` 查看可用 ID。"}
-            from src.main import restore_kb_backup
-            ok, msgs = restore_kb_backup(load_config(), args[0])
-            return {"status": "success" if ok else "error", "output": "\n".join(msgs)}
+        elif cmd_name == "version":
+            return {"status": "success", "output": "🚀 **WikiCoder Pro**\n- 核心引擎: `v3.2.0`\n- 适配层: `v1.2.9` (Full Align)"}
 
-        # 5. 模型与模式切换
-        if cmd == "/model":
-            config = load_config()
-            if not args:
-                return {"status": "error", "output": (
-                    f"### 🤖 模型设置\n"
-                    f"当前使用模型: `{config.llm.model}`\n\n"
-                    f"用法: `/model <模型名称>`\n"
-                    f"提示：您可以快速切换为以下 WikiCoder 专用模型：\n"
-                    f"- `jiutian-think-v3` (深度思考推理)\n"
-                    f"- `jiutian-lan-comv3` (通用快速回答)"
-                )}
-            from src.main import _set_model_config
-            ok, msg = _set_model_config(args[0])
-            return {"status": "success" if ok else "error", "output": msg}
+        elif cmd_name == "archive":
+            if not history: return {"status": "error", "output": "❌ 归档失败：对话历史为空。"}
+            ok, path = archive_chat_to_md(history)
+            return {"status": "success" if ok else "error", "output": f"✅ 已为您生成正式归档：\n`{path}`" if ok else f"❌ 归档失败: {path}"}
 
-        if cmd == "/mode":
-            if not args or args[0] not in {"auto", "wiki_only", "general_only", "build"}:
-                return {"status": "error", "output": "### 🛠️ 模式选择范围\n- `/mode auto`: 智能检索 (默认)\n- `/mode wiki_only`: 严格仅使用本地知识库\n- `/mode general_only`: 跳过知识库，直接问 AI\n- `/mode build`: 全自动构建模式"}
-            # 注意：mode 需要修改全局配置或会话状态，这里示例修改配置
-            return {"status": "success", "output": f"✅ 切换成功: 模式 = `{args[0]}`"}
+        # [2] 万能代理 (降级至 CLI 执行)
+        cli_cmds = ["xlsx2md", "pdf2md", "docx2md", "kbclear", "kbbackups", "kbrestore", "kbsave", "version", "undo"]
+        if cmd_name in cli_cmds:
+            executable = sys.executable
+            main_script = str(PROJECT_ROOT / "src" / "main.py")
+            cli_args = [executable, main_script, cmd_name]
+            if arg: cli_args.extend(parts[1:])
+            res = subprocess.run(cli_args, capture_output=True, text=True, cwd=str(PROJECT_ROOT), encoding="utf-8")
+            output = res.stdout if res.stdout else res.stderr
+            import re
+            output = re.sub(r"\x1b\[[0-9;]*m", "", output)
+            return {"status": "success" if res.returncode == 0 else "error", "output": output.strip()}
 
-        # 6. 对话与记忆管理
-        if cmd == "/resume":
-            from src.main import _load_session_state
-            state = _load_session_state()
-            if not state or "history" not in state:
-                return {"status": "error", "output": "### ⚠️ 未找到历史会话\n无法执行 `/resume`。"}
-            # 这里简单返回状态，实际历史会在下一次 /chat 时带上
-            return {"status": "success", "output": f"### 🔄 会话已恢复\n- 历史消息数: {len(state.get('history', []))}\n- 上次模型: `{state.get('model', 'default')}`"}
+        # [3] 特殊状态同步
+        if cmd_name == "resume":
+            from src.cli.repl import _load_session_state
+            h, m = _load_session_state()
+            if h: return {"status": "success", "output": f"✅ 已成功恢复会话记录。", "history": h, "mode": m}
+            return {"status": "error", "output": "❌ 未发现可恢复的会话记录。"}
 
-        if cmd == "/memdraft":
-            return {"status": "success", "output": "### 📝 整理建议\n请点击界面顶部的 **[整理记录]** 按钮，系统将自动汇总本次对话并生成 Wiki 草稿。"}
+        elif cmd_name == "mode":
+            if arg in ["plan", "build"]: return {"status": "success", "output": f"🔄 **模式已切换**: `{arg.upper()}`", "mode": arg}
+            return {"status": "error", "output": "❌ 请指定模式"}
 
-        if cmd == "/memsave":
-            return {"status": "success", "output": "### 💾 保存建议\n请点击界面顶部的 **[入库]** 按钮，将当前整理好的草稿保存到本地知识库。"}
+        elif cmd_name == "model":
+            if not arg: return {"status": "error", "output": "❌ 请指定模型名称"}
+            if DEFAULT_CONFIG_PATH.exists():
+                data = yaml.safe_load(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+                data.setdefault("llm", {})["model"] = arg
+                DEFAULT_CONFIG_PATH.write_text(yaml.safe_dump(data, allow_unicode=True), encoding="utf-8")
+                return {"status": "success", "output": f"✅ 模型已切换为: `{arg}`"}
+            return {"status": "error", "output": "❌ 配置文件丢失"}
 
-        if cmd == "/ask":
-            return {"status": "success", "output": "### 💡 提示\n`/ask` 指令用于强制 Wiki 模式。在插件中，您可以直接输入问题，或者通过 `/mode wiki_only` 切换到该模式。"}
-
-        # 7. 文件转换工具
-        if cmd == "/pdf2md":
-            if not args: return {"status": "error", "output": "用法: `/pdf2md <路径>`"}
-            from src.skills.pdf_tools import convert_pdf_path
-            outs, errs = convert_pdf_path(" ".join(args))
-            return {"status": "success", "output": f"✅ 已完成 PDF 转换: {len(outs)} 个文件"}
-
-        if cmd == "/docx2md":
-            if not args: return {"status": "error", "output": "用法: `/docx2md <路径>`"}
-            from src.skills.docx_tools import convert_docx_path
-            outs, errs = convert_docx_path(" ".join(args))
-            return {"status": "success", "output": f"✅ 已完成 Word 转换: {len(outs)} 个文件"}
-
-        if cmd == "/xlsx2md":
-            if not args: return {"status": "error", "output": "用法: `/xlsx2md <路径>`"}
-            from src.skills.xlsx_tools import convert_xlsx_path
-            outs, errs = convert_xlsx_path(" ".join(args))
-            return {"status": "success", "output": f"✅ 已完成 Excel 转换: {len(outs)} 个文件"}
-
-        # 8. Canvas 转换
-        if cmd in {"/md2canvas", "/md2canvas_ai"}:
-            from src.skills.canvas_tools import convert_md_canvas_path
-            use_ai = (cmd == "/md2canvas_ai")
-            if not args:
-                return {"status": "error", "output": f"### ⚠️ 参数缺失\n用法: `{cmd} <路径> [-r]`"}
-            
-            # 提取参数
-            path_arg = " ".join(args)
-            recursive = False
-            if "-r" in path_arg or "--recursive" in path_arg:
-                recursive = True
-                path_arg = path_arg.replace("--recursive", "").replace("-r", "").strip()
-            
-            outs, errs = convert_md_canvas_path(path_arg, recursive=recursive, use_ai=use_ai)
-            
-            msg_lines = []
-            if outs:
-                msg_lines.append("### ✅ 转换成功")
-                for o in outs:
-                    msg_lines.append(f"- 已生成: `{o.name}`")
-                    msg_lines.append(f"FILE_PATH:{o.resolve()}") 
-            if errs:
-                msg_lines.append("### ❌ 转换部分失败")
-                for e in errs:
-                    msg_lines.append(f"- {e}")
-            
-            return {"status": "success" if outs else "error", "output": "\n".join(msg_lines)}
-
-        # 9. 帮助内容
-        if cmd == "/help":
-            return {"status": "success", "output": (
-                "### 📖 Wikicodian 指令手册\n"
-                "| 指令 | 说明 | 必选参数 |\n"
-                "| :--- | :--- | :--- |\n"
-                "| `/sync` | 学习新笔记 | 无 |\n"
-                "| `/kbclear` | 重置索引 | `yes` |\n"
-                "| `/vaultpath` | 设置库路径 | `<路径>` |\n"
-                "| `/model` | 切换 AI 模型 | `<名称>` |\n"
-                "| `/mode` | 检索策略 | `auto/wiki/gen` |\n"
-                "| `/kbsave` | 保存存档 | `[备注]` |\n"
-                "| `/kbrestore` | 恢复指令 | `<ID>` |\n"
-                "| `/reset` | 清空对话 | 无 |"
-            )}
-
-        return {"status": "error", "output": f"找不到该命令: `{cmd}`。输入 `/help` 查看所有指令。"}
+        return {"status": "error", "output": f"❓ 未知或暂未映射的命令 `{full_cmd}`"}
     except Exception as e:
-        return {"status": "error", "output": f"🔥 执行失败: `{str(e)}`"}
+        return {"status": "error", "output": f"❌ 执行失败: {str(e)}"}
 
-@app.get("/v1/files")
-async def get_files():
-    """获取知识库中已索引的所有文件列表 (用于前端 @ 引用提醒)"""
-    try:
-        from src.skills.wiki_tools import wiki_list_structure
-        items = wiki_list_structure()
-        return {"status": "success", "files": [it['parent_file'] for it in items]}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/v1/config")
-async def get_config():
-    """获取基础配置（用于插件端显示进度或状态）"""
-    config = load_config()
-    return {
-        "vault_path": str(config.wiki_strategy.vault_path),
-        "model": config.llm.model,
-        "provider": config.llm.provider
-    }
-
-@app.post("/v1/memdraft")
-async def mem_draft(request: DraftRequest):
-    """将对话历史整理为 Wiki Markdown 草稿"""
-    try:
-        if not request.history:
-            return {"status": "error", "message": "当前会话暂无可整理内容。"}
-        
-        config = load_config()
-        llm = build_llm(config)
-        
-        # 组装对话文本
-        hist_text = "\n\n".join(
-            [f"### 用户问题\n{h['q']}\n\n### 助手回答\n{h['a']}" for h in request.history[-12:]]
-        )
-        
-        system_prompt = (
-            "你是知识工程师。请把给定对话整理为可直接入库的中文 Wiki Markdown 文档。"
-            "要求：结构清晰、可复用、避免口语、不要编造事实。"
-        )
-        user_prompt = (
-            f"文档标题建议：{request.title_hint or '自动整理会话'}\n\n"
-            "请严格按以下结构输出 Markdown：\n"
-            "# 标题\n"
-            "## 背景\n"
-            "## 结论\n"
-            "## 详细说明\n"
-            "## 操作步骤\n"
-            "## 注意事项\n"
-            "## 标签\n"
-            "对话内容如下：\n\n"
-            f"{hist_text}"
-        )
-
-        # 异步调用 LLM (由于 generate 是同步的，放到线程池)
-        import anyio
-        draft = await anyio.to_thread.run_sync(
-            llm.generate, 
-            system_prompt, 
-            user_prompt
-        )
-        
-        import re
-        m = re.search(r"^#\s+(.+)$", draft, flags=re.MULTILINE)
-        title = (m.group(1).strip() if m else request.title_hint or "会话整理")
-        
-        return {
-            "status": "success", 
-            "draft": draft, 
-            "title": title
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.post("/v1/memsave")
-async def mem_save(request: SaveRequest):
-    """将草稿保存到本地 raw/faq 目录"""
-    try:
-        config = load_config()
-        # 异步保存
-        import anyio
-        out_path = await anyio.to_thread.run_sync(
-            _save_memory_markdown,
-            config,
-            request.title,
-            request.content
-        )
-        return {
-            "status": "success",
-            "path": str(out_path),
-            "message": f"已成功入库：{out_path.name}"
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-def start_server(host: str = "127.0.0.1", port: int = 8000):
+def start_server(host="127.0.0.1", port=8000):
     import uvicorn
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(
+        app, 
+        host=host, 
+        port=port, 
+        log_level="warning", # 核心修复：防止干扰终端渲染
+        access_log=False      # 核心修复：禁止输出访问日志
+    )

@@ -19,8 +19,10 @@ import httpx
 import trafilatura
 
 from src.core.llm_client import LLMClient
-from src.core.wiki_agent import WikiAgent, extract_wiki_query
+from src.core.agent import WikiFirstAgent
+from src.core.wiki_agent import extract_wiki_query
 from src.utils.config import AppConfig
+from src.skills.wiki_tools import wiki_search
 
 
 @dataclass
@@ -44,10 +46,15 @@ class BuildAgent:
         self.cwd = cwd or os.getcwd()
         self.depth = depth
         self.llm = LLMClient(config.llm)
-        self.wiki_agent = WikiAgent(self.llm)
+        self.wiki_agent = WikiFirstAgent(config)
         self.steps: list[BuildStep] = []
         self.tasks: list[str] = []
         self._action_history_hashes: list[str] = []
+        self.interrupt_signal = False # [关键映射]：外部强制中断信号
+    
+    def sync(self, on_status=None):
+        """委托 WikiAgent 执行深度同步"""
+        return self.wiki_agent.sync(on_status=on_status)
 
     def run(
         self,
@@ -55,7 +62,8 @@ class BuildAgent:
         history: list[tuple[str, str]] | None = None,
         on_step: Callable[[BuildStep], bool] | None = None,
         on_log: Callable[[str], None] | None = None,
-        mode: str = "plan"
+        mode: str = "plan",
+        should_stop: Callable[[], bool] | None = None
     ) -> str:
         """
         根据模式执行任务。
@@ -66,23 +74,39 @@ class BuildAgent:
             on_step: 步骤回调（Build 模式）
             on_log: 日志回调（WikiAgent 进度推送）
             mode: "plan" 或 "build"
+            should_stop: 可选的中断检查回调
         """
+        # [关键映射]：启动即推送，消除黑洞期
+        if on_step:
+            on_step(BuildStep(
+                thought=f"收到老板指令：'{user_query[:20]}...'，正在进入 {mode} 模式进行深度拆解和构思。",
+                action_type="thinking",
+                action_input="internal_brainstorm"
+            ))
+            
+        self.interrupt_signal = False # 重置中断信号
+
         # 1. 处理 @wikiagent
         wiki_context = ""
         clean_query = user_query
         if "@wikiagent" in user_query.lower():
             wiki_query, remaining = extract_wiki_query(user_query)
             if wiki_query:
-                if on_log:
-                    on_log(f"[系统] 正在调用 WikiAgent 检索: {wiki_query}")
-                wiki_context = self.wiki_agent.search(wiki_query, on_log=on_log)
+                # 调用新版 WikiFirstAgent
+                res = self.wiki_agent.run(
+                    wiki_query, 
+                    on_status=on_log, 
+                    on_step=on_step,
+                    response_mode="answer"
+                )
+                wiki_context = res.output
                 clean_query = remaining if remaining else wiki_query
 
         # 2. 分发到对应模式
         if mode == "plan":
-            return self._run_plan(clean_query, wiki_context, history)
+            return self._run_plan(clean_query, wiki_context, history, on_log, should_stop)
         else:
-            return self._run_build(clean_query, wiki_context, history, on_step, on_log)
+            return self._run_build(clean_query, wiki_context, history, on_step, on_log, should_stop)
 
     # ========================
     # Plan 模式：纯 LLM 对话
@@ -91,13 +115,19 @@ class BuildAgent:
         self,
         query: str,
         wiki_context: str,
-        history: list[tuple[str, str]] | None
+        history: list[tuple[str, str]] | None,
+        on_log: Callable[[str], None] | None = None,
+        should_stop: Callable[[], bool] | None = None
     ) -> str:
         """Plan 模式：直接与 LLM 对话"""
         system_prompt = (
             "你是 WikiCoder，一个高级技术顾问。\n"
-            "你擅长分析问题、制定方案、解读技术文档和回答技术咨询。\n"
-            "请用中文回答，保持专业且简洁。"
+            "你擅长分析问题、制定方案、解读技术文档和回答技术咨询。\n\n"
+            "【输出准则】：\n"
+            "1. 必须用中文回答，风格专业且有条理。\n"
+            "2. 如果提供了 [知识库参考资料]，你的回答必须基于该资料，禁止捏造。\n"
+            "3. **必须保留来源引用**：在每一段或每一条核心结论后，请保留或加上 [Source: 相对路径] 格式的来源标注。\n"
+            "4. 结构化输出：使用 Markdown 标题、列表、粗体等让内容一目了然。"
         )
 
         user_prompt = ""
@@ -113,7 +143,20 @@ class BuildAgent:
         user_prompt += f"用户问题: {query}"
 
         try:
-            return self.llm.generate(system_prompt, user_prompt)
+            full_resp = []
+            line_buffer = ""
+            for chunk in self.llm.generate_stream(system_prompt, user_prompt):
+                # 检查回调或内部信号
+                if self.interrupt_signal or (should_stop and should_stop()):
+                    full_resp.append("\n\n[任务已由用户手动终止]")
+                    break
+                
+                full_resp.append(chunk)
+                if on_log: on_log(chunk)
+            if on_log and line_buffer:
+                on_log(line_buffer)
+                
+            return "".join(full_resp)
         except Exception as e:
             return f"LLM 调用失败: {e}"
 
@@ -126,7 +169,8 @@ class BuildAgent:
         wiki_context: str,
         history: list[tuple[str, str]] | None,
         on_step: Callable[[BuildStep], bool] | None,
-        on_log: Callable[[str], None] | None
+        on_log: Callable[[str], None] | None,
+        should_stop: Callable[[], bool] | None = None
     ) -> str:
         """Build 模式：复刻 OpenCode 的 Agent Loop"""
         self._action_history_hashes = []
@@ -180,6 +224,9 @@ class BuildAgent:
             )
 
         for i in range(self.MAX_STEPS_BUILD):
+            # 检查回调或内部信号
+            if self.interrupt_signal or (should_stop and should_stop()):
+                return "任务已由用户手动终止"
             current_prompt = context
             current_prompt += f"\n\n=== 任务进度 ===\n"
             current_prompt += "\n".join([f"- {t}" for t in self.tasks]) if self.tasks else "(未规划)"
@@ -234,7 +281,7 @@ class BuildAgent:
                     real_context = self._execute("ls", ".")
                     step.observation = (
                         f"[系统强力警告] 检测到动作完全重复：{action_type}。\n"
-                        f"你正在陷入死循环！请立即停止重试刚才的操作。\n"
+                        f"你可能正在陷入死循环！请立即停止重试刚才的操作。\n"
                         f"【当前目录真实状态】:\n{real_context}\n"
                         "请重新审视路径和命令，尝试完全不同的方案（例如：如果启动失败，先查日志或看 package.json）。"
                     )
@@ -242,8 +289,18 @@ class BuildAgent:
                     self.steps.append(step)
                     if on_step and not on_step(step): break
                     continue # 强制重思考
-                elif repeat_count >= 2:
-                    return f"ERROR: 动作死循环（已重复3次：{action_type}）。Agent 无法自主破局，已中止。"
+                elif repeat_count == 2:
+                    step.observation = (
+                        f"[系统最后通牒] 这是该操作第 3 次重复：{action_type}。\n"
+                        "如果你继续重复，系统将为了保护资源强制中止任务。\n"
+                        "建议：换一个文件、换一个命令，或者先执行 ls -R 查看全局结构。"
+                    )
+                    self._action_history_hashes.append(action_hash)
+                    self.steps.append(step)
+                    if on_step and not on_step(step): break
+                    continue
+                elif repeat_count >= 3:
+                    return f"ERROR: 动作死循环（已重复 {repeat_count + 1} 次：{action_type}）。Agent 无法自主破局，已中止以保护资源。"
                 
                 self._action_history_hashes.append(action_hash)
 
@@ -265,7 +322,7 @@ class BuildAgent:
             except Exception as e:
                 return f"执行出错: {e}"
 
-        return "达到最大执行步数（30步），任务未完成。"
+        return f"达到最大执行步数（{self.MAX_STEPS_BUILD} 步），任务未完成。"
 
     # ========================
     # 工具执行引擎
@@ -293,9 +350,14 @@ class BuildAgent:
                 return self._exec_fetch(params)
             # 兼容旧版动作
             elif action_type == "shell":
-                return self._exec_bash({"command": action_input})
+                cmd_input = action_input
+                if isinstance(action_input, str) and action_input.startswith("{"):
+                    try:
+                        data = json.loads(action_input)
+                        cmd_input = data.get("command", action_input)
+                    except: pass
+                return self._exec_bash({"command": cmd_input})
             elif action_type == "wiki_search":
-                from src.skills.wiki_tools import wiki_search
                 try:
                     data = json.loads(action_input)
                     q = data.get("query", action_input)
@@ -584,97 +646,74 @@ class BuildAgent:
         if not text or not text.strip():
             return None
 
-        # 策略1: 直接 JSON 解析（最快路径）
-        try:
-            start = text.find('{')
-            end = text.rfind('}')
-            if start == -1 or end == -1:
-                return None
-            return json.loads(text[start:end+1])
-        except json.JSONDecodeError:
-            pass
+    def _parse_json_robustly(self, text: str) -> dict | None:
+        """极度强健的 JSON 提取器，应对各种 LLM 幻觉和截断"""
+        if not text or not text.strip(): return None
+        
+        # 尝试1: 标准代码块提取
+        json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+        if json_match:
+            try: return json.loads(json_match.group(1))
+            except: text = json_match.group(1) # 回退到提取后的文本继续解析
 
-        # 策略2: 修复物理换行后重试
-        try:
-            json_str = text[text.find('{'):text.rfind('}')+1]
-            def _fix_newlines(m):
-                content = m.group(2).replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-                return f'{m.group(1)}"{content}"{m.group(3)}'
-            fixed = re.sub(
-                r'(":\s*)"(.*?)"(\s*[,}])',
-                _fix_newlines, json_str, flags=re.DOTALL
-            )
-            return json.loads(fixed)
-        except (json.JSONDecodeError, Exception):
-            pass
-
-        # 策略3: 正则逐字段提取（最强容错）
-        res = {}
-
-        # 提取简单字符串字段
-        for key in ["action", "thought", "self_criticism"]:
-            # 贪婪匹配到下一个 "key": 或 } 之前
-            m = re.search(fr'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-            if m:
-                res[key] = m.group(1).replace('\\n', '\n').replace('\\t', '\t')
-
-        # 提取 input 字段（最复杂，可能包含嵌套 JSON 或大段文本）
-        # 尝试1: input 是一个 JSON 对象
-        inp_obj_m = re.search(r'"input"\s*:\s*(\{)', text)
-        if inp_obj_m:
-            # 手动匹配大括号配对
-            brace_start = inp_obj_m.start(1)
-            depth = 0
-            in_str = False
-            escape = False
-            brace_end = -1
-            for ci in range(brace_start, len(text)):
-                c = text[ci]
-                if escape:
-                    escape = False
-                    continue
-                if c == '\\':
-                    escape = True
-                    continue
-                if c == '"' and not escape:
-                    in_str = not in_str
-                    continue
-                if in_str:
-                    continue
-                if c == '{':
-                    depth += 1
-                elif c == '}':
-                    depth -= 1
-                    if depth == 0:
-                        brace_end = ci
-                        break
-            if brace_end > 0:
-                raw_input = text[brace_start:brace_end+1]
-                try:
-                    res["input"] = json.dumps(json.loads(raw_input), ensure_ascii=False)
+        # 尝试2: 寻找第一个 '{' 并进行智能括号匹配
+        start = text.find('{')
+        if start != -1:
+            depth = 0; in_str = False; escape = False; brace_end = -1
+            for i in range(start, len(text)):
+                c = text[i]
+                if escape: escape = False; continue
+                if c == '\\': escape = True; continue
+                if c == '"' and not escape: in_str = not in_str; continue
+                if not in_str:
+                    if c == '{': depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0: brace_end = i; break
+            
+            if brace_end != -1:
+                raw_json = text[start:brace_end+1]
+                try: return json.loads(raw_json)
                 except json.JSONDecodeError:
-                    # 尝试修复内部换行
-                    fixed_input = raw_input.replace('\n', '\\n').replace('\r', '\\r')
-                    try:
-                        res["input"] = json.dumps(json.loads(fixed_input), ensure_ascii=False)
-                    except json.JSONDecodeError:
-                        res["input"] = raw_input
+                    # 尝试修复内部换行和尾部逗号
+                    cleaned = re.sub(r',\s*\}', '}', raw_json)
+                    cleaned = re.sub(r'(":\s*)"(.*?)"(\s*[,}])', 
+                                   lambda m: f'{m.group(1)}"{m.group(2).replace("\n", "\\n")}"{m.group(3)}', 
+                                   cleaned, flags=re.DOTALL)
+                    try: return json.loads(cleaned)
+                    except: pass
 
-        # 尝试2: input 是纯字符串
-        if "input" not in res:
-            inp_str_m = re.search(r'"input"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
-            if inp_str_m:
-                res["input"] = inp_str_m.group(1).replace('\\n', '\n').replace('\\t', '\t')
-
-        # 尝试3: input 到文本末尾（最后手段）
-        if "input" not in res and "action" in res:
-            inp_last_m = re.search(r'"input"\s*:\s*"(.*)', text, re.DOTALL)
-            if inp_last_m:
-                raw = inp_last_m.group(1)
-                # 去掉尾部的 "} 和多余内容
-                raw = re.sub(r'"\s*\}\s*$', '', raw)
-                res["input"] = raw.replace('\\n', '\n')
-
+        # 尝试3: 启发式正则提取
+        res = {}
+        for key in ["action", "thought", "self_criticism"]:
+            m = re.search(fr'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+            if m: res[key] = m.group(1).replace('\\n', '\n')
+        
+        # 递归处理 input
+        inp_start = text.find('"input"')
+        if inp_start != -1:
+            colon_pos = text.find(':', inp_start)
+            if colon_pos != -1:
+                rem = text[colon_pos+1:].strip()
+                if rem.startswith('{'):
+                    d = 0; s = False; e = False; b_end = -1
+                    for i in range(len(rem)):
+                        c = rem[i]
+                        if e: e = False; continue
+                        if c == '\\': e = True; continue
+                        if c == '"' and not e: s = not s; continue
+                        if not s:
+                            if c == '{': d += 1
+                            elif c == '}':
+                                d -= 1
+                                if d == 0: b_end = i; break
+                    if b_end != -1:
+                        try: res["input"] = json.loads(rem[:b_end+1])
+                        except: res["input"] = rem[:b_end+1]
+                elif rem.startswith('"'):
+                    s_m = re.search(r'"((?:[^"\\]|\\.)*)"', rem)
+                    if s_m: res["input"] = s_m.group(1).replace('\\n', '\n')
+        
         # 提取任务列表
         tasks_m = re.search(r'"pending_tasks"\s*:\s*\[(.*?)\]', text, re.DOTALL)
         if tasks_m:
@@ -683,6 +722,6 @@ class BuildAgent:
             except json.JSONDecodeError:
                 # 简单提取引号内的字符串
                 res["pending_tasks"] = re.findall(r'"([^"]+)"', tasks_m.group(1))
-
+        
         return res if "action" in res else None
 

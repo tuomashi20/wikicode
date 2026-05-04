@@ -1,3 +1,6 @@
+"""
+wiki_tools.py - WikiCoder knowledge base utilities.
+"""
 from __future__ import annotations
 
 import json
@@ -28,6 +31,9 @@ def wiki_search_v2(
     results = []
     for r in rows:
         d = dict(r)
+        # 确保返回物理路径
+        if not d.get("rel_path"):
+            d["rel_path"] = d.get("parent_file", "")
         # 补全 breadcrumb 逻辑
         if not d.get("breadcrumb"):
             d["breadcrumb"] = f"{d.get('parent_file')} > {d.get('title')}"
@@ -37,11 +43,19 @@ def wiki_search_v2(
 
 def wiki_search(
     query: str,
-    limit: int = 5,
+    limit: int | None = None,
     llm: Any | None = None,
     skip_llm: bool = False
 ) -> str:
     """[Agent 专用版] 返回带路径背书的格式化字符串"""
+    if limit is None:
+        try:
+            from src.utils.config import load_config
+            cfg = load_config()
+            limit = cfg.wiki_strategy.agent_search_limit
+        except:
+            limit = 5
+
     results, _ = wiki_search_v2(query, limit=limit, llm=llm, skip_llm=skip_llm)
     if not results:
         return f"Wiki: 未找到关于 '{query}' 的匹配。建议使用 wiki_list 查看相关目录。"
@@ -49,8 +63,9 @@ def wiki_search(
     output = []
     for r in results:
         path = r.get("breadcrumb")
+        rel_path = r.get("rel_path") or r.get("parent_file")
         content = r.get("content_text") or ""
-        output.append(f"### [路径背书]: {path}\n{content[:2000]}")
+        output.append(f"### [路径背书]: {path}\n### [物理路径]: {rel_path}\n{content[:2000]}")
     
     return "\n\n---\n\n".join(output)
 
@@ -83,13 +98,47 @@ def wiki_read(rel_path: str) -> str:
     """[Agent 专用版] 通读规范文件"""
     from src.utils.config import load_config
     config = load_config()
-    p = Path(config.wiki_strategy.raw_path) / rel_path
+    raw_root = Path(config.wiki_strategy.raw_path)
+    p = raw_root / rel_path
+    
     if not p.exists():
-        return f"Error: 未找到文件 '{rel_path}'。"
+        # 路径容错逻辑：针对 Windows 环境下的编码乱码进行模糊匹配
+        parent_dir = raw_root / Path(rel_path).parent
+        if parent_dir.exists():
+            search_name = Path(rel_path).name.replace(" ", "")
+            # 尝试通过相似度或部分匹配找回文件
+            for entry in parent_dir.iterdir():
+                if entry.is_file() and (search_name in entry.name or entry.name in search_name):
+                    p = entry
+                    break
+        
+    if not p.exists():
+        return f"Error: 未找到文件 '{rel_path}'。请确认路径编码是否正确。"
         
     try:
-        content = p.read_text(encoding="utf-8", errors="ignore")
-        return f"--- 文件内容预览: {rel_path} ---\n{content[:10000]}"
+        # 工业级编码探测：按优先级尝试所有可能的编码
+        encodings = ["utf-8-sig", "utf-8", "gb18030", "gbk", "utf-16", "utf-16-le", "utf-16-be", "latin-1"]
+        content = None
+        
+        # 读取原始字节流进行分析
+        raw_bytes = p.read_bytes()
+        if not raw_bytes:
+            return f"--- 文件内容预览: {rel_path} ---\n(空文件)"
+
+        for enc in encodings:
+            try:
+                content = raw_bytes.decode(enc)
+                # 检查是否包含明显的乱码特征（如大量的 ）
+                if content.count('\ufffd') > len(content) * 0.05:
+                    continue
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        
+        if content is None:
+            content = raw_bytes.decode("utf-8", errors="ignore")
+            
+        return f"--- 文件内容预览: {rel_path} ---\n{content[:15000]}"
     except Exception as e:
         return f"Error reading file: {str(e)}"
 

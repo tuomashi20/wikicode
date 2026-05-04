@@ -1,0 +1,618 @@
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Literal, Any
+
+from src.core.llm_client import LLMClient
+from src.core.query_rewriter import QueryRewrite, load_business_terms
+from src.skills.wiki_tools import wiki_read_chunk, wiki_search_v2
+from src.utils.config import AppConfig
+from src.utils.logger import get_file_logger
+from src.core.graph_agent import GraphAgent
+
+
+ResponseMode = Literal["answer", "patch"]
+SessionMode = Literal["plan"]
+
+
+@dataclass
+class AgentResponse:
+    thought: str
+    actions: list[str]
+    output: str
+
+@dataclass
+class WikiStep:
+    thought: str
+    action_type: str
+    action_input: str
+    tasks: list[str] = field(default_factory=list)
+
+
+class WikiFirstAgent:
+    """Wiki-first ReAct: search wiki first, fallback to general model when no reliable hit."""
+
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.logger = get_file_logger("session", "session.log")
+        self.llm = LLMClient(config.llm)
+        self.core_keywords = load_business_terms(config.wiki_strategy.business_terms_path)
+        # 实例化逻辑官
+        try:
+            self.graph_agent = GraphAgent()
+        except:
+            self.graph_agent = None
+        self._stop_requested = False
+
+    def run(
+        self,
+        user_input: str,
+        force_wiki: bool = False,
+        mode: SessionMode = "plan",
+        code_context: str = "",
+        response_mode: ResponseMode = "answer",
+        target_file: str = "",
+        history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
+        on_step: Callable[[Any], bool] | None = None,
+    ) -> AgentResponse:
+        actions: list[str] = []
+        query = user_input.strip()
+
+        def _act(msg: str) -> None:
+            actions.append(msg)
+            if on_status is not None:
+                on_status(msg)
+            if on_step is not None:
+                # 使用本地定义的 WikiStep
+                act_type = msg.split('(')[0] if '(' in msg else "info"
+                on_step(WikiStep(thought="", action_type=act_type, action_input=msg))
+
+        if not query and not force_wiki:
+            return AgentResponse(thought="empty-input", actions=actions, output="Please enter a question.")
+
+        # Plan 模式统一走 Wiki-first 逻辑
+        thought = "Plan-mode: architecture and task breakdown."
+        if on_status is not None:
+            on_status("Plan mode: analyzing requirements")
+
+        ws = self.config.wiki_strategy
+        results, rw = (
+            wiki_search_v2(
+                query, 
+                limit=8, 
+                synonyms_path=ws.synonyms_path,
+                business_terms_path=ws.business_terms_path,
+                llm=self.llm,
+                fanout_limit=ws.rag_retrieval_fanout,
+                rewrite_priority=ws.rag_rewrite_priority
+            ) if query else ([], None)
+        )
+        if rw is not None:
+            _act(f"query_rewrite(keywords={rw.keywords[:6]}, expanded={rw.expanded_terms[:6]})")
+        _act(f"wiki_search_v2(query={query!r}) -> {len(results)}")
+
+        terms = self._build_query_terms(query, rw)
+        reliable = self._filter_reliable_results(results, terms, self.core_keywords, query)
+        
+        if results and not reliable:
+            _act("wiki_relevance_filter: drop_all_low_relevance")
+        elif reliable and len(reliable) < len(results):
+            # 强化检查：如果 Top 3 没有核心词，尝试在全集里打捞
+            import re
+            # 增强型提取：不仅提取单词，还提取连续的中文片段
+            keywords = [k for k in re.split(r'[^a-zA-Z\u4e00-\u9fa5]+', query.lower()) if len(k) > 1]
+            # 尝试进一步切分长难词
+            extended = []
+            for kw in keywords:
+                if len(kw) > 4:
+                    # 暴力切分，增加召回率
+                    extended.extend([kw[i:i+2] for i in range(len(kw)-1)])
+            
+            query_core = [k for k in self.core_keywords if k.lower() in query.lower()]
+            if query_core and not any(any(k.lower() in r.get("title", "").lower() for k in query_core) for r in reliable[:2]):
+                reordered = self._rerank_by_business_core(results, query_core)
+                if reordered and reordered[0]["chunk_id"] != reliable[0]["chunk_id"]:
+                    reliable = reordered
+                    _act(f"wiki_rerank: promote_business_core_match(found={len(reordered)})")
+            
+            _act(f"wiki_relevance_filter: keep={len(reliable)}/{len(results)}")
+
+        if reliable:
+            reasons = [str(r.get("_hit_reason", "")) for r in reliable[:3]]
+            _act(f"wiki_hit_reason(top3={reasons})")
+
+        chunks: list[dict[str, str]] = []
+        for r in reliable[:3]:
+            content = wiki_read_chunk(r["chunk_id"])
+            _act(f"wiki_read_chunk(chunk_id={r['chunk_id']})")
+            
+            # --- [优化] 双链感知：提取 [[链接]] 并拉取摘要 ---
+            linked_ctx = self._fetch_linked_context(content)
+            if linked_ctx:
+                content = f"{content}\n\n[相关参考背景]:\n{linked_ctx}"
+                _act(f"wiki_link_percept: followed_links_in_chunk({r['chunk_id']})")
+
+            chunks.append(
+                {
+                    "chunk_id": str(r["chunk_id"]),
+                    "title": str(r["title"]),
+                    "parent_file": str(r["parent_file"]),
+                    "content": content,
+                }
+            )
+
+        # --- [集成] 逻辑推理感知：请教 @graphagent ---
+        graph_context = ""
+        if self.graph_agent:
+            try:
+                # 显式发送一个步骤给 UI
+                if on_status: on_status("正在扫描业务逻辑图谱...")
+                
+                graph_context = self.graph_agent.reasoning(query)
+                if graph_context:
+                    _act("graph_reasoning(subgraph_path_found=True)")
+            except Exception as ge:
+                if on_status: on_status(f"图谱推理跳过: {str(ge)}")
+            # 即使没搜到 Wiki，也要尝试把图谱逻辑带入
+            output = self._general_chat(
+                query=query + graph_context, # 注入图谱背景
+                actions=actions,
+                code_context=code_context,
+                response_mode=response_mode,
+                target_file=target_file,
+                history=history,
+                on_token=on_token,
+                on_status=on_status,
+            )
+            output = self._general_chat(
+                query=query,
+                actions=actions,
+                code_context=code_context,
+                response_mode=response_mode,
+                target_file=target_file,
+                history=history,
+                on_token=on_token,
+                on_status=on_status,
+            )
+            if rw is not None and rw.suggest_terms:
+                output += "\n\nSuggested keywords: " + ", ".join(rw.suggest_terms[:6])
+            self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
+            return AgentResponse(thought=thought + " (fallback-general)", actions=actions, output=output)
+
+        output = self._wiki_grounded_chat(
+            query=query + graph_context, # 注入图谱背景
+            chunks=chunks,
+            actions=actions,
+            code_context=code_context,
+            response_mode=response_mode,
+            target_file=target_file,
+            history=history,
+            on_token=on_token,
+            on_status=on_status,
+        )
+        self.logger.info("thought=%s | actions=%s | output_len=%s", thought, actions, len(output))
+        return AgentResponse(thought=thought, actions=actions, output=output)
+
+    @staticmethod
+    def _build_query_terms(query: str, rw) -> list[str]:
+        raw_terms: list[str] = []
+        if rw is not None:
+            raw_terms.extend([str(x) for x in rw.expanded_terms])
+            raw_terms.extend([str(x) for x in rw.keywords])
+        raw_terms.append(query)
+
+        out: list[str] = []
+        seen: set[str] = set()
+        for t in raw_terms:
+            parts = re.split(r"[\s,.;:!?()\[\]{}<>\"'`]+", t.strip().lower())
+            for part in parts:
+                if not part or len(part) < 2:
+                    continue
+                if part in seen:
+                    continue
+                seen.add(part)
+                out.append(part)
+        return out[:16]
+
+    def _filter_reliable_results(
+        self, 
+        results: list[dict], 
+        terms: list[str], 
+        core_keywords: list[str] | None = None,
+        query: str = ""
+    ) -> list[dict]:
+        """
+        [业务核心逻辑]：高召回模式。
+        仅执行路径黑名单过滤，不再进行繁琐的相似度计算，确保 AI 能获得最全面的参考资料。
+        """
+        if not results:
+            return []
+
+        reliable: list[dict] = []
+        for r in results:
+            parent_file = str(r.get("parent_file", "")).lower()
+            # 仅物理路径过滤：排除 Demo、历史会话和草稿
+            if any(k in parent_file for k in ["/knowledge/", "knowledge\\", "chat_archive", "draft_"]):
+                continue
+            if hit_count == 1:
+                single = next((t for t in terms if t in text), "")
+                # 业务核心词即便只中一个也是可靠的
+                if len(single) >= 3 or any(single in k for k in cores):
+                    reliable.append(r)
+        
+        # 重新按分数排序（数据库基础分 + Agent 加权分）
+        reliable.sort(key=lambda x: float(x.get("_score", 0)), reverse=True)
+        return reliable
+
+    def _rerank_by_business_core(self, results: list[dict], query_cores: list[str]) -> list[dict]:
+        """将包含业务核心词的文档强制置顶。"""
+        if not query_cores:
+            return results
+        
+        with_core = []
+        others = []
+        for r in results:
+            text = f"{r.get('title','')} {r.get('content_text','')}".lower()
+            if any(k.lower() in text for k in query_cores):
+                with_core.append(r)
+            else:
+                others.append(r)
+        
+        return with_core + others
+
+    @staticmethod
+    def _is_code_query(query: str, code_context: str = "") -> bool:
+        q = (query or "").lower()
+        keys = [
+            "python", "脚本", "代码", "debug", "报错", "异常", "修复", "bug", ".py", "自动化", "合并"
+        ]
+        return bool(code_context.strip()) or any(k in q for k in keys)
+
+    def _wiki_grounded_chat(
+        self,
+        query: str,
+        chunks: list[dict[str, str]],
+        actions: list[str],
+        code_context: str = "",
+        response_mode: ResponseMode = "answer",
+        target_file: str = "",
+        history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
+    ) -> str:
+        context_blocks = []
+        ws = self.config.wiki_strategy
+        for idx, c in enumerate(chunks, start=1):
+            context_blocks.append(
+                f"[CHUNK {idx}]\n"
+                f"id: {c['chunk_id']}\n"
+                f"title: {c['title']}\n"
+                f"source: {c['parent_file']}\n"
+                f"content:\n{c['content'][:ws.rag_context_max_chars]}"
+            )
+
+        style = ws.style_guidelines or {}
+        style_text = ", ".join(f"{k}={v}" for k, v in style.items()) if style else "none"
+        history_block = self._format_history_block(history)
+
+        if response_mode == "patch":
+            system_prompt = (
+                "You are a senior code review assistant. Prioritize provided wiki policy. "
+                "Output MUST use SEARCH/REPLACE block format as shown below. "
+                "Do not explain. If no change is needed, output NO_CHANGES.\n\n"
+                "=== OUTPUT FORMAT (required) ===\n"
+                "For EACH change, output a block like:\n\n"
+                "<<<< SEARCH\n"
+                "exact lines to find in the original file\n"
+                "====\n"
+                "replacement lines\n"
+                ">>>> REPLACE\n\n"
+                "=== EXAMPLE ===\n\n"
+                "<<<< SEARCH\n"
+                "def old_func():\n"
+                "    return 1\n"
+                "====\n"
+                "def old_func():\n"
+                "    return 2\n"
+                ">>>> REPLACE\n\n"
+                "IMPORTANT: The SEARCH block must exactly match existing code. "
+                "Include enough context lines for unique matching. "
+                "You may output multiple SEARCH/REPLACE blocks for multiple changes."
+            )
+            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:12000]}" if code_context else ""
+            user_prompt = (
+                f"Requirement: {query}\n\n"
+                "Wiki policy:\n"
+                + "\n\n".join(context_blocks)
+                + history_block
+                + code_part
+                + "\n\nReturn SEARCH/REPLACE blocks only."
+            )
+        else:
+            system_prompt = (
+                "你是 WikiCoder 专家模型，当前处于 Plan (规划模式)。"
+                "你的目标是基于用户问题，结合本地知识库(Wiki)和业务逻辑图谱提供专业的深度方案。"
+                "【严格禁令】：如果 Wiki 规范中未提及相关信息，你必须明确告知用户‘在本地知识库中未找到相关规则’，禁止提供非项目相关的通用方案（如通用的安装费范围等）。"
+                "如果 Wiki 规范与通用实践冲突，以 Wiki 为准。\n\n"
+                "=== 输出格式要求 ===\n"
+                "你必须严格按照以下结构输出 Markdown：\n"
+                "## 💡 解决方案\n"
+                "[详细的技术方案描述，需结合项目规范和最佳实践]\n\n"
+                "## 📋 任务清单\n"
+                "- [ ] 步骤 1: ...\n"
+                "- [ ] 步骤 2: ...\n\n"
+                "注意：在此模式下，你只需提供规划，不要尝试执行任何具体命令。\n\n"
+                f"Style constraints: {style_text}."
+            )
+            code_part = f"\n\nCurrent code context:\n{code_context[:8000]}" if code_context else ""
+            user_prompt = (
+                f"User question:\n{query}\n\n"
+                "Relevant wiki snippets:\n"
+                + "\n\n".join(context_blocks)
+                + history_block
+                + code_part
+                + "\n\nAnswer based on policy and cite evidence with [1]/[2]/[3] when possible."
+            )
+
+        try:
+            if on_status is not None:
+                on_status("llm_generate: wiki-grounded started")
+            parts: list[str] = []
+            for tok in self.llm.generate_stream(system_prompt=system_prompt, user_prompt=user_prompt):
+                if getattr(self, '_stop_requested', False):
+                    raise InterruptedError("Stopped by user")
+                if not tok:
+                    continue
+                parts.append(tok)
+                if on_token is not None:
+                    on_token(tok)
+            llm_text = "".join(parts).strip()
+            if not llm_text:
+                llm_text = self.llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+            actions.append(
+                f"llm_generate(provider={self.config.llm.provider}, model={self.config.llm.model}, mode=wiki:{response_mode})"
+            )
+            if on_status is not None:
+                on_status("llm_generate: wiki-grounded completed")
+            output = llm_text or "LLM returned empty output."
+            if response_mode == "answer":
+                output2 = self._ensure_citations(output, chunks)
+                if on_token is not None and output2.startswith(output):
+                    tail = output2[len(output):]
+                    if tail:
+                        on_token(tail)
+                output = output2
+            return output
+        except Exception as e:
+            actions.append(f"llm_generate(failed, mode=wiki:{response_mode})")
+            if on_status is not None:
+                on_status(f"llm_generate: failed ({e})")
+            snippet_text = "\n".join([f"- {c['title']} ({c['parent_file']})" for c in chunks])
+            return (
+                f"LLM call failed: {e}\n\n"
+                f"Retrieved wiki snippets:\n{snippet_text}\n\n"
+                "Please verify llm.provider / api_key configuration."
+            )
+
+    def _general_chat(
+        self,
+        query: str,
+        actions: list[str],
+        code_context: str = "",
+        response_mode: ResponseMode = "answer",
+        target_file: str = "",
+        history: list[tuple[str, str]] | None = None,
+        on_token: Callable[[str], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
+    ) -> str:
+        history_block = self._format_history_block(history)
+
+        if response_mode == "patch":
+            system_prompt = (
+                "You are a senior code assistant. No wiki policy matched. "
+                "Output MUST use SEARCH/REPLACE block format. "
+                "No explanation. If no change is needed, output NO_CHANGES.\n\n"
+                "=== OUTPUT FORMAT (required) ===\n"
+                "For EACH change, output a block like:\n\n"
+                "<<<< SEARCH\n"
+                "exact lines to find in the original file\n"
+                "====\n"
+                "replacement lines\n"
+                ">>>> REPLACE\n\n"
+                "IMPORTANT: The SEARCH block must exactly match existing code. "
+                "Include enough context lines for unique matching."
+            )
+            code_part = f"\n\nTarget file: {target_file}\nCode:\n{code_context[:12000]}" if code_context else ""
+            user_prompt = f"Requirement:\n{query}{history_block}{code_part}\n\nReturn SEARCH/REPLACE blocks only."
+        else:
+            if self._is_code_query(query, code_context):
+                system_prompt = (
+                    "You are a practical coding assistant. "
+                    "Prioritize directly usable code and executable steps. "
+                    "When fixing issues, explain root cause briefly, then provide corrected code. "
+                    "Do not add unnecessary theory."
+                )
+            else:
+                system_prompt = (
+                    "你是 WikiCoder 架构师，当前处于 Plan (规划模式)。"
+                    "未发现匹配的本地 Wiki 知识，请基于通用技术能力为用户提供方案。"
+                    "输出必须包含 ## 💡 解决方案 和 ## 📋 任务清单 结构。"
+                )
+            code_part = f"\n\nCurrent code context:\n{code_context[:8000]}" if code_context else ""
+            user_prompt = f"User question:\n{query}{history_block}{code_part}"
+
+        try:
+            if on_status is not None:
+                on_status("llm_generate: general started")
+            parts: list[str] = []
+            for tok in self.llm.generate_stream(system_prompt=system_prompt, user_prompt=user_prompt):
+                if not tok:
+                    continue
+                parts.append(tok)
+                if on_token is not None:
+                    on_token(tok)
+            llm_text = "".join(parts).strip()
+            if not llm_text:
+                llm_text = self.llm.generate(system_prompt=system_prompt, user_prompt=user_prompt)
+            actions.append(
+                f"llm_generate(provider={self.config.llm.provider}, model={self.config.llm.model}, mode=general:{response_mode})"
+            )
+            if on_status is not None:
+                on_status("llm_generate: general completed")
+            return llm_text or "LLM returned empty output."
+        except Exception as e:
+            actions.append(f"llm_generate(failed, mode=general:{response_mode})")
+            if on_status is not None:
+                on_status(f"llm_generate: failed ({e})")
+            return f"Wiki miss and general LLM call failed: {e}\nPlease verify llm.api_key / provider config."
+
+    def _fetch_linked_context(self, content: str) -> str:
+        """[双链感知]：解析内容中的 [[Link]] 语法并抓取相关摘要。"""
+        links = re.findall(r"\[\[(.+?)\]\]", content)
+        if not links:
+            return ""
+        
+        linked_info = []
+        seen = set()
+        for link in links[:self.config.wiki_strategy.rag_link_follow_limit]: 
+            title = link.strip()
+            if not title or title in seen:
+                continue
+            seen.add(title)
+            
+            res, _ = wiki_search_v2(title, limit=1)
+            if res:
+                rel_content = wiki_read_chunk(res[0]["chunk_id"])
+                if rel_content:
+                    snippet = rel_content[:300].strip() + "..."
+                    linked_info.append(f"《{title}》相关说明：\n{snippet}")
+        
+        return "\n".join(linked_info) if linked_info else ""
+
+    @staticmethod
+    def _format_history_block(history: list[tuple[str, str]] | None, max_turns: int = 8, max_chars: int = 4800) -> str:
+        if not history:
+            return ""
+        turns = history[-max_turns:]
+        lines = ["\n\nRecent conversation context:"]
+        for idx, (q, a) in enumerate(turns, start=1):
+            q1 = (q or "").strip()
+            a1 = (a or "").strip()
+            if len(a1) > 600:
+                a1 = a1[:600] + "..."
+            lines.append(f"\n[{idx}] user: {q1}")
+            lines.append(f"[{idx}] assistant: {a1}")
+        out = "\n".join(lines)
+        if len(out) > max_chars:
+            out = out[-max_chars:]
+        return out
+
+    @staticmethod
+    def _render_citations(chunks: list[dict[str, str]]) -> str:
+        lines = ["References:"]
+        for i, c in enumerate(chunks[:3], start=1):
+            line_range = WikiFirstAgent._chunk_local_line_range(c.get("content", ""))
+            snippet = WikiFirstAgent._evidence_snippet(c.get("content", ""))
+            anchor = f"chunk://{c['chunk_id']}#L{line_range}"
+            lines.append(
+                f"- [{i}] {c['title']} | source={c['parent_file']} | chunk_id={c['chunk_id']} | anchor={anchor}"
+            )
+            if snippet:
+                lines.append(f"  snippet: {snippet}")
+        return "\n".join(lines)
+
+    def _ensure_citations(self, answer: str, chunks: list[dict[str, str]]) -> str:
+        if not chunks:
+            return answer
+        citations = self._render_citations(chunks)
+        if "References:" in answer or "参考片段" in answer:
+            return answer
+        out = answer.rstrip()
+        if "[1]" not in out and "[2]" not in out and "[3]" not in out:
+            out = self._auto_attach_citation_markers(out, chunks)
+            out += "\n\n(Evidence markers: [1]/[2]/[3] correspond to References below.)"
+        return out + "\n\n" + citations
+
+    @staticmethod
+    def _auto_attach_citation_markers(answer: str, chunks: list[dict[str, str]]) -> str:
+        # 1. 寻找关键词命中的节点 (子串模糊匹配)
+
+        lines = answer.splitlines()
+        out: list[str] = []
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                out.append(ln)
+                continue
+            if not WikiFirstAgent._should_cite_line(s):
+                out.append(ln)
+                continue
+            idx = WikiFirstAgent._best_chunk_index(s, chunks)
+            if idx > 0 and f"[{idx}]" not in s:
+                out.append(f"{ln} [{idx}]")
+            else:
+                out.append(ln)
+        return "\n".join(out)
+
+    @staticmethod
+    def _should_cite_line(text: str) -> bool:
+        s = text.strip()
+        if len(s) < 12:
+            return False
+        if s.startswith(("#", "---", "```")):
+            return False
+        if s.lower().startswith(("summary", "结论", "建议", "tips", "注意")) and len(s) < 24:
+            return False
+        if "?" in s or "？" in s:
+            return False
+        has_en = bool(re.search(r"[a-zA-Z]{3,}", s))
+        has_cjk = bool(re.search(r"[\u4e00-\u9fff]{4,}", s))
+        has_num = bool(re.search(r"\d", s))
+        return has_en or has_cjk or has_num
+
+    @staticmethod
+    def _best_chunk_index(text: str, chunks: list[dict[str, str]]) -> int:
+        q_terms = WikiFirstAgent._lex_terms(text)
+        if not q_terms:
+            return 0
+        best_idx = 0
+        best_score = 0
+        for i, c in enumerate(chunks[:3], start=1):
+            c_terms = WikiFirstAgent._lex_terms(
+                f"{c.get('title', '')} {c.get('parent_file', '')} {c.get('content', '')[:800]}"
+            )
+            if not c_terms:
+                continue
+            score = len(q_terms & c_terms)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        return best_idx if best_score > 0 else 0
+
+    @staticmethod
+    def _lex_terms(text: str) -> set[str]:
+        t = text.lower()
+        terms = set(re.findall(r"[a-z0-9_]{2,}", t))
+        cjk = "".join(re.findall(r"[一-鿿]+", text))
+        for i in range(0, max(0, len(cjk) - 1)):
+            terms.add(cjk[i : i + 2])
+        return {x for x in terms if x}
+
+    @staticmethod
+    def _chunk_local_line_range(content: str) -> str:
+        lines = content.splitlines()
+        if not lines:
+            return "1-1"
+        return f"1-{len(lines)}"
+
+    @staticmethod
+    def _evidence_snippet(content: str, max_len: int = 140) -> str:
+        lines = [x.strip() for x in content.splitlines() if x.strip()]
+        body = " ".join(lines[1:] if len(lines) > 1 else lines)
+        if not body:
+            return ""
+        return body if len(body) <= max_len else (body[:max_len].rstrip() + "...")

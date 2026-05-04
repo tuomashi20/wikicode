@@ -197,37 +197,26 @@ class LLMClient:
     def _call_jiutian_chat_stream(self, system_prompt: str, user_prompt: str) -> Iterator[str]:
         if not self.config.api_key:
             raise RuntimeError("Missing Jiutian API key. Set llm.api_key or JIUTIAN_API_KEY.")
-        try:
-            from openai import OpenAI  # type: ignore
-
-            client = OpenAI(
-                base_url=self._jiutian_base_url(),
-                api_key=self.config.api_key,
-            )
-            stream = client.chat.completions.create(
-                model=self.config.model or "jiutian-think-v3",
-                temperature=self.config.temperature,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                stream=True,
-            )
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                piece = ""
-                if hasattr(delta, "content") and delta.content:
-                    piece = str(delta.content)
-                if piece:
-                    yield piece
-            return
-        except Exception:
-            # fallback to one-shot request
-            text = self._call_jiutian_chat(system_prompt, user_prompt)
-            if text:
-                yield text
+        from openai import OpenAI
+        client = OpenAI(
+            base_url=self._jiutian_base_url(),
+            api_key=self.config.api_key,
+        )
+        stream = client.chat.completions.create(
+            model=self.config.model or "jiutian-lan-comv3",
+            temperature=self.config.temperature,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=True,
+        )
+        for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if hasattr(delta, "content") and delta.content:
+                yield str(delta.content)
 
     def _call_google(self, system_prompt: str, user_prompt: str) -> str:
         if not self.config.api_key:
