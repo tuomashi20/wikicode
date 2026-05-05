@@ -27,6 +27,13 @@ if (!(Get-Command uv -ErrorAction SilentlyContinue)) {
     exit
 }
 
+# 1.5 Clean up potential global installations to avoid path conflicts
+Write-Host "[WikiCoder] Cleaning up potential global conflicts..." -ForegroundColor Cyan
+& uv pip uninstall wikicoder --quiet 2>$null
+if (Get-Command pip -ErrorAction SilentlyContinue) {
+    & pip uninstall wikicoder -y --quiet 2>$null
+}
+
 # 2. Sync Environment
 Write-Host "[WikiCoder] Syncing Python environment and deps..." -ForegroundColor Cyan
 & uv sync

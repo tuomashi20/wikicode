@@ -1,112 +1,83 @@
-llm:
-  provider: "jiutian"
-  model: "jiutian-think-v3"
-  api_key: "YOUR_JIUTIAN_API_KEY"
-  base_url: null
-  image_asset_host: "https://jiutian.10086.cn"
-  image_understand_model: null
-  image_generate_model: null
-  image_understand_url: null
-  image_generate_url: null
-  temperature: 0.2
-  timeout_seconds: 120
+# ==========================================================
+# WikiCoder 示例配置文件 (Standard Example v3.6)
+# ==========================================================
 
+# ----------------------------------------------------------
+# [LLM 核心配置]
+# ----------------------------------------------------------
+llm:
+  provider: "jiutian"              # 模型提供商
+  model: "jiutian-lan-comv3"       # 主对话模型
+  api_key: "YOUR_API_KEY_HERE"     # 在此填入你的 API Key
+  base_url: null                   # 自定义 API 基准地址
+  
+  image_understand_model: null
+  image_generate_model: "cntxt2image"
+  image_understand_url: null
+  image_generate_url: "https://jiutian.10086.cn/largemodel/moma/api/v3/images/generations"
+  
+  temperature: 0.2                 # 生成温度 (0.0-1.0)
+  timeout_seconds: 120             # 响应超时 (秒)
+
+# ----------------------------------------------------------
+# [Wiki 路径与分类]
+# ----------------------------------------------------------
 wiki_strategy:
-  # 推荐：统一设置 vault_path，程序会自动派生 raw/wiki/wiki_processed
-  vault_path: "./wiki-vault"
+  vault_path: "./data/vault"       # 知识库根目录
   raw_dir: "raw"
   wiki_dir: "wiki"
   processed_dir: "wiki_processed"
-
-  # raw 下自动创建的子目录（可按团队业务调整）
-  raw_subdirs: ["终端", "运维", "随笔", "邮件", "技术", "生活", "项目", "学习", "笔记"]
-
-  # wiki 下自动创建的知识维度目录
+  
+  # 目录扫描范围
+  raw_subdirs: ["终端", "运维", "技术", "项目", "学习"]
   wiki_subdirs: ["entities", "concepts", "comparisons", "queries"]
-
-  # 可选：将 raw 一级目录映射到 wiki 分类目录
+  
   raw_to_wiki_map:
-    "终端": "entities"
-    "技术": "concepts"
-    "项目": "comparisons"
-    "学习": "queries"
-
+    终端: entities
+    技术: concepts
+    项目: comparisons
+    学习: queries
+    
   wiki_compile_on_sync: true
-
-  # 如需手动覆盖可显式设置以下路径（通常不需要）
-  # raw_path: "./data/raw"
-  # wiki_path: "./data/wiki"
-  # processed_path: "./data/wiki_processed"
-
   synonyms_path: "./data/dictionaries/synonyms_zh.yaml"
   split_mode: "heading"
   heading_level: 2
-  style_guidelines:
-    priority: ["MUST", "REQUIRED"]
-    language: "Chinese"
 
-  # 分类与标签规则（建议在这里维护，不要改代码）
+  # --------------------------------------------------------
+  # [RAG 检索规则：业务核心逻辑]
+  # --------------------------------------------------------
   rules:
-    concept_cues: ["定义", "术语", "是指", "指的是", "本办法所称", "本规范所称", "含义", "定义为"]
-    comparison_hints: ["对比", "比较", "差异", "区别", "优缺点", "选型", "vs"]
-    entity_org_suffixes: ["公司", "集团", "部门", "中心", "分公司", "委员会", "办公室", "项目组"]
-    entity_type_hints: ["系统", "平台", "终端", "设备", "岗位", "角色", "单位", "组织"]
-    entity_exclude_terms: ["管理办法", "规范", "细则", "标准", "目录", "附件", "附录"]
+    # 语义识别辅助
+    concept_cues: ["定义", "术语", "是指", "指的是", "含义", "定义为"]
+    comparison_hints: ["对比", "比较", "差异", "区别", "优缺点", "vs"]
+    entity_org_suffixes: ["公司", "集团", "部门", "中心", "分公司"]
+    entity_type_hints: ["系统", "平台", "终端", "设备", "岗位"]
+    entity_exclude_terms: ["管理办法", "规范", "细则", "标准", "目录"]
     entity_content_cues: ["责任主体", "执行主体", "适用对象", "维护对象"]
-    entity_ignore_terms: ["甲方", "乙方", "双方", "本办法", "本规范", "本细则", "本制度"]
-    entity_card_min_mentions: 2
-    entity_card_max_pages: 200
-    entity_card_name_max_len: 40
-    chapter_title_patterns:
-      - "第[一二三四五六七八九十百千0-9]+(章|节|部分)"
-      - "[一二三四五六七八九十]+、.+"
+    
+    # 章节与标签控制
+    chapter_title_patterns: ["第[一二三四五六七八九十百千0-9]+(章|节|部分)", "[一二三四五六七八九十]+、.+"]
     chapter_exact_terms: ["目录", "附件", "附录", "总则"]
-    tag_stopwords:
-      - "相关"
-      - "以及"
-      - "如何"
-      - "进行"
-      - "为了"
-      - "可以"
-      - "需要"
-      - "管理"
-      - "规范"
-      - "要求"
-      - "流程"
-      - "标准"
-      - "办法"
-      - "说明"
-      - "附件"
-      - "目录"
-      - "内容"
-      - "部分"
-      - "有关"
-      - "根据"
-      - "通过"
-      - "关于"
-      - "sheet1"
-      - "unnamed"
-      - "附录"
-      - "总则"
-      - "备注"
-      - "类型"
-      - "项目"
-      - "制度基础信息表"
-    tag_block_patterns:
-      - "第[一二三四五六七八九十百千0-9]+(章|节|部分)"
-      - "[一二三四五六七八九十]+、.+"
-      - "sheet\\d+"
-      - "chapter\\d+"
-    tag_block_prefixes: ["sheet", "chapter"]
     tag_min_len: 2
     tag_max_len: 20
+    tag_stopwords: ["相关", "以及", "如何", "进行", "为了", "可以", "管理"]
+    tag_block_patterns: ["第[一二三四五六七八九十百千0-9]+(章|节|部分)", "sheet\\d+", "chapter\\d+"]
+    tag_block_prefixes: ["sheet", "chapter"]
 
-    # --- RAG 检索与重写策略 (业务逻辑参数化) ---
-    rag_retrieval_fanout: 12           # 检索初筛的关键词名额 (建议 12-16)
-    rag_rewrite_priority: "append"     # 重写词优先级 (append:核心词优先, prepend:LLM扩展优先)
-    rag_core_boost_score: 1000.0       # 核心业务词命中时的额外加权分
-    rag_link_follow_limit: 3           # 双链联动感知深度 (0则关闭)
-    rag_context_max_chars: 2400        # 每个 Chunk 注入 Prompt 的最大长度限制
+    # 检索算法与重写策略
+    rag_retrieval_fanout: 12           # 检索初筛名额
+    rag_rewrite_priority: "append"     # 重写优先级
+    rag_core_boost_score: 1000.0       # 核心词加权
+    rag_link_follow_limit: 3           # 联动感知深度
+    rag_context_max_chars: 2400        # Chunk 最大注入字数
 
+    # 业务专项加权 (降维打击项)
+    rag_filename_boost_terms: ["纪要", "通知", "最新", "补充", "进一步", "结算", "标准"]
+    rag_filename_boost_score: 500.0    # 文件名命中分
+    agent_search_limit: 8              # 检索召回深度
+
+# ----------------------------------------------------------
+# [系统同步设置]
+# ----------------------------------------------------------
 sync:
-  auto_on_startup: true
+  auto_on_startup: true            # 启动自增量同步

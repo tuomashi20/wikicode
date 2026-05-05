@@ -7,10 +7,12 @@ import os
 import sys
 import re
 import json
+import json
 import glob as glob_module
 import platform
 import subprocess
 import base64
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Callable, Optional
@@ -22,6 +24,7 @@ from src.core.llm_client import LLMClient
 from src.core.agent import WikiFirstAgent
 from src.core.wiki_agent import extract_wiki_query
 from src.utils.config import AppConfig
+from src.core.mcp_client import GBrainMCPClient
 from src.skills.wiki_tools import wiki_search
 
 
@@ -50,7 +53,12 @@ class BuildAgent:
         self.steps: list[BuildStep] = []
         self.tasks: list[str] = []
         self._action_history_hashes: list[str] = []
-        self.interrupt_signal = False # [关键映射]：外部强制中断信号
+        self.interrupt_signal = False 
+        
+        try:
+            self.gbrain = GBrainMCPClient()
+        except:
+            self.gbrain = None
     
     def sync(self, on_status=None):
         """委托 WikiAgent 执行深度同步"""
@@ -102,11 +110,38 @@ class BuildAgent:
                 wiki_context = res.output
                 clean_query = remaining if remaining else wiki_query
 
+        # 1.5 处理 gbrain 个人记忆 (双脑集成)
+        gbrain_context = ""
+        if self.gbrain:
+            if on_log: on_log("正在从 gbrain 唤醒个人记忆...")
+            try:
+                # 记录“记住”操作
+                if "记住" in clean_query or "保存" in clean_query:
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    slug = f"personal/memory_{int(time.time())}"
+                    content = f"---\ntype: memory\ntitle: Saved via BuildAgent at {timestamp}\n---\n\n{clean_query}"
+                    self.gbrain.call_tool("put_page", {"slug": slug, "content": content})
+                    if on_log: on_log(f"✅ 已存入 gbrain 长效存储: {slug}")
+                
+                # 检索记忆
+                gbrain_res = self.gbrain.call_tool("query", {"query": clean_query})
+                from src.utils.logger import get_file_logger
+                agent_logger = get_file_logger("agent", "agent.log")
+                agent_logger.info(f"gbrain query for '{clean_query}' returned: {gbrain_res}")
+                
+                if gbrain_res and "No results found" not in gbrain_res and "Error:" not in gbrain_res:
+                    gbrain_context = gbrain_res
+            except Exception as e:
+                from src.utils.logger import get_file_logger
+                get_file_logger("agent", "agent.log").error(f"gbrain query failed: {e}")
+                pass
+
         # 2. 分发到对应模式
         if mode == "plan":
-            return self._run_plan(clean_query, wiki_context, history, on_log, should_stop)
+            return self._run_plan(clean_query, wiki_context, gbrain_context, history, on_log, should_stop)
         else:
-            return self._run_build(clean_query, wiki_context, history, on_step, on_log, should_stop)
+            return self._run_build(clean_query, wiki_context, gbrain_context, history, on_step, on_log, should_stop)
 
     # ========================
     # Plan 模式：纯 LLM 对话
@@ -115,6 +150,7 @@ class BuildAgent:
         self,
         query: str,
         wiki_context: str,
+        gbrain_context: str,
         history: list[tuple[str, str]] | None,
         on_log: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None
@@ -139,6 +175,9 @@ class BuildAgent:
 
         if wiki_context:
             user_prompt += f"[知识库参考资料]\n{wiki_context}\n\n"
+            
+        if gbrain_context:
+            user_prompt += f"[gbrain 个人记忆]\n{gbrain_context}\n\n"
 
         user_prompt += f"用户问题: {query}"
 
@@ -167,6 +206,7 @@ class BuildAgent:
         self,
         query: str,
         wiki_context: str,
+        gbrain_context: str,
         history: list[tuple[str, str]] | None,
         on_step: Callable[[BuildStep], bool] | None,
         on_log: Callable[[str], None] | None,
@@ -218,6 +258,8 @@ class BuildAgent:
         context = f"=== 用户任务 ===\n{query}\n"
         if wiki_context:
             context += f"\n[知识库参考资料]\n{wiki_context}\n"
+        if gbrain_context:
+            context += f"\n[gbrain 个人记忆]\n{gbrain_context}\n"
         if history:
             context += "\n[对话背景]\n" + "\n".join(
                 [f"Q: {q}\nA: {a[:200]}" for q, a in history[-3:]]
