@@ -20,11 +20,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.utils.config import load_config, PROJECT_ROOT, DEFAULT_CONFIG_PATH, ensure_workspace
-from src.core.build_agent import BuildAgent, BuildStep
+from src.core.wikicoder_engine import BuildAgent, BuildStep
 from src.cli.commands_wiki import run_sync
 from src.skills.chat_archive_skill import archive_chat_to_md, mem_draft_archive
 from src.core.constants import CORE_COMMANDS, get_command_list
-from src.core.business_ops import get_pure_business_graph, run_business_audit
+# from src.core.business_ops import get_pure_business_graph, run_business_audit
 
 app = FastAPI(title="WikiCoder API")
 
@@ -59,6 +59,7 @@ class ChatRequest(BaseModel):
     mode: str = "plan"
     agent_search_limit: int | None = None
     rag_filename_boost_terms: list | None = None
+    report_template: str | None = None
 
 def format_history(history):
     result = []
@@ -73,7 +74,7 @@ def format_history(history):
 async def chat(chat_request: ChatRequest, request: Request):
     try:
         config = load_config()
-        agent_build = BuildAgent(config, cwd=chat_request.cwd)
+        agent_build = BuildAgent(config)
         history_tuples = format_history(chat_request.history)
         
         async def event_generator():
@@ -117,7 +118,14 @@ async def chat(chat_request: ChatRequest, request: Request):
             def _run_agent():
                 nonlocal agent_done
                 try:
-                    out = agent_build.run(chat_request.query, history_tuples, on_step=_on_step, on_log=_on_log, mode=chat_request.mode)
+                    out = agent_build.run(
+                        chat_request.query, 
+                        history_tuples, 
+                        on_step=_on_step, 
+                        on_log=_on_log, 
+                        mode=chat_request.mode,
+                        report_template=chat_request.report_template
+                    )
                     status_queue.put({"type": "done", "output": out})
                 except Exception as e:
                     status_queue.put({"type": "error", "content": str(e)})
@@ -153,8 +161,11 @@ async def chat(chat_request: ChatRequest, request: Request):
                             agent_done = True
                             break
                     except queue.Empty:
-                        elapsed = int(asyncio.get_running_loop().time() - last_act)
-                        if elapsed >= 2:
+                        now = asyncio.get_running_loop().time()
+                        elapsed = int(now - last_act)
+                        # 只有在等待超过 2 秒，且距离上次发送状态消息超过 2 秒时才发送
+                        if elapsed >= 2 and (not hasattr(event_generator, "last_status_time") or now - event_generator.last_status_time >= 2):
+                            event_generator.last_status_time = now
                             yield f"data: {json.dumps({'status': f'🧠 WikiCoder 正在全速构思中 (已耗时 {elapsed}s)...'}, ensure_ascii=False)}\n\n"
                         await asyncio.sleep(0.05)
             except Exception as e:
@@ -163,6 +174,8 @@ async def chat(chat_request: ChatRequest, request: Request):
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/v1/confirm")
@@ -178,16 +191,44 @@ async def confirm_action(req: dict):
 async def get_commands():
     return get_command_list()
 
-# --- [NEW] 业务运营分析接口 (WebUI 专用) ---
-@app.get("/v1/ops/graph")
-async def get_ops_graph():
-    """获取全量业务逻辑图谱"""
-    return get_pure_business_graph()
+@app.get("/v1/templates")
+async def get_templates():
+    """获取所有可用的报告模板清单及其默认配置"""
+    template_dir = PROJECT_ROOT / "src" / "templates" / "reports"
+    templates = []
+    if template_dir.exists():
+        # 扫描目录下所有的 md 文件
+        for f in template_dir.glob("*.md"):
+            # 这里的 name 转换一下，比如 business_audit -> Business Audit
+            display_name = f.stem.replace("_", " ").title()
+            templates.append({"id": f.name, "name": display_name})
+    
+    # 获取当前配置中的默认模板
+    config = load_config()
+    default_template = "business_audit.md"
+    try:
+        if hasattr(config, "wiki_strategy"):
+            default_template = getattr(config.wiki_strategy, "report_template", default_template)
+        else:
+            default_template = config.get("wiki_strategy", {}).get("report_template", default_template)
+    except:
+        pass
+        
+    return {
+        "templates": templates,
+        "default": default_template
+    }
 
-@app.get("/v1/ops/audit")
-async def get_ops_audit():
-    """获取业务违规审计报表"""
-    return run_business_audit()
+# --- [NEW] 业务运营分析接口 (WebUI 专用) ---
+# @app.get("/v1/ops/graph")
+# async def get_ops_graph():
+#     """获取全量业务逻辑图谱"""
+#     return get_pure_business_graph()
+# 
+# @app.get("/v1/ops/audit")
+# async def get_ops_audit():
+#     """获取业务违规审计报表"""
+#     return run_business_audit()
 
 @app.post("/v1/exec")
 async def execute_command(req: dict):

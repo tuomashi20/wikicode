@@ -135,13 +135,26 @@ def _fts_upsert(
     breadcrumb: str,
     content_text: str,
 ) -> None:
+    # [核心修复]：针对 unicode61 分词器在 CJK/Latin 混排时无法切分的问题，
+    # 在存入 FTS 虚拟表前，强制在中文与英数边界插入空格。
+    def _pad_cjk(text: str) -> str:
+        if not text: return ""
+        # 在 [中文][英数] 间插空格
+        text = re.sub(r"([\u4e00-\u9fff])([a-zA-Z0-9])", r"\1 \2", text)
+        # 在 [英数][中文] 间插空格
+        text = re.sub(r"([a-zA-Z0-9])([\u4e00-\u9fff])", r"\1 \2", text)
+        return text
+
+    p_title = _pad_cjk(title)
+    p_content = _pad_cjk(content_text)
+
     conn.execute("DELETE FROM chunks_fts WHERE chunk_id = ?", (chunk_id,))
     conn.execute(
         """
         INSERT INTO chunks_fts (chunk_id, title, tags, parent_file, breadcrumb, content_text)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (chunk_id, title, tags, parent_file, breadcrumb, content_text),
+        (chunk_id, p_title, tags, parent_file, breadcrumb, p_content),
     )
 
 
@@ -249,16 +262,26 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
     # 提取核心关键词用于加权
     core_phrases = re.findall(r"[\u4e00-\u9fff]{2,}", q)
     
-    # 针对业务高频词的特殊加权名单 (优先从配置读取)
+    # 针对业务高频词的特殊加权名单
     try:
-        from src.utils.config import load_config
-        config = load_config()
-        # 修正路径：这些参数在 config.yaml 的 rules 下
-        business_boost_words = config.wiki_strategy.rules.rag_filename_boost_terms
-        if not business_boost_words:
-             business_boost_words = ["结算", "标准", "规则", "费用", "纪要", "2024", "66号"]
-    except:
-        business_boost_words = ["结算", "标准", "规则", "费用", "纪要", "2024", "66号"]
+        # 从 business_terms.yaml 动态注入 (核心词库)
+        # 避免循环引用，直接尝试读取默认位置或环境变量
+        terms_path = os.getenv("WIKICODER_BUSINESS_TERMS", "./data/dictionaries/business_terms.yaml")
+        
+        from src.core.query_rewriter import load_business_terms
+        dynamic_terms = load_business_terms(terms_path)
+        
+        boost_words = set()
+        if dynamic_terms:
+            boost_words.update(dynamic_terms)
+            
+        # 兜底高频业务词
+        if not boost_words:
+            boost_words = {"结算", "标准", "规则", "费用", "纪要", "2024", "采购", "结算单", "明细", "报账"}
+        
+        business_boost_words = list(boost_words)
+    except Exception:
+        business_boost_words = ["结算", "标准", "规则", "费用", "纪要", "2024", "采购", "结算单", "明细", "报账"]
     
     tokens = _tokenize_query(q)
     if not tokens:
@@ -295,17 +318,17 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                         has_core = True
                     if ph.lower() in str(r['title']).lower():
                         score += 500.0 # 标题命中：额外再奖励
-                # 业务核心词路径奖励 (V4 强化：仅当查询包含核心词且路径命时加分)
+                # 业务核心词路径奖励 (V5 统治级加权：确保分工文件绝对置顶)
                 query_low = q.lower()
                 for bw in business_boost_words:
                     bw_low = bw.lower()
-                    if bw_low in query_low:
-                        # 如果用户问了核心词，且文件名或路径中包含该词，给予统治级加分
-                        path_hit = bw_low in str(r['parent_file']).lower() or bw_low in str(r['breadcrumb']).lower()
-                        if path_hit:
-                            score += 2000.0 # 路径命中核心业务词：绝对置顶
+                    # 如果查询包含核心词 (如 "负责", "分工")，且文件名命中了权重词 (如 "分工", "界面")
+                    if bw_low in query_low or any(k in query_low for k in ["负责", "维护", "谁干", "专业"]):
+                        path_text = f"{r['parent_file']} {r['breadcrumb']}".lower()
+                        if bw_low in path_text:
+                            score += 10000.0 # 统治级加分：运维分工文件必须出现在第一行
                         elif bw_low in str(r['title']).lower():
-                            score += 1000.0 # 标题命中核心业务词：高优先
+                            score += 5000.0
                 
                 scored_rows.append((r, score))
         except Exception:

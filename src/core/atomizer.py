@@ -115,7 +115,10 @@ class Atomizer:
 
         delete_chunks_by_parent(rel_raw)
 
-        chunks = self._split_by_heading(text, rel_raw, level=self.config.wiki_strategy.heading_level)
+        ws = self.config.wiki_strategy
+        patterns = getattr(ws, "chapter_title_patterns", [])
+
+        chunks = self._split_by_heading(text, rel_raw, level=ws.heading_level, patterns=patterns)
         for c in chunks:
             out_path = self.chunks_dir / f"{c.chunk_id}.md"
             out_path.write_text(c.content, encoding="utf-8")
@@ -167,7 +170,7 @@ class Atomizer:
                     pass
 
     @staticmethod
-    def _split_by_heading(text: str, rel_raw_path: str, level: int = 2) -> list[Chunk]:
+    def _split_by_heading(text: str, rel_raw_path: str, level: int = 2, patterns: list[str] = []) -> list[Chunk]:
         """
         [进化版] 层级感知切片：
         1. 识别所有层级的标题 (H1-H6)。
@@ -198,17 +201,35 @@ class Atomizer:
                 breadcrumb=breadcrumb
             )
 
+        # 已经通过参数 patterns 传入
+
         for line in lines:
+            line_s = line.strip()
+            # 1. 匹配标准 MD 标题
             header_match = re.match(r"^(#+)\s+(.+)$", line)
-            if header_match:
+            # 2. 匹配自定义章节标题 (如 第一章, 一、)
+            is_custom_header = False
+            custom_title = ""
+            for pat in patterns:
+                if re.match(f"^{pat}", line_s):
+                    is_custom_header = True
+                    custom_title = line_s
+                    break
+
+            if header_match or is_custom_header:
                 # 发现新标题，如果之前有内容，先封装成块
                 if current_body:
                     chunks.append(_create_chunk(current_headers, current_body, chunk_idx))
                     chunk_idx += 1
                     current_body = []
                 
-                h_level = len(header_match.group(1))
-                h_title = header_match.group(2).strip()
+                if header_match:
+                    h_level = len(header_match.group(1))
+                    h_title = header_match.group(2).strip()
+                else:
+                    h_level = 2 # 自定义章节默认按 H2 处理
+                    h_title = custom_title
+
                 if h_level <= 6:
                     current_headers[h_level] = h_title
                     # 清空更低等级（更细分）的旧标题
