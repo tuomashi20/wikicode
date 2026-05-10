@@ -25,7 +25,7 @@ def chat(
 ) -> None:
     """启动 WikiCoder 智能对话终端 (Textual GUI)。"""
     from src.ui.app import WikiCoderApp
-    from src.core.build_agent import BuildAgent
+    from src.core.wikicoder_engine import BuildAgent
     config = load_config()
     WikiCoderApp(config, lambda cfg: BuildAgent(cfg)).run()
 

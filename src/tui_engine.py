@@ -18,6 +18,7 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.lexers import Lexer
 from prompt_toolkit.filters import has_focus
 from prompt_toolkit.mouse_events import MouseEventType, MouseButton
+from src.core.agent import WikiStep
 
 # 专用 Rich 渲染器与线程锁
 # 专用 Rich 渲染器与线程锁
@@ -73,21 +74,36 @@ class TUIApp:
         self.full_history_text = to_ansi("[bold cyan]WikiCoder Professional TUI[/bold cyan]\n[dim]输入问题开始对话，或输入 /help 查看命令[/dim]\n")
         self.history_area = TextArea(read_only=True, scrollbar=True, lexer=SimpleAnsiLexer(), text=self.full_history_text)
 
+        import re
+        def strip_ansi(text):
+            """去除文本中的 ANSI 颜色代码"""
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            return ansi_escape.sub('', text)
+
         def make_copy_handler(text_area):
             original_handler = text_area.control.mouse_handler
             def _handler(mouse_event):
                 if mouse_event.event_type == MouseEventType.MOUSE_DOWN and mouse_event.button == MouseButton.RIGHT:
+                    # 优先获取用户划选的内容
                     selected = text_area.buffer.copy_selection().text
                     if selected:
-                        system_copy(selected)
-                        self.append_text("\n[bold green]系统: [右键成功] 文字已复制到剪贴板。[/bold green]\n", is_rich=True)
+                        clean_text = strip_ansi(selected)
+                        system_copy(clean_text)
+                        self.append_text("\n[bold green]系统: [划选复制成功] 纯净文本已存入剪贴板。[/bold green]\n", is_rich=True)
                     else:
-                        try:
-                            paste_text = pyperclip.paste()
-                            if paste_text:
-                                self.input_field.buffer.insert_text(paste_text)
-                        except Exception:
-                            pass
+                        # 如果没有划选，尝试智能复制最后一段 AI 回复
+                        if self.session_history:
+                            last_q, last_a = self.session_history[-1]
+                            clean_last_a = strip_ansi(last_a)
+                            system_copy(clean_last_a)
+                            self.append_text("\n[bold cyan]系统: [智能复制成功] 已自动复制最后一条 AI 回复。[/bold cyan]\n", is_rich=True)
+                        else:
+                            try:
+                                paste_text = pyperclip.paste()
+                                if paste_text:
+                                    self.input_field.buffer.insert_text(paste_text)
+                            except Exception:
+                                pass
                     return None
                 return original_handler(mouse_event)
             return _handler
@@ -121,6 +137,17 @@ class TUIApp:
             event.app.current_buffer.insert_text("\n")
         self.input_field.key_bindings = input_kb
 
+        # 增加全局复制快捷键
+        @self.kb.add("escape", "c") # Alt+C
+        def copy_last_response(event):
+            if self.session_history:
+                last_q, last_a = self.session_history[-1]
+                # strip_ansi 已在 init 作用域内定义 (如果没定义则需重新定义)
+                ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+                clean_text = ansi_escape.sub('', last_a)
+                system_copy(clean_text)
+                self.append_text("\n[bold cyan]系统: [Alt+C 一键复制成功] 已复制最后一条 AI 回复。[/bold cyan]\n", is_rich=True)
+
         self.input_field.control.mouse_handler = make_copy_handler(self.input_field)
 
         self.task_area = TextArea(read_only=True, scrollbar=True, lexer=SimpleAnsiLexer(), 
@@ -129,14 +156,11 @@ class TUIApp:
 
         self.stats_control = FormattedTextControl(text=self._get_stats_text)
         
-        # 建立更底层的窗口引用，绕过 TextArea 复杂的嵌套布局，提升渲染稳定性
-        self.history_window = Window(content=self.history_area.control, wrap_lines=True)
-        self.task_window = Window(content=self.task_area.control, wrap_lines=True, width=40, style="bg:#121212")
-        
+        # 修正：直接使用 TextArea 控件而非手动创建 Window，以确保鼠标事件（划选）能被控件正确处理
         main_split = VSplit([
-            self.history_window, 
+            self.history_area, 
             Window(width=1, char="│", style="fg:ansigray"), 
-            self.task_window
+            self.task_area
         ])
         
         content_layout = HSplit([
@@ -183,7 +207,7 @@ class TUIApp:
         if len(cwd) > 25: cwd = "..." + cwd[-22:]
         cwd_safe = escape(cwd)
         model_safe = escape(model_name)
-        return HTML(f'<style bg="{color}" fg="ansiwhite"><b> {mode_label} </b></style> <style fg="ansicyan">🤖 {model_safe}</style> | <style fg="gray">📂 {cwd_safe}</style> | [Enter:发送] | [Ctrl+J:换行] | [ESC:终止] | Tab:切换')
+        return HTML(f'<style bg="{color}" fg="ansiwhite"><b> {mode_label} </b></style> <style fg="ansicyan">🤖 {model_safe}</style> | <style fg="gray">📂 {cwd_safe}</style> | [Alt+C:复制] | [Enter:发送] | [Shift+鼠标:强制划选]')
 
     def _update_task_panel(self):
         if self.session_mode != "build":
@@ -264,9 +288,20 @@ class TUIApp:
                     self.append_text(f"\n[green]系统: 同步完成 (files={result.get('files', 0)})[/green]\n", is_rich=True)
                 elif root_cmd == "/kbpath":
                     arg = cmd[len(root_cmd):].strip()
-                    ws = self.config.wiki_strategy
-                    if not arg: self.append_text(f"\n[yellow]当前路径: {getattr(ws, 'vault_path', '未设置')}[/yellow]\n", is_rich=True)
-                    else: ws.vault_path = arg; self.append_text(f"\n[green]已设置主路径为: {escape(arg)}[/green]\n", is_rich=True)
+                    if not arg: 
+                        ws = self.config.wiki_strategy
+                        self.append_text(f"\n[yellow]当前路径: {getattr(ws, 'vault_path', '未设置')}[/yellow]\n", is_rich=True)
+                    else:
+                        from src.skills.wiki_skill import set_vault_path
+                        self.append_text(f"\n[cyan]正在切换知识库并初始化基础设施...[/cyan]\n", is_rich=True)
+                        ok, msg = set_vault_path(arg)
+                        if ok:
+                            self.append_text(f"[bold green]✅ {msg}[/bold green]\n", is_rich=True)
+                            # 重新加载配置
+                            from src.utils.config import load_config
+                            self.config = load_config()
+                        else:
+                            self.append_text(f"[bold red]❌ {msg}[/bold red]\n", is_rich=True)
                 elif root_cmd == "/resume":
                     from src.main import _load_session_state; old_hist, old_mode = _load_session_state()
                     if old_hist:
@@ -404,30 +439,59 @@ class TUIApp:
                         self.append_text(f"\n\n[bold cyan]系统: 正在整理并保存 '{escape(save_title)}'...[/bold cyan]\n", is_rich=True)
                     else:
                         if root_cmd == "/ask": processed_cmd = cmd[len("/ask"):].strip()
-                        self.append_text(f"\n\n[bold cyan]You:[/bold cyan] {escape(cmd)}\n", is_rich=True)
+                        # 提问背景框
+                        self.append_text(f"\n\n[on #1e1e1e][bold cyan]You:[/bold cyan] {escape(cmd)}[/on #1e1e1e]\n", is_rich=True)
                         self.append_text("[dim italic]>>> AI 正在思考并检索知识库...[/dim italic]\n", is_rich=True)
 
                     self.is_processing = True; self.stop_requested = False; self.elapsed_time = 0.0; timer_task = asyncio.create_task(self._timer_task())
                     self.current_answer = ""; self.is_first_token = True
+                    
+                    # 预生成背景 ANSI 代码以提升性能
+                    bg_style = "[on #1e1e1e]"
+                    bg_reset = "[/on #1e1e1e]"
+
+                    # 使用 ANSI 的 EL (Erase in Line) 指令，强制背景色涂满行末而不产生实际字符
+                    # 这能确保背景顶满右侧，且不会因为空格过多触发 TUI 的自动换行
+                    el_code = "\x1b[K"
+                    
                     def on_token(token):
                         if self.stop_requested: raise InterruptedError("Stopped")
-                        self.current_answer += token; self.append_text(token, is_rich=False)
+                        
+                        # 先转义 AI 的原始输出，防止 [ ] 等字符被当成 Rich 标签
+                        safe_token = escape(token)
+                        # 在换行前注入 EL 指令
+                        styled_token = safe_token.replace("\n", f"{el_code}{bg_reset}\n{bg_style} ")
+                        
+                        if self.is_first_token:
+                            self.append_text(f"\n{bg_style} ", is_rich=True)
+                            self.is_first_token = False
+                        
+                        # 将混合了背景标记和转义内容的文字转换为 ANSI 并直接输出
+                        self.append_text(to_ansi(styled_token), is_rich=False)
+                        self.current_answer += token
+                    
+                    def finalize_answer():
+                        # 结束时涂满最后一行并合上盒子
+                        self.append_text(to_ansi(f"{el_code}{bg_reset}\n"), is_rich=False)
                         
                     def on_build_step(step):
                         if self.stop_requested: raise InterruptedError("Stopped")
-                        msg = f"\n[bold magenta]► Thought:[/bold magenta] [magenta]{escape(step.thought)}[/magenta]\n"
-                        msg += f"[bold cyan]► Action:[/bold cyan] [cyan]{escape(step.action_type)}[/cyan]"
+                        # 构建模式 Thought/Action 背景框
+                        msg = f"\n[on #1c1c1c][bold magenta]► Thought:[/bold magenta] [magenta]{escape(step.thought)}[/magenta][/on #1c1c1c]\n"
+                        msg += f"[on #1c1c1c][bold cyan]► Action:[/bold cyan] [cyan]{escape(step.action_type)}[/cyan]"
                         if step.action_input: 
                             msg += f"\n[dim]{escape(step.action_input[:500] + ('...' if len(step.action_input)>500 else ''))}[/dim]"
-                            # 提取操作的文件路径
-                            if step.action_type in ["edit_file", "write_file", "read_file", "patch_apply"]:
-                                try:
-                                    import json
-                                    data = json.loads(step.action_input)
-                                    path = data.get("path")
-                                    if path: self.modified_files.add(path)
-                                except: pass
-                        self.append_text(msg + "\n", is_rich=True)
+                        msg += "[/on #1c1c1c]\n"
+                        self.append_text(msg, is_rich=True)
+                        
+                        # 提取操作文件路径
+                        if step.action_type in ["edit_file", "write_file", "read_file", "patch_apply"]:
+                            try:
+                                import json
+                                data = json.loads(step.action_input)
+                                path = data.get("path")
+                                if path: self.modified_files.add(path)
+                            except: pass
                         if step.action_type == "finish":
                             for t in self.all_seen_tasks:
                                 self.completed_tasks_text.add(t)
@@ -442,7 +506,7 @@ class TUIApp:
                                     clean_t = t[3:].strip() if t.lower().startswith("[x]") else t[1:].strip()
                                     is_done = True
                                 
-                                # 剔除 AI 常常加入的 "1. " "2、" "- " 等前缀，防止因前缀丢失导致被识别为两条任务
+                                # 剔除 AI 常常加入的 "1. " "2、" "- " 等前缀
                                 clean_t = re.sub(r'^(\d+[\.\-、]\s*|\-\s*)', '', clean_t).strip()
                                 
                                 if clean_t not in self.all_seen_tasks: 
@@ -470,6 +534,7 @@ class TUIApp:
                                 clean_hist = [(q, a[:1000] + "..." if len(a)>1000 else a) for q, a in self.session_history]
                                 return agent_build.run(processed_cmd, history=clean_hist, on_step=on_build_step)
                             final_out = await asyncio.get_event_loop().run_in_executor(None, run_build)
+                            finalize_answer()
                             self.current_answer = final_out
                             self.append_text(f"\n\n[bold green]✅ 构建完成: {escape(final_out)}[/bold green]\n", is_rich=True)
                             self.session_history.append((cmd, f"✅ 构建完成：{final_out}"))
@@ -477,7 +542,15 @@ class TUIApp:
                         else:
                             agent_plan = self.agent
                             self.current_running_agent = agent_plan
-                            await asyncio.get_event_loop().run_in_executor(None, lambda: agent_plan.run(processed_cmd, mode=self.session_mode, on_token=on_token))
+                            # 增加 on_status 和 on_step 回调，确保联网状态和步骤能显示在界面上
+                            await asyncio.get_event_loop().run_in_executor(None, lambda: agent_plan.run(
+                                processed_cmd, 
+                                response_mode=self.session_mode, 
+                                on_token=on_token,
+                                on_status=self.set_status,
+                                on_step=on_build_step
+                            ))
+                            finalize_answer()
                             if save_after_done and not self.stop_requested:
                                 vp = getattr(self.config.wiki_strategy, "vault_path", os.getcwd()); target_path = os.path.join(vp, "raw", "faq", f"{save_title}.md")
                                 os.makedirs(os.path.dirname(target_path), exist_ok=True); 

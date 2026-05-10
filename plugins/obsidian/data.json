@@ -1,0 +1,7 @@
+{
+  "serverUrl": "http://127.0.0.1:8000",
+  "agentSearchLimit": 8,
+  "boostTerms": "结算, 标准, 纪要",
+  "wikiEnabled": false,
+  "reportTemplate": "plan_standard.md"
+}

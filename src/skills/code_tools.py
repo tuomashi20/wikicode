@@ -25,10 +25,26 @@ class PatchSummary:
 
 
 def _safe_path(path: str) -> Path:
-    p = (PROJECT_ROOT / path).resolve()
-    if not str(p).startswith(str(PROJECT_ROOT.resolve())):
-        raise ValueError("Path escapes project root")
-    return p
+    from src.utils.config import CWD_ROOT
+    
+    # 1. 尝试作为绝对路径解析
+    p_abs = Path(path).resolve()
+    
+    # 2. 尝试作为相对于项目根目录的路径解析
+    p_proj = (PROJECT_ROOT / path).resolve()
+    
+    # 3. 尝试作为相对于当前工作目录的路径解析
+    p_cwd = (CWD_ROOT / path).resolve()
+
+    # 安全检查：只要在 PROJECT_ROOT 或 CWD_ROOT 下，即为合法
+    roots = [PROJECT_ROOT.resolve(), CWD_ROOT.resolve()]
+    
+    for p in [p_abs, p_proj, p_cwd]:
+        for root in roots:
+            if str(p).startswith(str(root)):
+                return p
+                
+    raise ValueError(f"Path '{path}' escapes allowed directories (Project Root or Current Workdir)")
 
 
 
@@ -40,9 +56,140 @@ def _normalize_diff_path(path: str) -> str:
 
 
 
-def read_file(path: str) -> str:
-    p = _safe_path(path)
-    return p.read_text(encoding="utf-8", errors="ignore") if p.exists() else ""
+def read_file(path: str, query: str = None, start_line: int = None, end_line: int = None) -> str:
+    # 1. 尝试从项目根目录读取
+    try:
+        p = _safe_path(path)
+        if p.exists() and p.is_file():
+            content = p.read_text(encoding="utf-8", errors="ignore")
+            return _process_content(content, path, query, start_line, end_line)
+    except:
+        pass
+    
+    # 2. 尝试从知识库目录读取 (跨盘支持)
+    try:
+        from src.utils.config import load_config
+        config = load_config()
+        if hasattr(config, "wiki_strategy"):
+            vault_path_str = getattr(config.wiki_strategy, "vault_path", None)
+        else:
+            vault_path_str = config.get("wiki_strategy", {}).get("vault_path", None)
+            
+        if vault_path_str:
+            vault_path = Path(vault_path_str)
+            
+            # 2a. 原样尝试
+            p_vault = (vault_path / path).resolve()
+            if p_vault.exists() and p_vault.is_file():
+                content = p_vault.read_text(encoding="utf-8", errors="ignore")
+                return _process_content(content, path, query, start_line, end_line)
+                
+            # 2b. 自动补全 raw/ 前缀尝试
+            if not path.startswith("raw/"):
+                p_raw = (vault_path / "raw" / path).resolve()
+                if p_raw.exists() and p_raw.is_file():
+                    content = p_raw.read_text(encoding="utf-8", errors="ignore")
+                    return _process_content(content, path, query)
+
+            # 2c. 递归模糊搜索
+            clean_path = path.replace("《", "").replace("》", "").replace("【", "").replace("】", "")
+            clean_path = clean_path.replace("[", "").replace("]", "").replace("(", "").replace(")", "")
+            if "/" in clean_path: clean_path = clean_path.split("/")[-1]
+            
+            search_name = clean_path.replace(".md", "").replace(".txt", "").strip()
+            if search_name:
+                for pattern in [f"**/*{search_name}*.md", f"**/*{search_name}*.txt"]:
+                    for match in vault_path.glob(pattern):
+                        if match.is_file():
+                            content = match.read_text(encoding="utf-8", errors="ignore")
+                            return f"--- [自动重定向至: {match.name}] ---\n\n" + _process_content(content, match.name, query, start_line, end_line)
+    except Exception as e:
+        pass
+        
+    return f"错误: 无法在项目或知识库中找到文件 '{path}'"
+def _process_content(content: str, path: str, query: str = None, start_line: int = None, end_line: int = None) -> str:
+    """内部辅助：处理内容切片（行号 > 关键词 > 默认）"""
+    lines = content.splitlines()
+    
+    # 优先逻辑 1: 基于行号的物理翻页
+    if start_line is not None:
+        start_idx = max(0, start_line - 1)
+        end_idx = min(len(lines), end_line if end_line is not None else start_idx + 500)
+        snippet = "\n".join(lines[start_idx:end_idx])
+        return f"--- [📄 行号定位: 第 {start_line} 至 {end_idx} 行 (总行数: {len(lines)})] ---\n\n{snippet}"
+
+    # 优先逻辑 2: 基于关键词的语义定位 (增强版：支持标题优先与目录跳过)
+    if query:
+        import re
+        clean_query = re.escape(query.replace("《", "").replace("》", ""))
+        
+        # 2a. 尝试寻找标题模式 (如 "## 第六章")
+        header_pattern = rf"^\s*#+\s+.*{clean_query}.*"
+        header_matches = list(re.finditer(header_pattern, content, re.MULTILINE | re.IGNORECASE))
+        
+        # 2b. 获取所有普通匹配
+        all_matches = list(re.finditer(clean_query, content, re.IGNORECASE))
+        
+        if not all_matches and not header_matches:
+            return f"--- [⚠️ 注意: 未在文档中找到关键词 '{query}'，展示开头内容] ---\n\n" + "\n".join(lines[:400])
+
+        # 决策：如果有标题匹配，用标题；如果没有，用普通匹配但避开开头目录
+        target_match = None
+        if header_matches:
+            target_match = header_matches[0]
+        else:
+            # 如果第一个匹配项在文件前 5% 且文件较长，尝试找第二个（避开目录）
+            if all_matches[0].start() < len(content) * 0.05 and len(all_matches) > 1:
+                target_match = all_matches[1]
+            else:
+                target_match = all_matches[0]
+
+        start_pos = target_match.start()
+        # 动态调整：如果是标题，多往后看一点；如果是普通匹配，前后兼顾
+        show_start = max(0, start_pos - 1000)
+        show_end = min(len(content), start_pos + 9000)
+        snippet = content[show_start:show_end]
+        prefix = "... " if show_start > 0 else ""
+        suffix = " ..." if show_end < len(content) else ""
+        return f"--- [🔍 关键词 '{query}' 精准定位 (位置: {start_pos})] ---\n\n{prefix}{snippet}{suffix}"
+
+    # 默认逻辑: 返回开头内容
+    if len(lines) > 500:
+        return "\n".join(lines[:500]) + f"\n\n... (文档过长，已截断。总行数: {len(lines)}。如需后续内容请指定 start_line/end_line 或提供关键词 query。)"
+    return content
+
+def read_excel(path: str = None, file_path: str = None, sheet: str = None) -> str:
+    """[本地增强] 使用 Pandas 精准读取 Excel 文件并返回结构化摘要"""
+    final_path = path or file_path
+    if not final_path:
+        return "错误: 未提供文件路径参数 (path 或 file_path)"
+    
+    from src.skills.code_tools import _safe_path
+    try:
+        abs_path = _safe_path(final_path)
+        import pandas as pd
+        
+        # 尝试读取 Excel
+        df = pd.read_excel(abs_path, sheet_name=sheet) if sheet else pd.read_excel(abs_path)
+        
+        # 构建精准摘要
+        rows, cols = df.shape
+        columns = list(df.columns)
+        head_sample = df.head(3).to_markdown(index=False)
+        
+        summary = [
+            f"### Excel 结构摘要: {final_path}",
+            f"- **总行数**: {rows}",
+            f"- **总列数**: {cols}",
+            f"- **列名列表**: {columns}",
+            "\n#### 数据样例 (前 3 行):",
+            head_sample,
+            "\n> [提示] Agent 可根据上述列名编写 Python 脚本进行分类汇总统计。"
+        ]
+        return "\n".join(summary)
+        
+    except Exception as e:
+        return f"读取本地 Excel 失败: {str(e)}\n> [建议] 请检查文件路径是否正确，或确保当前环境已安装 pandas 和 openpyxl 库。"
 
 
 

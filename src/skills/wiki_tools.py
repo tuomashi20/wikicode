@@ -1,169 +1,114 @@
-"""
-wiki_tools.py - WikiCoder knowledge base utilities.
-"""
 from __future__ import annotations
-
+import os
+import re
 import json
+import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Dict, Union, Optional
 
-from src.core.query_rewriter import QueryRewrite, load_synonyms, rewrite_query, load_business_terms
-from src.utils.config import PROJECT_ROOT
-from src.utils.db_manager import get_chunk_by_id, list_structure, search_chunks
+def _get_wiki_root() -> Path:
+    """[WikiCoder 路径中枢] 严格按照 vault_path + wiki_dir 拼接命"""
+    try:
+        from src.utils.config import load_config
+        config = load_config()
+        # 提取策略配置
+        strategy = getattr(config, "wiki_strategy", None)
+        if strategy is None:
+            if hasattr(config, "get"):
+                strategy = config.get("wiki_strategy", {})
+            else:
+                strategy = {}
+            
+        v_path = getattr(strategy, "vault_path", "wiki") if hasattr(strategy, "vault_path") else (strategy.get("vault_path", "wiki") if isinstance(strategy, dict) else "wiki")
+        w_dir = getattr(strategy, "wiki_dir", "") if hasattr(strategy, "wiki_dir") else (strategy.get("wiki_dir", "") if isinstance(strategy, dict) else "")
+        
+        # 绝对对齐：拼接根目录与 Wiki 子目录
+        full_path = Path(v_path) / w_dir
+        return full_path
+    except Exception as e:
+        # 最后的保底
+        return Path("D:/lihq_obsi/lihq_obsi/LLM_wiki/wiki")
 
 
 def wiki_search_v2(
     query: str,
-    limit: int = 20,
-    synonyms_path: Path | str | None = None,
-    business_terms_path: Path | str | None = None,
-    llm: Any | None = None,
-    fanout_limit: int = 12,
-    rewrite_priority: str = "append",
-    skip_llm: bool = False
-) -> tuple[list[dict[str, Any]], QueryRewrite]:
-    """[标准数据版] 检索知识库，返回原始行数据，用于 UI 和测评"""
-    rw = rewrite_query(query, llm=llm, skip_llm=skip_llm)
-    if not query.strip():
-        return [], rw
-
-    rows = search_chunks(query=rw.fts_query, limit=limit)
-    results = []
-    for r in rows:
-        d = dict(r)
-        # 确保返回物理路径
-        if not d.get("rel_path"):
-            d["rel_path"] = d.get("parent_file", "")
-        # 补全 breadcrumb 逻辑
-        if not d.get("breadcrumb"):
-            d["breadcrumb"] = f"{d.get('parent_file')} > {d.get('title')}"
-        results.append(d)
-    return results, rw
-
-
-def wiki_search(
-    query: str,
-    limit: int | None = None,
-    llm: Any | None = None,
-    skip_llm: bool = False
-) -> str:
-    """[Agent 专用版] 返回带路径背书的格式化字符串"""
-    if limit is None:
-        try:
-            from src.utils.config import load_config
-            cfg = load_config()
-            limit = cfg.wiki_strategy.agent_search_limit
-        except:
-            limit = 5
-
-    results, _ = wiki_search_v2(query, limit=limit, llm=llm, skip_llm=skip_llm)
-    if not results:
-        return f"Wiki: 未找到关于 '{query}' 的匹配。建议使用 wiki_list 查看相关目录。"
-
-    output = []
-    for r in results:
-        path = r.get("breadcrumb")
-        rel_path = r.get("rel_path") or r.get("parent_file")
-        content = r.get("content_text") or ""
-        output.append(f"### [路径背书]: {path}\n### [物理路径]: {rel_path}\n{content[:2000]}")
+    limit: int = 10,
+    llm: Optional[Any] = None,
+    skip_llm: bool = True
+) -> tuple[List[Dict[str, Any]], Any]:
+    """[WikiCoder 极效版] 优先检索编译后的 Wiki 库，次选原始切片"""
+    from src.utils.db_manager import search_chunks
     
-    return "\n\n---\n\n".join(output)
+    # 1. 动态获取 Wiki 根目录
+    wiki_root = _get_wiki_root()
+    wiki_hits = []
+    
+    # 简单的关键词提取（处理 OLT, 结算等核心词）
+    keywords = re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]{2,}', query)
+    
+    if wiki_root.exists():
+        for kw in keywords:
+            # 在全库搜索匹配的文件
+            for md_file in wiki_root.rglob(f"*{kw}*.md"):
+                if ".wikicoder" in str(md_file): continue
+                # 构造伪 chunk 格式，兼容下游
+                wiki_hits.append({
+                    "chunk_id": f"WIKI:{md_file.name}",
+                    "title": f"【Wiki 聚合页】{md_file.stem}",
+                    "parent_file": str(md_file.relative_to(wiki_root)),
+                    "is_wiki": True,
+                    "content_preview": md_file.read_text(encoding="utf-8")[:1000]
+                })
+                if len(wiki_hits) >= 3: break # Wiki 命中不在多而在精
+            if wiki_hits: break
 
+    # 2. 调用原始数据库检索
+    results = search_chunks(query, limit=limit)
+    
+    # 3. 合并结果：Wiki 命中具有压倒性的权重，置于首位
+    final_results = wiki_hits + [r for r in results if not any(w["title"] == r["title"] for w in wiki_hits)]
+    
+    return final_results[:limit], None
 
-def wiki_list(sub_dir: str = "") -> str:
-    """[Agent 专用版] 列出知识库目录结构"""
-    from src.utils.config import load_config
-    config = load_config()
-    base_path = Path(config.wiki_strategy.raw_path)
-    
-    target = base_path
-    if sub_dir:
-        target = base_path / sub_dir
-    
-    if not target.exists():
-        return f"Error: 路径 '{sub_dir}' 不存在。"
-    
-    files = []
-    for p in target.glob("**/*"):
-        if p.is_file() and p.suffix in [".md", ".txt", ".docx", ".pdf"]:
-            files.append(str(p.relative_to(base_path)))
-    
-    if not files:
-        return f"Wiki: 在 '{sub_dir}' 下未发现规范文件。"
-        
-    return "知识库文件列表:\n" + "\n".join([f"- {f}" for f in sorted(files)])
+from src.utils.db_manager import get_conn
 
-
-def wiki_read(rel_path: str) -> str:
-    """[Agent 专用版] 通读规范文件"""
-    from src.utils.config import load_config
-    config = load_config()
-    raw_root = Path(config.wiki_strategy.raw_path)
-    p = raw_root / rel_path
-    
-    if not p.exists():
-        # 路径容错逻辑：针对 Windows 环境下的编码乱码进行模糊匹配
-        parent_dir = raw_root / Path(rel_path).parent
-        if parent_dir.exists():
-            search_name = Path(rel_path).name.replace(" ", "")
-            # 尝试通过相似度或部分匹配找回文件
-            for entry in parent_dir.iterdir():
-                if entry.is_file() and (search_name in entry.name or entry.name in search_name):
-                    p = entry
-                    break
-        
-    if not p.exists():
-        return f"Error: 未找到文件 '{rel_path}'。请确认路径编码是否正确。"
-        
+def wiki_read_chunk(chunk_id: Union[str, int]) -> str:
+    """[全景视野版] 读取片段，支持 Wiki 聚合页直读"""
     try:
-        # 工业级编码探测：按优先级尝试所有可能的编码
-        encodings = ["utf-8-sig", "utf-8", "gb18030", "gbk", "utf-16", "utf-16-le", "utf-16-be", "latin-1"]
-        content = None
-        
-        # 读取原始字节流进行分析
-        raw_bytes = p.read_bytes()
-        if not raw_bytes:
-            return f"--- 文件内容预览: {rel_path} ---\n(空文件)"
+        # 1. [WikiCoder 优化] 如果是 Wiki 聚合页，直接读取文件
+        if isinstance(chunk_id, str) and chunk_id.startswith("WIKI:"):
+            filename = chunk_id.replace("WIKI:", "")
+            wiki_root = _get_wiki_root()
+            # 递归寻找匹配的文件
+            for p in wiki_root.rglob(filename):
+                return p.read_text(encoding="utf-8")
+            return f"错误: 未找到 Wiki 页面 {filename}"
 
-        for enc in encodings:
-            try:
-                content = raw_bytes.decode(enc)
-                # 检查是否包含明显的乱码特征（如大量的 ）
-                if content.count('\ufffd') > len(content) * 0.05:
-                    continue
-                break
-            except (UnicodeDecodeError, LookupError):
-                continue
-        
-        if content is None:
-            content = raw_bytes.decode("utf-8", errors="ignore")
+        # 2. 原始数据库检索逻辑
+        with get_conn() as conn:
+            target = conn.execute(
+                "SELECT rowid, parent_file, content_text FROM chunks WHERE chunk_id = ?", 
+                (chunk_id,)
+            ).fetchone()
+            if not target: return "未找到该片段。"
             
-        return f"--- 文件内容预览: {rel_path} ---\n{content[:15000]}"
+            rid = target['rowid']
+            p_file = target['parent_file']
+            
+            # 扩大范围获取上下文
+            neighbors = conn.execute(
+                "SELECT content_text FROM chunks WHERE parent_file = ? AND rowid >= ? AND rowid <= ? ORDER BY rowid ASC",
+                (p_file, rid - 5, rid + 5)
+            ).fetchall()
+            
+            contents = [n['content_text'] for n in neighbors if n['content_text']]
+            if not contents: return target['content_text'] or ""
+            
+            return "\n--- [自动加载上下文关联] ---\n" + "\n\n".join(contents)
     except Exception as e:
-        return f"Error reading file: {str(e)}"
+        return f"读取失败: {e}"
 
-
-def wiki_read_chunk(chunk_id: str) -> str:
-    """按 ID 读取知识片段内容 (向下兼容)"""
-    row = get_chunk_by_id(chunk_id)
-    if not row:
-        return ""
-    cp = str(row["content_path"])
-    p = Path(cp) if Path(cp).is_absolute() else (PROJECT_ROOT / cp)
-    if not p.exists():
-        return ""
-    try:
-        return p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return ""
-
-
-def wiki_list_structure() -> list[dict[str, Any]]:
-    """供 UI 使用的结构化列表"""
+def wiki_list_structure() -> List[Dict[str, Any]]:
+    from src.utils.db_manager import list_structure
     items = list_structure()
     return [{"parent_file": p, "chunk_count": c} for p, c in items]
-
-
-# --- 别名兼容 ---
-wiki_list_files = wiki_list
-wiki_read_file = wiki_read

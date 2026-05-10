@@ -9,6 +9,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CWD_ROOT = Path.cwd().resolve()
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / ".wikicoder" / "config.yaml"
 DEFAULT_CONFIG_EXAMPLE_PATH = PROJECT_ROOT / ".wikicoder" / "config.example.yaml"
 
@@ -42,6 +43,7 @@ class WikiStrategyConfig:
     split_mode: str
     heading_level: int
     wiki_compile_on_sync: bool
+    schema_path: Path  # [NEW] WikiCoder 语义规则路径
     style_guidelines: dict[str, Any]
     concept_cues: list[str]
     comparison_hints: list[str]
@@ -69,6 +71,7 @@ class WikiStrategyConfig:
     rag_filename_boost_terms: list[str] # 文件名/路径命中奖励关键词
     rag_filename_boost_score: float     # 文件名命中奖励分
     agent_search_limit: int             # WikiAgent 检索时的默认召回条数
+    report_template: str                # [新增] 报告合成模板名称
 
 
 @dataclass
@@ -84,9 +87,14 @@ class AppConfig:
 
 
 
-def _resolve_path(value: str | Path) -> Path:
+def _resolve_path(value: str | Path | None) -> Path | None:
+    """[路径原子化] 仅在有明确输入时解析路径，拒绝盲目猜测当前目录"""
+    if value is None or str(value).strip() == "":
+        return None
+    
     p = Path(value).expanduser()
     if not p.is_absolute():
+        # 如果是相对路径，则相对于代码根目录解析
         p = (PROJECT_ROOT / p).resolve()
     return p
 
@@ -139,27 +147,77 @@ def _infer_wiki_category(name: str) -> str:
 
 
 def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
+    # [关键变更] 拒绝回退到代码库内部路径
     vault_raw = str(wiki_data.get("vault_path", "")).strip()
-    vault_path = _resolve_path(vault_raw) if vault_raw else None
+    vault_path = _resolve_path(vault_raw)
 
-    raw_dir = str(wiki_data.get("raw_dir", "raw"))
-    wiki_dir = str(wiki_data.get("wiki_dir", "wiki"))
-    processed_dir = str(wiki_data.get("processed_dir", "wiki_processed"))
+    if vault_path is None:
+        # 如果没有配置 vault_path，则所有子路径均为 None，强制用户通过 /kbpath 设置
+        return WikiStrategyConfig(
+            vault_path=None,
+            raw_path=None,
+            wiki_path=None,
+            processed_path=None,
+            raw_subdirs=[],
+            wiki_subdirs=[],
+            raw_to_wiki_map={},
+            synonyms_path=None,
+            business_terms_path=None,
+            split_mode="heading",
+            heading_level=2,
+            wiki_compile_on_sync=True,
+            schema_path=None,
+            style_guidelines={},
+            concept_cues=[],
+            comparison_hints=[],
+            entity_org_suffixes=[],
+            entity_type_hints=[],
+            entity_exclude_terms=[],
+            entity_content_cues=[],
+            entity_ignore_terms=[],
+            entity_card_min_mentions=2,
+            entity_card_max_pages=200,
+            entity_card_name_max_len=40,
+            chapter_title_patterns=[],
+            chapter_exact_terms=[],
+            tag_stopwords=[],
+            tag_block_patterns=[],
+            tag_block_prefixes=[],
+            tag_min_len=2,
+            tag_max_len=20,
+            rag_retrieval_fanout=12,
+            rag_rewrite_priority="append",
+            rag_core_boost_score=1000.0,
+            rag_link_follow_limit=3,
+            rag_context_max_chars=2400,
+            rag_filename_boost_terms=[],
+            rag_filename_boost_score=500.0,
+            agent_search_limit=5,
+            report_template="business_audit.md"
+        )
 
+    # 以下逻辑仅在 vault_path 存在时执行
+    raw_val = wiki_data.get("raw_dir", "raw")
+    raw_path = _resolve_path(vault_path / raw_val) if not Path(raw_val).is_absolute() else _resolve_path(raw_val)
+
+    wiki_val = wiki_data.get("wiki_path", "wiki")
+    wiki_path = _resolve_path(vault_path / wiki_val) if not Path(wiki_val).is_absolute() else _resolve_path(wiki_val)
+
+    proc_val = wiki_data.get("processed_dir", "wiki_processed")
+    processed_path = _resolve_path(vault_path / proc_val) if not Path(proc_val).is_absolute() else _resolve_path(proc_val)
+    
+    synonyms_val = wiki_data.get("synonyms_path")
+    synonyms_path = _resolve_path(synonyms_val)
+    
+    terms_val = wiki_data.get("business_terms_path")
+    if terms_val is None: terms_val = "./data/dictionaries/business_terms.yaml"
+    business_terms_path = _resolve_path(terms_val)
+
+    # [NEW] 自动探测 .wikicoder/schema.yaml
     if vault_path:
-        raw_default = vault_path / raw_dir
-        wiki_default = vault_path / wiki_dir
-        processed_default = vault_path / processed_dir
+        schema_path = vault_path / ".wikicoder" / "schema.yaml"
     else:
-        raw_default = PROJECT_ROOT / "data" / "raw"
-        wiki_default = PROJECT_ROOT / "data" / "wiki"
-        processed_default = PROJECT_ROOT / "data" / "wiki_processed"
-
-    raw_path = _resolve_path(wiki_data.get("raw_path", str(raw_default)))
-    wiki_path = _resolve_path(wiki_data.get("wiki_path", str(wiki_default)))
-    processed_path = _resolve_path(wiki_data.get("processed_path", str(processed_default)))
-    synonyms_path = _resolve_path(wiki_data.get("synonyms_path", "./data/dictionaries/synonyms_zh.yaml"))
-    business_terms_path = _resolve_path(wiki_data.get("business_terms_path", "./data/dictionaries/business_terms.yaml"))
+        schema_path = PROJECT_ROOT / ".wikicoder" / "schema.yaml"
 
     # Support both raw_subdirs and legacy typo row_subdirs
     raw_subdirs_cfg = wiki_data.get("raw_subdirs")
@@ -206,6 +264,7 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
         split_mode=str(wiki_data.get("split_mode", "heading")),
         heading_level=int(wiki_data.get("heading_level", 2)),
         wiki_compile_on_sync=bool(wiki_data.get("wiki_compile_on_sync", True)),
+        schema_path=schema_path,
         style_guidelines=wiki_data.get("style_guidelines", {}),
         concept_cues=_rule_list("concept_cues"),
         comparison_hints=_rule_list("comparison_hints"),
@@ -233,6 +292,7 @@ def _build_wiki_strategy(wiki_data: dict[str, Any]) -> WikiStrategyConfig:
         rag_filename_boost_terms=_rule_list("rag_filename_boost_terms"),
         rag_filename_boost_score=float(rules_data.get("rag_filename_boost_score", default_rules.get("rag_filename_boost_score", 500.0))),
         agent_search_limit=max(1, _rule_int("agent_search_limit", 5)),
+        report_template=str(wiki_data.get("report_template", "business_audit.md")),
     )
 
 
@@ -245,22 +305,30 @@ def ensure_workspace(config: AppConfig | None = None) -> None:
         except Exception:
             cfg = None
 
-    dirs = [PROJECT_ROOT / "logs", PROJECT_ROOT / "data" / "dictionaries", PROJECT_ROOT / ".wikicoder"]
-    if cfg is not None:
+    # 1. 创建必要的系统级目录（日志、项目配置等）
+    dirs = [PROJECT_ROOT / "logs", PROJECT_ROOT / ".wikicoder"]
+    
+    # 2. 只有在配置了知识库路径后，才创建业务目录
+    if cfg is not None and cfg.wiki_strategy.vault_path is not None:
         ws = cfg.wiki_strategy
-        dirs.extend([ws.raw_path, ws.wiki_path, ws.processed_path, ws.processed_path / "chunks"])
+        v_path = ws.vault_path
+        # 强制在库目录下建立元数据中心
+        dirs.extend([v_path / ".wikicoder", ws.raw_path, ws.wiki_path, ws.processed_path, ws.processed_path / "chunks"])
         dirs.extend([ws.raw_path / d for d in ws.raw_subdirs])
         dirs.extend([ws.wiki_path / d for d in ws.wiki_subdirs])
-    else:
-        dirs.extend([
-            PROJECT_ROOT / "data" / "raw",
-            PROJECT_ROOT / "data" / "wiki",
-            PROJECT_ROOT / "data" / "wiki_processed",
-            PROJECT_ROOT / "data" / "wiki_processed" / "chunks",
-        ])
 
     for d in dirs:
-        d.mkdir(parents=True, exist_ok=True)
+        if d:
+            d.mkdir(parents=True, exist_ok=True)
+
+    # 3. [核心补丁] 自动同步 Schema 模版到新库
+    if cfg is not None and cfg.wiki_strategy.vault_path is not None:
+        schema_file = cfg.wiki_strategy.vault_path / ".wikicoder" / "schema.yaml"
+        if not schema_file.exists():
+            template_path = PROJECT_ROOT / "src" / "templates" / "schema_template.yaml"
+            if template_path.exists():
+                schema_content = template_path.read_text(encoding="utf-8")
+                schema_file.write_text(schema_content, encoding="utf-8")
 
 
 

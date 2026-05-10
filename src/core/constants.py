@@ -5,7 +5,7 @@ constants.py - WikiCoder 指令系统的唯一真理来源。
 CORE_COMMANDS = {
     "/archive": "总结会话并存档到 Wiki",
     "/model": "切换 AI 模型",
-    "/mode": "切换模式 (plan/build)",
+    "/mode": "切换模式 (chat/agent)",
     "/kbpath": "设置库路径",
     "/sync": "同步知识库索引",
     "/status": "查看运行状态",

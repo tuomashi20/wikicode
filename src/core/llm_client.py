@@ -143,6 +143,7 @@ class LLMClient:
         payload = {
             "model": self.config.model,
             "temperature": self.config.temperature,
+            "max_tokens": 4096,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -165,10 +166,12 @@ class LLMClient:
             client = OpenAI(
                 base_url=self._jiutian_base_url(),
                 api_key=self.config.api_key,
+                timeout=self.config.timeout_seconds
             )
             resp = client.chat.completions.create(
                 model=self.config.model or "jiutian-think-v3",
                 temperature=self.config.temperature,
+                max_tokens=4096,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -182,6 +185,7 @@ class LLMClient:
             payload = {
                 "model": self.config.model or "jiutian-think-v3",
                 "temperature": self.config.temperature,
+                "max_tokens": 4096,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -201,6 +205,7 @@ class LLMClient:
         client = OpenAI(
             base_url=self._jiutian_base_url(),
             api_key=self.config.api_key,
+            timeout=self.config.timeout_seconds
         )
         stream = client.chat.completions.create(
             model=self.config.model or "jiutian-lan-comv3",
@@ -231,6 +236,7 @@ class LLMClient:
             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             "generationConfig": {
                 "temperature": self.config.temperature,
+                "maxOutputTokens": 4096,
             },
         }
         headers = {"Content-Type": "application/json"}
@@ -248,7 +254,7 @@ class LLMClient:
         try:
             from openai import OpenAI  # type: ignore
             base = (self.config.base_url or "https://api.openai.com/v1").rstrip("/")
-            client = OpenAI(base_url=base, api_key=self.config.api_key)
+            client = OpenAI(base_url=base, api_key=self.config.api_key, timeout=self.config.timeout_seconds)
             stream = client.chat.completions.create(
                 model=self.config.model,
                 temperature=self.config.temperature,
@@ -374,6 +380,11 @@ class LLMClient:
         # some APIs may return text under different paths
         if "output_text" in data:
             return str(data.get("output_text", "")).strip()
+        
+        # 兼容九天模型的私有报错格式，防止返回空字符串导致解析失败
+        if data.get("status") == "error" and "message" in data:
+            return f"Error from LLM Provider: {data.get('message')}"
+            
         return ""
 
     def _jiutian_chat_url(self) -> str:

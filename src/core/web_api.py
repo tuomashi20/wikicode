@@ -21,7 +21,8 @@ from pydantic import BaseModel
 
 from src.utils.config import load_config, PROJECT_ROOT, DEFAULT_CONFIG_PATH, ensure_workspace
 from src.core.wikicoder_engine import BuildAgent, BuildStep
-from src.cli.commands_wiki import run_sync
+from src.cli.commands_wiki import app as cli_app
+from src.skills.wiki_skill import sync_kb, clear_kb, set_vault_path, get_structure
 from src.skills.chat_archive_skill import archive_chat_to_md, mem_draft_archive
 from src.core.constants import CORE_COMMANDS, get_command_list
 # from src.core.business_ops import get_pure_business_graph, run_business_audit
@@ -56,7 +57,7 @@ class ChatRequest(BaseModel):
     query: str
     history: list = []
     cwd: str = "."
-    mode: str = "plan"
+    mode: str = "chat"
     agent_search_limit: int | None = None
     rag_filename_boost_terms: list | None = None
     report_template: str | None = None
@@ -82,22 +83,28 @@ async def chat(chat_request: ChatRequest, request: Request):
             agent_done = False
             
             def _on_step(step: BuildStep) -> bool:
-                is_dangerous = step.action_type in ["shell", "python", "edit_file"]
+                # 危险操作拦截逻辑
+                is_dangerous = step.action_type in ["shell", "python", "edit_file", "write_file"]
                 confirm_id = str(uuid.uuid4()) if is_dangerous else ""
-                thought_prefix = ""
-                if step.action_type == "search_chunks": thought_prefix = "🔍 正在深入检索知识库..."
-                elif step.action_type == "read_file": thought_prefix = "📖 正在调阅相关文档..."
-                elif step.action_type == "search_web": thought_prefix = "🌐 正在接入互联网检索..."
-                elif step.action_type == "write_file": thought_prefix = "📝 正在根据构思同步文件..."
-                display_thought = f"{thought_prefix}\n{step.thought}" if thought_prefix else step.thought
+                
+                # [Sync] 交互式请示识别
+                is_interaction = step.action_type == "ask_user"
+                interaction_data = {}
+                if is_interaction:
+                    try:
+                        interaction_data = json.loads(step.action_input)
+                    except:
+                        interaction_data = {"question": step.action_input}
 
                 status_queue.put({
                     "type": "step", 
-                    "thought": display_thought,
+                    "thought": step.thought,
                     "action_type": step.action_type,
+                    "action_input": step.action_input,
                     "tasks": step.tasks,
-                    "require_confirm": is_dangerous,
-                    "confirm_id": confirm_id
+                    "require_confirm": is_dangerous or is_interaction,
+                    "confirm_id": confirm_id,
+                    "interaction": interaction_data # 透传结构化的问题与选项
                 })
                 
                 if is_dangerous:
@@ -109,7 +116,8 @@ async def chat(chat_request: ChatRequest, request: Request):
                 return True
 
             def _on_log(content: str) -> bool:
-                if content.startswith("[") or "步骤" in content:
+                # 增强日志识别
+                if "正在同步内置长程记忆" in content or "WikiCoder [AGENT]" in content:
                     status_queue.put({"type": "step", "thought": content, "action_type": "info"})
                 else:
                     status_queue.put({"type": "log", "content": content})
@@ -153,7 +161,12 @@ async def chat(chat_request: ChatRequest, request: Request):
                             yield f"data: {json.dumps({'output': item['content']}, ensure_ascii=False)}\n\n"
                             await asyncio.sleep(0) 
                         elif item["type"] == "done":
-                            yield f"data: {json.dumps({'thought': '任务完成', 'output': item['output']}, ensure_ascii=False)}\n\n"
+                            is_interrupted = item['output'] == "__INTERRUPTED_WAITING_USER__"
+                            yield f"data: {json.dumps({
+                                'thought': '等待用户决策' if is_interrupted else '任务完成', 
+                                'output': item['output'],
+                                'is_interrupted': is_interrupted
+                            }, ensure_ascii=False)}\n\n"
                             await asyncio.sleep(0) 
                             agent_done = True
                         elif item["type"] == "error":
@@ -242,22 +255,41 @@ async def execute_command(req: dict):
     try:
         # [1] 核心业务逻辑
         if cmd_name == "sync":
-            result = run_sync()
+            result = sync_kb()
             return {"status": "success", "output": f"✅ **同步完成**\n- 修改文件: `{result.get('files', 0)}`"}
             
         elif cmd_name == "structure":
-            from src.skills.wiki_tools import wiki_list_structure
-            items = wiki_list_structure()
+            items = get_structure()
             if not items: return {"status": "success", "output": "📭 当前知识库索引为空。"}
             table = "| 文件名 | 切片数 |\n| :--- | :--- |\n"
             for it in items: table += f"| {it['parent_file']} | {it['chunk_count']} |\n"
             return {"status": "success", "output": f"📊 **知识库物理结构**:\n\n{table}"}
+            
+        elif cmd_name == "kbclear":
+            msgs = clear_kb(all_data=True)
+            return {"status": "success", "output": "### 🧹 知识库清理报告\n\n" + "\n".join([f"- {m}" for m in msgs])}
+
+        elif cmd_name == "kbbackups":
+            from src.skills.kb_backup_skill import get_backups
+            items = get_backups(limit=10)
+            if not items: return {"status": "success", "output": "📭 暂无备份记录。"}
+            lines = [f"- **{it['id']}** ({it['created_at']})" for it in items]
+            return {"status": "success", "output": "📅 **知识库备份列表**:\n\n" + "\n".join(lines)}
+
+        elif cmd_name == "kbsave":
+            from src.skills.kb_backup_skill import create_backup
+            bid, msgs = create_backup(name=arg or None)
+            return {"status": "success" if bid else "error", "output": f"✅ **备份创建成功**: `{bid}`\n\n" + "\n".join(msgs)}
+
+        elif cmd_name == "kbrestore":
+            if not arg: return {"status": "error", "output": "❌ 请指定要恢复的备份 ID"}
+            from src.skills.kb_backup_skill import restore_backup_by_id
+            ok, msgs = restore_backup_by_id(arg)
+            return {"status": "success" if ok else "error", "output": "\n".join(msgs)}
 
         elif cmd_name in ["vaultpath", "kbpath"]:
             if not arg: return {"status": "error", "output": "❌ 请指定路径"}
-            from src.cli.commands_wiki import _set_vault_path
-            ok, msg = _set_vault_path(arg)
-            if ok: ensure_workspace(load_config())
+            ok, msg = set_vault_path(arg)
             return {"status": "success" if ok else "error", "output": msg}
 
         elif cmd_name == "status":
@@ -275,15 +307,15 @@ async def execute_command(req: dict):
             return {"status": "success", "output": "👋 感谢使用 WikiCoder！您可以直接点击侧边栏顶部的关闭图标或切换到其他插件。"}
 
         elif cmd_name == "version":
-            return {"status": "success", "output": "🚀 **WikiCoder Pro**\n- 核心引擎: `v3.2.0`\n- 适配层: `v1.2.9` (Full Align)"}
+            return {"status": "success", "output": "🚀 **WikiCoder Pro**\n- 核心引擎: `v4.2.0` (Interactive Core)\n- 适配层: `v2.1.0` (Obsidian Ready)"}
 
         elif cmd_name == "archive":
             if not history: return {"status": "error", "output": "❌ 归档失败：对话历史为空。"}
             ok, path = archive_chat_to_md(history)
             return {"status": "success" if ok else "error", "output": f"✅ 已为您生成正式归档：\n`{path}`" if ok else f"❌ 归档失败: {path}"}
 
-        # [2] 万能代理 (降级至 CLI 执行)
-        cli_cmds = ["xlsx2md", "pdf2md", "docx2md", "kbclear", "kbbackups", "kbrestore", "kbsave", "version", "undo"]
+        # [2] 工具类代理 (仅保持文档转换等原子工具)
+        cli_cmds = ["xlsx2md", "pdf2md", "docx2md", "version", "undo"]
         if cmd_name in cli_cmds:
             executable = sys.executable
             main_script = str(PROJECT_ROOT / "src" / "main.py")
@@ -303,7 +335,7 @@ async def execute_command(req: dict):
             return {"status": "error", "output": "❌ 未发现可恢复的会话记录。"}
 
         elif cmd_name == "mode":
-            if arg in ["plan", "build"]: return {"status": "success", "output": f"🔄 **模式已切换**: `{arg.upper()}`", "mode": arg}
+            if arg in ["chat", "agent"]: return {"status": "success", "output": f"🔄 **模式已切换**: `{arg.upper()}`", "mode": arg}
             return {"status": "error", "output": "❌ 请指定模式"}
 
         elif cmd_name == "model":

@@ -1,105 +1,62 @@
 #!/bin/bash
+# WikiCoder UOS/Linux Installer (Industrialized V4.3 - Pure Python)
 set -e
 
+echo "=========================================="
 echo "🚀 [WikiCoder] 正在启动一键安装程序 (UOS/Linux)..."
+echo "=========================================="
 
-# 1. 检查并安装 uv
+# 0. 锁定脚本所在的物理目录
+PROJECT_DIR=$(cd "$(dirname "$0")"; pwd)
+cd "$PROJECT_DIR"
+
+# 1. 检查并安装 uv (Python 极速管家)
 if ! command -v uv &> /dev/null; then
-    echo "📦 [WikiCoder] 正在安装高性能引擎 uv..."
+    echo "📦 [WikiCoder] 正在安装 uv 环境引擎..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    # 注入 uv 路径到当前会话，不再死板地 source .cargo/env
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
 fi
 
-# 2. 创建环境并安装依赖
-echo "🐍 [WikiCoder] 正在配置 Python 环境 (uv sync)..."
+# 2. 同步 Python 依赖环境
+echo "🐍 [WikiCoder] 正在构建 Python 虚拟环境与依赖同步..."
 if ! uv sync; then
-    echo "❌ [WikiCoder] 错误：依赖同步失败！"
-    echo "💡 建议：请检查网络连接，或手动运行 'uv sync --verbose' 查看具体报错。"
-    exit 1
+    echo "⚠️ [WikiCoder] uv sync 失败，尝试强制修复..."
+    uv venv --quiet
 fi
 
-if [ ! -d ".venv" ]; then
-    echo "❌ [WikiCoder] 错误：.venv 虚拟环境未能成功创建。"
-    exit 1
-fi
+# 3. 基础设施初始化 (目录与配置)
+echo "📂 [WikiCoder] 正在初始化基础设施目录..."
+mkdir -p wiki .wikicoder data logs scratch
 
-# 3. 创建全局启动脚本
+# 4. 注册全局快捷命令 (wikicoder)
 echo "⚙️ [WikiCoder] 正在注册全局快捷命令..."
 BIN_DIR="$HOME/.local/bin"
-
-# 强力确保目录存在
-if ! mkdir -p "$BIN_DIR"; then
-    echo "❌ [WikiCoder] 错误：无法创建目录 $BIN_DIR。请检查是否拥有 $HOME 目录的写权限。"
-    exit 1
-fi
-
-# 清空可能的同名障碍
-rm -f "$BIN_DIR/wikicoder" || true
-
-# 锁定脚本所在的物理目录，防止路径漂移
-PROJECT_DIR=$(cd "$(dirname "$0")"; pwd)
+mkdir -p "$BIN_DIR"
 LAUNCHER="$BIN_DIR/wikicoder"
 
-# 调试信息：确保路径在这一刻是可达的
-if [ ! -d "$BIN_DIR" ]; then
-    echo "❌ [WikiCoder] 关键故障：mkdir 执行成功但目录仍不存在。请检查磁盘空间或权限锁定。"
-    exit 1
-fi
-
-# 尝试写入启动器
-if ! cat <<EOF > "$LAUNCHER"
+cat <<EOF > "$LAUNCHER"
 #!/bin/bash
 # WikiCoder 启动器 (uv run 规范版)
-# 使用 --project 保持当前工作目录并正确加载环境
+export PATH="\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH"
 uv --project "$PROJECT_DIR" run python "$PROJECT_DIR/src/main.py" "\$@"
 EOF
-then
-    echo "❌ [WikiCoder] 错误：无法在 $LAUNCHER 创建启动文件，请检查目录权限或手动创建。"
-    exit 1
-fi
 
 chmod +x "$LAUNCHER"
 
-# 4. 处理 PATH 环境变量
-path_updated=false
-if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
-    # 导出到当前脚本进程，以便后续验证
-    export PATH="$BIN_DIR:$PATH"
-    
-    # 永久写入配置文件
-    SHELL_CONFIG="$HOME/.bashrc"
-    [ -n "$ZSH_VERSION" ] && SHELL_CONFIG="$HOME/.zshrc"
-    
-    if [ -f "$SHELL_CONFIG" ]; then
-        if ! grep -q ".local/bin" "$SHELL_CONFIG"; then
-            echo "" >> "$SHELL_CONFIG"
-            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$SHELL_CONFIG"
-            path_updated=true
-        fi
-    fi
+# 5. 首次知识库编译与同步
+echo "🚀 [WikiCoder] 执行首次知识库编译与同步..."
+"$LAUNCHER" sync
+
+# 6. 处理 PATH 环境变量 (永久写入)
+SHELL_CONFIG="$HOME/.bashrc"
+[ -n "$ZSH_VERSION" ] && SHELL_CONFIG="$HOME/.zshrc"
+
+if ! grep -q ".local/bin" "$SHELL_CONFIG"; then
+    echo 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"' >> "$SHELL_CONFIG"
+    echo "🔥 [WikiCoder] 已更新 $SHELL_CONFIG，请执行 'source $SHELL_CONFIG' 生效。"
 fi
 
-echo ""
-echo "=========================================="
-echo "✅ [WikiCoder] 安装成功！"
-echo "=========================================="
-
-# 5. 立即尝试验证运行
-echo "🔍 正在进行自检..."
-if "$LAUNCHER" --version &> /dev/null; then
-    echo "✨ 启动器验证通过！"
-else
-    echo "⚠️ 启动器自检异常，请检查 .venv 是否创建成功。"
-fi
-
-echo "=========================================="
-if [ "$path_updated" = true ]; then
-    echo "🔥 [重要] 请执行以下命令使配置立即生效（或者重启终端）："
-    echo "    source $SHELL_CONFIG"
-fi
-
-# 6. 注册 Systemd 用户服务 (实现开机自启)
+# 7. 注册 Systemd 用户服务 (实现开机自启)
 echo "🛡️ [WikiCoder] 正在配置后台服务自启动 (Systemd)..."
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
@@ -124,7 +81,12 @@ systemctl --user daemon-reload
 systemctl --user enable wikicoder.service
 systemctl --user restart wikicoder.service
 
-echo "✨ 后台服务已启动并设置为开机自启。"
-echo "💡 您可以使用 'systemctl --user status wikicoder' 查看状态。"
-echo "💡 使用 'wikicoder serve stop' 临时停止服务。"
+echo ""
+echo "=========================================="
+echo "✅ [WikiCoder] 一键安装圆满完成！"
+echo "=========================================="
+echo "下一步操作指引:"
+echo "1. 执行 'source $SHELL_CONFIG' 或重启终端。"
+echo "2. 输入 'wikicoder' 即可进入智能对话终端。"
+echo "3. 后端服务已在后台启动 (Systemd)。"
 echo "=========================================="

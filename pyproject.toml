@@ -29,7 +29,8 @@ dependencies = [
   "python-dateutil>=2.9.0.post0",
   "textual>=8.2.5",
   "tree-sitter-markdown>=0.5.1",
-  "mcp>=1.27.0",
+  "beautifulsoup4>=4.14.3",
+  "tabulate>=0.10.0",
 ]
 
 [project.scripts]

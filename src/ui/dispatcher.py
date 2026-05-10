@@ -26,26 +26,34 @@ class TUIDispatcher:
                     app_instance.agent = app_instance.agent_factory(app_instance.config)
                 
                 # 执行专家同步
-                success = app_instance.agent.sync(on_status=log_func)
+                res = app_instance.agent.sync(on_status=log_func)
                 
-                # 读取最新结果进行最终报告
-                report = "❌ 同步失败"
-                output_json = Path("d:/project/wikicode/graphify_out/.graphify_pure_merged.json")
-                if output_json.exists():
-                    import json
-                    data = json.loads(output_json.read_text(encoding='utf-8'))
-                    nodes = data.get('nodes', [])
-                    rich_atoms = [n for n in nodes if n.get('type') == 'semantic_atom' and len(n.get('properties', {})) > 0]
-                    report = f"### ✅ 专家级同步完成\n\n- **提炼原子**: {len(nodes)} 个\n- **结构化语义**: {len(rich_atoms)} 条\n\n> 提示：现在的检索已具备深度业务逻辑感知能力。"
+                if isinstance(res, dict) and "error" in res:
+                    report = f"❌ 同步失败: {res['error']}"
+                elif isinstance(res, dict):
+                    report = f"### ✅ 知识库同步完成 (V2.0)\n\n- **处理文件**: {res.get('files', 0)} 个 (已镜像至 gbrain)\n- **跳过未变**: {res.get('skipped', 0)} 个\n- **清理删除**: {res.get('deleted', 0)} 个\n- **生成切片**: {res.get('chunks', 0)} 条\n\n> 提示：Agent 模式现已激活 **gbrain 语义引擎**，可处理深层业务逻辑。"
+                else:
+                    report = "✅ 同步已完成。"
                 
-                return {"output": report}
+                log_func(report)
+                return {"status": "success"}
             
             elif root == "/kbpath":
+                if not arg or not arg.strip():
+                    log_func("[red]❌ 请指定知识库路径！用法: /kbpath <绝对路径>[/red]")
+                    return {"status": "error"}
+                    
                 ok, msg = set_vault_path(arg)
                 log_func(f"[{'green' if ok else 'red'}]{msg}[/]")
+                if ok:
+                    app_instance.config = load_config()
+                    app_instance.agent = None
+                    log_func("[dim]系统配置已重载，专家模块已重定向。[/dim]")
             
             elif root == "/kbclear":
-                msgs = clear_kb(all_data=(arg == "--all"))
+                # 兼容多种输入格式，只要带 all 就算全量清理
+                is_all = "all" in arg.lower()
+                msgs = clear_kb(all_data=is_all)
                 log_func("\n".join([f"[yellow]{m}[/yellow]" for m in msgs]))
             
             elif root == "/kbbackups":
@@ -69,21 +77,6 @@ class TUIDispatcher:
                 if ok: log_func(f"[bold green]✅ 已为您生成正式全量归档: {path}[/bold green]")
                 else: log_func(f"[red]❌ 归档失败: {path}[/red]")
 
-            elif root == "/pdf2md":
-                from src.skills.pdf_tools import convert_pdf_path
-                outs, errs = convert_pdf_path(arg, recursive=True)
-                log_func(f"PDF Convert: Done={len(outs)}, Errors={len(errs)}")
-            
-            elif root == "/docx2md":
-                from src.skills.docx_tools import convert_docx_path
-                outs, errs = convert_docx_path(arg, recursive=True)
-                log_func(f"Docx Convert: Done={len(outs)}, Errors={len(errs)}")
-            
-            elif root == "/xlsx2md":
-                from src.skills.xlsx_tools import convert_xlsx_path
-                outs, errs = convert_xlsx_path(arg, recursive=True)
-                log_func(f"Excel Convert: Done={len(outs)}, Errors={len(errs)}")
-                
             elif root == "/status":
                 cfg = load_config()
                 status = [
@@ -95,18 +88,8 @@ class TUIDispatcher:
                 ]
                 log_func("\n".join(status))
 
-            elif root == "/undo":
-                # 尝试调用 cli 层的 undo
-                executable = __import__('sys').executable
-                main_script = str(__import__('src.utils.config', fromlist=['PROJECT_ROOT']).PROJECT_ROOT / "src" / "main.py")
-                res = __import__('subprocess').run([executable, main_script, "undo"], capture_output=True, text=True, encoding="utf-8")
-                log_func(f"[yellow]⏪ 撤销执行结果:[/yellow]\n{res.stdout or res.stderr}")
-
-            elif root == "/md2canvas_ai":
-                log_func("[magenta]🚀 AI Canvas 转换引擎已准备就绪，正在分析当前上下文...[/magenta]")
-
             elif root == "/version":
-                log_func("[bold cyan]WikiCoder Pro TUI v3.2.1 [Full Align][/bold cyan]")
+                log_func("[bold cyan]WikiCoder Pro TUI v4.0.0 [Dual-Core][/bold cyan]")
 
             else:
                 log_func(f"[red]未知指令: {root}[/red]")

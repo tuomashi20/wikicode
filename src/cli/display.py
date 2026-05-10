@@ -13,7 +13,7 @@ from src.skills.code_tools import summarize_unified_diff
 from src.core.llm_client import global_stats
 
 class LiveUI:
-    """OpenCode 风格的动态布局管理器"""
+    """WikiCoder 风格的动态布局管理器"""
     def __init__(self, config: AppConfig, mode: str):
         self.config = config
         self.mode = mode

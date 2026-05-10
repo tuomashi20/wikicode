@@ -19,12 +19,38 @@ from textual.screen import Screen
 from rich.text import Text
 from rich.panel import Panel
 from rich.markdown import Markdown
+from rich.style import Style
+from rich.theme import Theme
+
+# 定义 WikiCoder 专属的清爽配色主题
+WIKICODER_THEME = Theme({
+    "markdown.h1": "bright_cyan bold",
+    "markdown.h2": "bright_cyan bold underline",
+    "markdown.h3": "bright_cyan bold",
+    "markdown.h4": "yellow bold",
+    "markdown.strong": "white bold",
+    "markdown.italic": "magenta italic",
+    "markdown.block_quote": "bright_black italic",
+    "markdown.hr": "cyan",
+    "markdown.code": "bright_green",
+    "markdown.code_block": "bright_white on #1e1e1e",
+    "table.header": "bright_cyan bold",
+    "table.footer": "bright_cyan bold",
+    "table.title": "bright_white bold",
+    "table.caption": "dim",
+})
+
+class StyledMarkdown(Markdown):
+    """支持自定义主题的 Markdown 渲染器，兼容旧版 rich"""
+    def __rich_console__(self, console, options):
+        with console.use_theme(WIKICODER_THEME):
+            yield from super().__rich_console__(console, options)
 
 # 模拟之前的配置结构
-from src.core.build_agent import BuildStep
+from src.core.types import BuildStep
 from src.core.constants import CORE_COMMANDS
 
-class AgentStepMessage(Message):
+class BuildStepMessage(Message):
     """自定义消息：用于从后台线程向 UI 传递 Agent 步进信息"""
     def __init__(self, step: BuildStep) -> None:
         self.step = step
@@ -74,6 +100,20 @@ class WikiInput(TextArea):
         super().__init__(**kwargs)
         # 移除强制的 markdown 语言设置，防止 tree-sitter 缺失报错
         self.show_line_numbers = False 
+
+    def action_undo(self) -> None:
+        """安全撤销：防止 Textual 在文档缩减时光标越界崩溃"""
+        try:
+            super().action_undo()
+        except ValueError:
+            self.cursor_location = (0, 0)
+
+    def action_redo(self) -> None:
+        """安全重做：防止 Textual 光标同步异常"""
+        try:
+            super().action_redo()
+        except ValueError:
+            self.cursor_location = (0, 0)
 
     def _on_key(self, event) -> None:
         popup = self.app.query_one("#command-popup")
@@ -130,25 +170,56 @@ class WikiInput(TextArea):
             self.insert("\n")
             event.stop(); event.prevent_default()
 
+class AskUserScreen(Screen):
+    """[工业级交互] 决策确认弹窗，支持按钮选择与开放输入"""
+    def __init__(self, question: str, options: List[str] = None):
+        super().__init__()
+        self.question = question
+        self.options = options or ["是", "否"]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ask-user-container"):
+            yield Label("🎯 决策请求", id="ask-user-title")
+            yield Static(self.question, id="ask-user-question")
+            
+            with Horizontal(id="ask-user-options"):
+                for i, opt in enumerate(self.options):
+                    yield Button(opt, variant="primary", id=f"opt-{i}")
+            
+            yield Label("或者在下方补充详细指令:", id="ask-user-hint")
+            yield Input(placeholder="输入自定义答复...", id="ask-user-input")
+            yield Label("按 Enter 确认自定义输入 | 点击按钮直接选择", id="ask-user-footer")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        # 提取按钮文本
+        res = str(event.button.label)
+        self.dismiss(res)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.value.strip():
+            self.dismiss(event.value.strip())
+
 class WikiCoderApp(App):
     """WikiCoder v3.2: 全功能工业级 Textual 交互界面"""
     
     CSS = """
     Screen {
-        background: #0f0f0f;
+        background: #0B0C10;
         layers: base popup;
     }
     
     #main-container {
         layout: grid;
         grid-size: 2;
-        grid-columns: 75% 25%;
+        grid-columns: 70% 30%;
         height: 1fr;
+        padding: 1 2;
     }
     
     #history-panel {
-        background: #0f0f0f;
-        overflow-x: hidden;
+        background: transparent;
+        overflow-y: scroll;
+        padding-right: 2;
     }
     
     #main-log {
@@ -156,22 +227,24 @@ class WikiCoderApp(App):
     }
     
     #sidebar {
-        border-left: solid #222;
-        background: #111;
-        padding: 1;
+        border: solid #1F2833;
+        background: #111418 60%;
+        padding: 1 2;
+        margin-left: 2;
     }
     
     #input-section {
-        height: 5;
-        background: #161616;
-        border-top: solid #333;
-        padding: 0 1;
+        height: 8;
+        background: #161B22;
+        border-top: tall #45A29E;
+        padding: 0 3;
     }
     
     #user-input {
-        height: 3;
+        height: 4;
         border: none;
         background: transparent;
+        color: #66FCF1;
     }
     
     #status-bar {
@@ -181,23 +254,32 @@ class WikiCoderApp(App):
     }
     
     .status-dot {
-        color: #22c55e;
+        color: #66FCF1;
         text-style: bold;
-        margin-right: 1;
     }
     
     #status-text {
-        color: #d1d5db;
-        width: 25;
+        color: #8892B0;
+        width: 40;
+    }
+
+    #cwd-text {
+        color: #444;
+        margin-left: 2;
+    }
+
+    #mouse-hint {
+        color: #66FCF1;
+        margin-left: 2;
     }
 
     #loading-dots {
-        color: #06b6d4;
+        color: #66FCF1;
         text-style: bold;
     }
     
     #interrupt-hint {
-        color: #666;
+        color: #444;
         margin-left: 2;
     }
     
@@ -205,12 +287,12 @@ class WikiCoderApp(App):
         display: none;
         dock: bottom;
         layer: popup;
-        width: 80%;
+        width: 50%;
         height: 14;
-        background: #1c1c1c;
-        border: solid #333;
-        margin-bottom: 7; 
-        margin-left: 2;
+        background: #1F2833;
+        border: thick #66FCF1;
+        margin-bottom: 9; 
+        margin-left: 5;
     }
     
     #command-popup ListView {
@@ -239,39 +321,112 @@ class WikiCoderApp(App):
 
     #task-tree {
         background: transparent;
-        color: #00ff00;
+        color: #66FCF1;
+    }
+
+    /* 决策弹窗样式 */
+    #ask-user-container {
+        width: 60%;
+        height: auto;
+        max-height: 25;
+        background: #111418;
+        border: thick #66FCF1;
+        padding: 1 3;
+        align: center middle;
+    }
+
+    #ask-user-title {
+        color: #66FCF1;
+        text-style: bold;
+        margin-bottom: 1;
+        text-align: center;
+    }
+
+    #ask-user-question {
+        background: #1F2833 20%;
+        padding: 1 2;
+        margin-bottom: 1;
+        color: #C5C6C7;
+        border: round #45A29E;
+    }
+
+    #ask-user-options {
+        height: 4;
+        align: center middle;
+        margin-bottom: 1;
+    }
+
+    #ask-user-options Button {
+        margin: 0 1;
+        background: #1F2833;
+        color: #66FCF1;
+        border: tall #66FCF1;
+    }
+
+    #ask-user-options Button:hover {
+        background: #45A29E;
+        color: #0B0C10;
+    }
+
+    #ask-user-hint {
+        color: #8892B0;
+        margin-top: 1;
+    }
+
+    #ask-user-input {
+        background: #0B0C10;
+        border: solid #45A29E;
+        color: #66FCF1;
+        margin-bottom: 1;
+    }
+
+    #ask-user-footer {
+        color: #444;
+        text-style: italic;
+        text-align: center;
     }
 
     .message-user {
-        background: #1a1a1a;
-        margin: 1 2;
-        padding: 0 1;
-        border-left: solid cyan;
+        background: #45A29E 20%;
+        margin: 1 0 1 15;
+        padding: 1 2;
+        border: round #66FCF1;
+        width: 80%;
+        align-horizontal: right;
     }
 
     .message-bot {
-        margin: 1 2;
-        padding: 0 1;
+        background: #111418;
+        margin: 1 10 1 0;
+        padding: 1 2;
+        border-left: thick #66FCF1;
+        width: 85%;
     }
 
     .message-system {
-        color: #666;
-        margin: 0 2;
+        color: #444;
+        margin: 0 6;
         text-style: italic;
+        text-align: center;
+    }
+    
+    VerticalScroll {
+        scrollbar-size: 1 1;
+        scrollbar-color: #45A29E;
+        scrollbar-color-hover: #66FCF1;
+        scrollbar-background: transparent;
     }
     """
 
     BINDINGS = [
         ("ctrl+q", "quit", "退出"),
-        Binding("f1", "toggle_wiki", "Wiki增强", show=True),
         Binding("ctrl+l", "clear_screen", "清空", show=True),
         Binding("escape", "stop_task", "终止任务", show=True),
         Binding("ctrl+v", "open_reader", "双击文本划选", show=True),
         Binding("ctrl+p", "palette", "命令面板", show=False),
     ]
 
-    session_mode = reactive("plan")
-    wiki_enabled = reactive(False)
+    session_mode = reactive("chat")
     is_processing = reactive(False)
     loading_dots = reactive("...")
     
@@ -286,7 +441,7 @@ class WikiCoderApp(App):
     WIKI_COMMANDS = list(COMMAND_HELP.keys())
 
     COMMAND_METADATA = {
-        "/mode": ["plan", "build"],
+        "/mode": ["chat", "agent"],
         "/model": ["jiutian-think-v3", "jiutian-lan-comv3"],
         "/kbbackups": ["list", "clean"],
     }
@@ -323,7 +478,6 @@ class WikiCoderApp(App):
             with Horizontal(id="status-bar"):
                 yield Label("●", classes="status-dot", id="status-dot")
                 yield Label("Mode: ", id="status-text")
-                yield Label(" Wiki: OFF", id="wiki-status")
                 yield Label(" 🖱️ 双击文本划选", id="mouse-hint")
                 yield Label("", id="cwd-text") 
                 yield Label("", id="loading-dots")
@@ -426,28 +580,15 @@ class WikiCoderApp(App):
     def update_status_bar(self):
         try: model_name = getattr(self.config.llm, 'model', '未知')
         except: model_name = "未知"
-        mode_str = "Build" if self.session_mode == "build" else "Plan"
+        mode_str = "Agent" if self.session_mode == "agent" else "Chat"
         
         # 获取当前工作目录
         current_path = self.agent.cwd if (self.agent and hasattr(self.agent, 'cwd')) else self.initial_cwd
         
-        status = f"[bold white]{mode_str}[/bold white] · [dim]{model_name}[/dim] · [dim]{current_path}[/dim]"
-        self.status_dot.styles.color = "#fbbf24" if self.is_processing else ("#a855f7" if self.wiki_enabled else "#22c55e")
-        self.status_text.update(status)
+        self.status_text.update(f"Mode: [bold #66FCF1]{mode_str}[/] | Model: [#C5C6C7]{model_name}[/]")
+        
+        self.status_dot.styles.color = "#fbbf24" if self.is_processing else "#22c55e"
 
-    def watch_wiki_enabled(self, enabled: bool) -> None:
-        try:
-            ws = self.query_one("#wiki-status", Label)
-            if enabled:
-                ws.update(" 专家模型: ON")
-                ws.styles.color = "#a855f7"
-                ws.styles.text_style = "bold"
-            else:
-                ws.update(" 专家模型: OFF")
-                ws.styles.color = "#d1d5db"
-                ws.styles.text_style = "none"
-            self.update_status_bar()
-        except: pass
 
     def watch_session_mode(self, mode: str):
         self.update_status_bar()
@@ -462,10 +603,7 @@ class WikiCoderApp(App):
         self.history_index = -1; self.input_field.text = ""; self.query_one("#command-popup").styles.display = "none"
         if raw_cmd.startswith("/"): self.route_command(raw_cmd); return
         
-        # Wiki 全局逻辑注入
         processed_cmd = raw_cmd
-        if self.wiki_enabled and "@wikiagent" not in raw_cmd.lower():
-            processed_cmd = f"@wikiagent {raw_cmd}"
             
         self.append_message("user", raw_cmd)
         self.is_processing = True
@@ -478,11 +616,12 @@ class WikiCoderApp(App):
         elif role == "system":
             new_msg = Static(f"{content}", classes="message-system")
         else:
-            # Bot 消息，支持 Markdown
-            new_msg = Static(Markdown(content) if content else "", classes="message-bot")
+            # Bot 消息，使用支持自定义样式的 StyledMarkdown
+            new_msg = Static(StyledMarkdown(content) if content else "", classes="message-bot")
         
         self.history_panel.mount(new_msg)
-        new_msg.scroll_visible()
+        # 强制滚动到底部，确保最新内容可见
+        self.history_panel.scroll_end(animate=False)
         return new_msg
 
     def route_command(self, cmd: str):
@@ -490,7 +629,7 @@ class WikiCoderApp(App):
         
         # 1. 处理 UI 状态同步指令（立即执行）
         if root == "/mode":
-            if arg in ["plan", "build"]: 
+            if arg in ["chat", "agent"]: 
                 self.session_mode = arg
                 from src.cli.repl import _save_session_state
                 _save_session_state(self.session_history, mode=self.session_mode)
@@ -559,12 +698,8 @@ class WikiCoderApp(App):
         TUIDispatcher.execute(root, arg, self, lambda m: self.post_message(AgentLogMessage(m)))
         self.is_processing = False
 
-    def action_toggle_mode(self): self.session_mode = "build" if self.session_mode == "plan" else "plan"
+    def action_toggle_mode(self): self.session_mode = "agent" if self.session_mode == "chat" else "chat"
 
-    def action_toggle_wiki(self):
-        self.wiki_enabled = not self.wiki_enabled
-        state = "开启" if self.wiki_enabled else "关闭"
-        self.notify(f"专家模型增强已{state}", title="🧠 Expert Intelligence", severity="information")
 
     def action_open_reader(self):
         if not self.session_history:
@@ -591,7 +726,7 @@ class WikiCoderApp(App):
         if self.current_worker: 
             self.current_worker.cancel()
             self.is_processing = False
-            self.append_message("system", "正在尝试终止当前任务...")
+            self.notify("⚠️ 正在强制终止任务...", severity="warning", title="刹车已启动")
             self.append_message("system", "System: Stop signal sent. Waiting for agent to safely exit...")
 
     @work(exclusive=True, thread=True)
@@ -604,38 +739,17 @@ class WikiCoderApp(App):
 
             def safe_update_ui(content):
                 if bot_msg:
-                    bot_msg.update(Markdown(content))
-                    bot_msg.scroll_visible()
+                    bot_msg.update(StyledMarkdown(content))
+                    self.history_panel.scroll_end(animate=False)
 
             def on_step(step):
-                nonlocal full_rep
                 # 协作式终止检查
                 from textual.worker import get_current_worker
                 worker = get_current_worker()
                 if worker and worker.is_cancelled: return False
                 
-                # 实时更新思维链与动作流
-                details = []
-                if step.thought:
-                    details.append(f"🧠 {step.thought}")
-                
-                # 根据动作类型增加视觉图标
-                if step.action_type == "search_web": details.append(f"🌐 正在搜索网页: {step.action_input}")
-                elif step.action_type == "search_chunks": details.append(f"🔍 正在检索知识库: {step.action_input}")
-                elif step.action_type == "graph_reasoning":
-                    details.append(f"🧠 **[逻辑官 @graphagent] 会诊见解**：{step.action_input}")
-                elif step.action_type == "wiki_discussion":
-                    details.append(f"📚 **[知识官 @wikiagent] 对话回应**：{step.action_input}")
-                elif step.action_type == "wiki_search_v2":
-                    details.append(f"📚 正在深度研读 Wiki 文档: {step.action_input}")
-                elif step.action_type == "write_file": details.append(f"📝 正在写入文件: {step.action_input}")
-                elif step.action_type: details.append(f"🛠️ 执行操作 ({step.action_type}): {step.action_input}")
-
-                if details:
-                    full_rep += "\n> " + "\n> ".join(details) + "\n"
-                    self.call_from_thread(safe_update_ui, full_rep)
-                
-                self.post_message(AgentStepMessage(step))
+                # 发送步进消息用于更新侧边栏（不重复在日志中打印描述，由内核 on_log 处理）
+                self.post_message(BuildStepMessage(step))
                 return True
 
             def on_log(msg):
@@ -651,18 +765,43 @@ class WikiCoderApp(App):
             if self.agent is None:
                 self.agent = self.agent_factory(self.config)
 
+
             rep = self.agent.run(
                 query,
                 history=self.session_history,
                 on_step=on_step,
                 on_log=on_log,
+                on_token=on_log,  # [流式支持] 直接复用 on_log 的追加更新逻辑
                 mode=self.session_mode,
                 should_stop=lambda: worker.is_cancelled if worker else False
             )
+            
+            # --- [核心增强]：处理交互式中断 ---
+            if rep == "__INTERRUPTED_WAITING_USER__":
+                # 获取最后一步的交互请求数据
+                last_step = self.agent.steps[-1]
+                try:
+                    params = json.loads(last_step.action_input)
+                    question = params.get("question", "未知问题")
+                    options = params.get("options", ["是", "否"])
+                    
+                    def handle_answer(answer):
+                        if answer:
+                            # 将用户选择作为新的 Query 提交，触发断点恢复
+                            self.input_field.text = answer
+                            self.action_submit()
+                            
+                    self.call_from_thread(self.push_screen, AskUserScreen(question, options), handle_answer)
+                except Exception as e:
+                    self.call_from_thread(self.append_message, "system", f"[red]解析交互请求失败: {e}[/red]")
+                return
+
             self.session_history.append((query, rep))
             
-            # 最终呈现结果（替换生长中的临时内容）
-            self.call_from_thread(safe_update_ui, rep)
+            # 最终呈现结果（不再覆盖，因为 on_token 已经实现了实时生长）
+            # 仅在 rep 确实有内容且 full_rep 异常为空时才做补全
+            if rep and not full_rep:
+                self.call_from_thread(safe_update_ui, rep)
         except Exception as e:
             self.call_from_thread(self.append_message, "system", f"[red]Error: {e}[/red]")
         finally:
@@ -673,25 +812,27 @@ class WikiCoderApp(App):
                 _save_session_state(self.session_history, mode=self.session_mode)
             except: pass
 
-    @on(AgentStepMessage)
-    def handle_agent_step(self, message: AgentStepMessage) -> None:
+    @on(BuildStepMessage)
+    def handle_agent_step(self, message: BuildStepMessage) -> None:
         s = message.step
         # 注意：这里的逻辑现在主要用于更新侧边栏和任务树，日志已由流式 Markdown 承接
         # 跟踪修改的文件
-        if s.action_type in ("write", "edit"):
+        if s.action_type in ("write", "edit", "write_file"):
             try:
                 params = __import__('json').loads(s.action_input)
-                fp = params.get('file_path', '')
+                fp = params.get('path') or params.get('file_path', '')
                 if fp:
-                    self.modified_files.add(fp)
+                    self.modified_files.add(str(fp))
                     self._refresh_file_list()
             except Exception:
                 pass
-        # 任务面板
-        if s.tasks:
+        # 任务面板 (增加防御性类型检查，防止非字符串任务导致 split() 崩溃)
+        if hasattr(s, 'tasks') and s.tasks:
             self.task_tree.clear()
             for t in s.tasks:
-                self.task_tree.root.add_leaf(t)
+                # 如果是字典（模型幻觉），尝试提取其描述性字段，否则强制转字符串
+                task_label = t if isinstance(t, str) else (t.get('current') or t.get('task') or str(t))
+                self.task_tree.root.add_leaf(str(task_label))
             self.task_tree.root.expand()
 
     @on(events.Click, ".message-user, .message-bot, .message-system, #history-panel")
@@ -722,5 +863,5 @@ class WikiCoderApp(App):
             pass
 
 if __name__ == "__main__":
-    from src.utils.config import load_config; from src.core.build_agent import BuildAgent
+    from src.utils.config import load_config; from src.core.wikicoder_engine import BuildAgent
     WikiCoderApp(load_config(), lambda cfg: BuildAgent(cfg)).run()

@@ -1,0 +1,49 @@
+# WikiCoder 通用知识提取架构 (Knowledge Schema)
+# 用于指导编译器从 Raw Sources 中提炼结构化 Wiki 页面
+
+# 1. 概念类 (Concept)
+# 适用于：技术名词、专业定义、业务术语
+concept:
+  identify_cues: ["是指", "定义为", "含义", "术语", "指的是"]
+  extract_attributes:
+    - name: "名称"
+    - definition: "定义/核心含义"
+    - context: "适用语境"
+    - synonyms: "同义词/别名"
+
+# 2. 实体类 (Entity)
+# 适用于：具体设备型号、部门、岗位、系统、平台
+entity:
+  identify_cues: ["设备", "型号", "系统", "平台", "单位", "部门", "岗位"]
+  extract_attributes:
+    - name: "名称"
+    - category: "类别"
+    - properties: "关键参数/属性"
+    - relations: "关联实体 (所属、连接、依赖)"
+
+# 3. 断言类 (Assertion/Responsibility)
+# 适用于：职责划分、业务规则、截止时间、标准要求
+assertion:
+  identify_cues: ["负责", "维护", "归属", "划分", "应当", "严禁", "必须"]
+  extract_attributes:
+    - subject: "主体"
+    - action: "动作/职责"
+    - object: "客体"
+    - boundary: "分工界面/边界条件"
+    - priority: "优先级/效力级别"
+
+# 4. 流程类 (Procedure)
+# 适用于：操作手册、报账流程、故障处理步骤
+procedure:
+  identify_cues: ["步骤", "流程", "第一步", "操作指南", "流程图"]
+  extract_attributes:
+    - goal: "目标"
+    - steps: "执行步骤"
+    - input: "输入条件"
+    - output: "产出结果"
+
+# 5. 溯源规范 (Traceability)
+# 强制要求：每一个提取出的属性必须带有原始引用指针
+traceability:
+  format: " (Source: {file_basename}#L{line_number})"
+  conflict_marker: " [!WARNING] 来源冲突：与 {other_file} 描述不一致"

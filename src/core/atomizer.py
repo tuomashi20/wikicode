@@ -50,9 +50,16 @@ class Atomizer:
         current_rel_paths: set[str] = set()
 
         for md_file in md_files:
+            # 确保在 Windows 下路径字符串的 UTF-8 一致性
             rel_raw = str(md_file.relative_to(raw_root)).replace("\\", "/")
             current_rel_paths.add(rel_raw)
-            text = md_file.read_text(encoding="utf-8", errors="ignore")
+            
+            # [核心修复]：自适应编码读取，防止内容静默丢失
+            try:
+                text = md_file.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                text = md_file.read_text(encoding="gbk", errors="replace")
+                
             file_hash = hashlib.md5(text.encode("utf-8", errors="ignore")).hexdigest()
 
             prev_meta = prev_files.get(rel_raw, {})
@@ -78,6 +85,14 @@ class Atomizer:
             prev_meta = prev_files.get(rel_raw, {})
             self._remove_chunk_files([str(x) for x in (prev_meta.get("chunk_ids") or [])])
             delete_chunks_by_parent(rel_raw)
+            
+            # --- [V2.0] gbrain 同步删除 ---
+            try:
+                from src.core.mcp_client import GBrainMCPClient
+                gb_client = GBrainMCPClient()
+                gb_slug = f"wiki/raw/{rel_raw.replace('.md', '')}"
+                gb_client.call_tool("delete_page", {"slug": gb_slug})
+            except: pass
             deleted_files += 1
             self.logger.info("sync_delete file=%s", rel_raw)
 
@@ -110,10 +125,24 @@ class Atomizer:
 
     def _process_file(self, md_file: Path, *, text: str | None = None) -> list[Chunk]:
         if text is None:
-            text = md_file.read_text(encoding="utf-8", errors="ignore")
+            try:
+                text = md_file.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                text = md_file.read_text(encoding="gbk", errors="replace")
         rel_raw = str(md_file.relative_to(self.config.wiki_strategy.raw_path)).replace("\\", "/")
 
         delete_chunks_by_parent(rel_raw)
+
+        # --- [V2.0] gbrain 镜像同步 ---
+        try:
+            from src.core.mcp_client import GBrainMCPClient
+            gb_client = GBrainMCPClient()
+            # 简化 slug: 运维/规范.md -> wiki/raw/运维/规范
+            gb_slug = f"wiki/raw/{rel_raw.replace('.md', '')}"
+            gb_client.call_tool("put_page", {"slug": gb_slug, "content": text})
+            self.logger.info("gbrain_mirror_sync success slug=%s", gb_slug)
+        except Exception as e:
+            self.logger.warn("gbrain_mirror_sync failed err=%s", str(e))
 
         ws = self.config.wiki_strategy
         patterns = getattr(ws, "chapter_title_patterns", [])
@@ -184,30 +213,43 @@ class Atomizer:
         current_body: list[str] = []
         chunk_idx = 1
 
-        def _create_chunk(headers, body, idx):
-            # 过滤掉 None，构造面包屑路径
+        def _create_chunks(headers, body_lines, base_idx):
+            """
+            [V2.1 增强版] 支持长文本二次分段并保留重叠
+            """
+            full_text = "\n".join(body_lines).strip()
+            max_len = 1800 # 单个片段最大字数
+            overlap = 300  # 重叠字数
+            
             breadcrumb = " > ".join([h for h in headers if h])
-            # 注入面包屑到内容头部，增强检索上下文
-            full_content = f"【上下文路径: {breadcrumb}】\n\n" + "\n".join(body).strip()
-            # 取当前最细颗粒度的标题作为 Chunk 标题
-            title = next((h for h in reversed(headers) if h), Path(rel_raw_path).stem)
-            cid = Atomizer._build_chunk_id(rel_raw_path, idx, title)
-            return Chunk(
-                chunk_id=cid,
-                title=title,
-                content=full_content,
-                parent_file=rel_raw_path,
-                raw_file_path=rel_raw_path,
-                breadcrumb=breadcrumb
-            )
-
-        # 已经通过参数 patterns 传入
+            title_base = next((h for h in reversed(headers) if h), Path(rel_raw_path).stem)
+            
+            if len(full_text) <= max_len:
+                # 内容短，直接生成单块
+                cid = Atomizer._build_chunk_id(rel_raw_path, base_idx, title_base)
+                content = f"【上下文路径: {breadcrumb}】\n\n" + full_text
+                return [Chunk(cid, title_base, content, rel_raw_path, rel_raw_path, breadcrumb)], base_idx + 1
+            
+            # 内容长，递归切分
+            sub_chunks = []
+            start = 0
+            sub_idx = 0
+            while start < len(full_text):
+                end = start + max_len
+                chunk_body = full_text[start:end]
+                # 构建带有子索引的 ID
+                cid = Atomizer._build_chunk_id(rel_raw_path, base_idx, f"{title_base}_part{sub_idx}")
+                content = f"【上下文路径: {breadcrumb} (第{sub_idx+1}部分)】\n\n" + chunk_body
+                sub_chunks.append(Chunk(cid, title_base, content, rel_raw_path, rel_raw_path, breadcrumb))
+                
+                start += (max_len - overlap)
+                sub_idx += 1
+                base_idx += 1
+            return sub_chunks, base_idx
 
         for line in lines:
             line_s = line.strip()
-            # 1. 匹配标准 MD 标题
             header_match = re.match(r"^(#+)\s+(.+)$", line)
-            # 2. 匹配自定义章节标题 (如 第一章, 一、)
             is_custom_header = False
             custom_title = ""
             for pat in patterns:
@@ -217,30 +259,28 @@ class Atomizer:
                     break
 
             if header_match or is_custom_header:
-                # 发现新标题，如果之前有内容，先封装成块
                 if current_body:
-                    chunks.append(_create_chunk(current_headers, current_body, chunk_idx))
-                    chunk_idx += 1
+                    new_chunks, chunk_idx = _create_chunks(current_headers, current_body, chunk_idx)
+                    chunks.extend(new_chunks)
                     current_body = []
                 
                 if header_match:
                     h_level = len(header_match.group(1))
                     h_title = header_match.group(2).strip()
                 else:
-                    h_level = 2 # 自定义章节默认按 H2 处理
+                    h_level = 2
                     h_title = custom_title
 
                 if h_level <= 6:
                     current_headers[h_level] = h_title
-                    # 清空更低等级（更细分）的旧标题
                     for i in range(h_level + 1, 7):
                         current_headers[i] = None
             else:
                 current_body.append(line)
         
-        # 处理文件结尾的最后一段内容
         if current_body:
-            chunks.append(_create_chunk(current_headers, current_body, chunk_idx))
+            new_chunks, chunk_idx = _create_chunks(current_headers, current_body, chunk_idx)
+            chunks.extend(new_chunks)
             
         # 极端兜底：如果全文没有标题，退化为单块模式
         if not chunks:
@@ -317,7 +357,9 @@ class Atomizer:
 
     @staticmethod
     def _build_chunk_id(rel_path: str, index: int, title: str) -> str:
-        slug = re.sub(r"[^a-zA-Z0-9]+", "_", title.lower()).strip("_") or "section"
-        path_slug = re.sub(r"[^a-zA-Z0-9]+", "_", rel_path.lower()).strip("_")
-        digest = hashlib.md5(f"{rel_path}:{index}:{title}".encode("utf-8")).hexdigest()[:8]
-        return f"wc_{path_slug}_{slug}_{index:02d}_{digest}"
+        # 移除潜在的乱码干扰，优先保证 ID 的唯一性与可读性
+        slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "_", title.lower()).strip("_") or "section"
+        path_slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "_", rel_path.lower()).strip("_")
+        # 增加盐值哈希，防止路径冲突
+        digest = hashlib.md5(f"{rel_path}:{index}:{title}".encode("utf-8", errors="replace")).hexdigest()[:8]
+        return f"wc_{path_slug[:30]}_{slug[:20]}_{index:02d}_{digest}"

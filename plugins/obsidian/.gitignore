@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+*.log
+.env
+.obsidian/
+dist/
+# 如果 main.js 是从 main.ts 编译出来的，通常不建议提交
+# main.js

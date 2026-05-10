@@ -12,7 +12,7 @@ wikicoder/
 │   ├── core/
 │   │   ├── agent.py         # ReAct 决策引擎 (Tool Use 调度)
 │   │   └── atomizer.py      # RAW -> WIKI 处理器 (原子化逻辑)
-│   ├── skills/              # Hermes-Agent 原子化工具集
+│   ├── skills/              # WikiCoder-Agent 原子化工具集
 │   │   ├── wiki_tools.py    # search_wiki, read_chunk, list_categories
 │   │   └── code_tools.py    # read_file, write_file, patch_apply
 │   └── utils/
@@ -66,7 +66,7 @@ db.sqlite：存储 chunk_id, title, parent_file, tags, last_modified。
 
 流式渲染：使用 rich.live 实现代码块高亮实时输出。
 
-4. Hermes-Agent 原子化工具 (The Skills)
+4. WikiCoder-Agent 原子化工具 (The Skills)
 为了让大模型能像操作文件一样操作 Wiki，需定义以下工具：
 
 wiki_search(query):
@@ -107,7 +107,7 @@ Step 1 (Infrastructure): "实现 .wikicoder/config.yaml 的加载逻辑，并建
 
 Step 2 (Atomizer & DB): "编写 atomizer.py。要求：读取 raw_path 下的 Markdown，按二级标题拆分并存入 data/wiki_processed/chunks，同时将元数据存入 db.sqlite。记录同步日志到 logs/sync.log。"
 
-Step 3 (Tools & Agent): "使用 LangChain 封装 wiki_tools.py。实现 wiki_search (SQL 检索) 和 wiki_read_chunk。在 System Prompt 中加入 Hermes-Agent 风格的‘Wiki 优先’指令。"
+Step 3 (Tools & Agent): "使用 LangChain 封装 wiki_tools.py。实现 wiki_search (SQL 检索) 和 wiki_read_chunk。在 System Prompt 中加入 WikiCoder-Agent 风格的‘Wiki 优先’指令。"
 
 Step 4 (REPL): "使用 python-prompt-toolkit 和 rich 实现 main.py 的对话循环。支持流式输出和斜杠命令 /sync。"
 

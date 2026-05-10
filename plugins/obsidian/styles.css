@@ -1,0 +1,388 @@
+.wikicodian-chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 10px;
+  background-color: var(--background-secondary);
+  user-select: text; /* 允许选择文字 */
+  -webkit-user-select: text;
+}
+
+.wikicodian-chat-messages {
+  flex-grow: 1;
+  overflow-y: auto;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  user-select: text;
+}
+
+.wikicodian-message {
+  padding: 8px 12px;
+  border-radius: 8px;
+  max-width: 90%;
+  line-height: 1.5;
+  font-size: 14px;
+  user-select: text; /* 确保消息内容可选 */
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+.wikicodian-message-user {
+  align-self: flex-end;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.wikicodian-message-bot {
+  align-self: flex-local;
+  background-color: var(--background-primary);
+  border: 1px solid var(--border-color);
+  color: var(--text-normal);
+}
+
+.wikicodian-chat-input-area {
+  display: none; /* 已废弃，被 input-wrapper 替代 */
+}
+
+.wikicodian-chat-input {
+  flex-grow: 1;
+  resize: none;
+  min-height: 40px;
+  max-height: 120px;
+}
+
+.wikicodian-sync-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+  padding: 4px 8px;
+  background: var(--background-modifier-border);
+  border-radius: 4px;
+  font-size: 11px;
+}
+
+.wikicodian-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 4px;
+}
+
+.wikicodian-status-online { background-color: #4CAF50; }
+.wikicodian-status-offline { background-color: #f44336; }
+
+.wikicodian-status-msg {
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-style: italic;
+  margin: 8px 0;
+}
+
+/* 斜杠命令建议列表样式 */
+.wikicodian-suggest-container {
+  position: absolute;
+  bottom: 60px;
+  left: 10px;
+  right: 10px;
+  background-color: var(--background-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  z-index: 1000;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.wikicodian-suggest-item {
+  padding: 8px 12px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.wikicodian-suggest-item.is-selected {
+  background-color: var(--background-modifier-hover);
+}
+
+.wikicodian-suggest-name {
+  font-weight: bold;
+  color: var(--text-accent);
+}
+
+.wikicodian-suggest-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.wikicodian-mode-toggle {
+  font-weight: bold;
+  transition: all 0.2s ease;
+}
+
+.wikicodian-mode-toggle.is-build {
+  background-color: #ff5722 !important;
+  color: white !important;
+}
+
+/* 任务面板样式 */
+.wikicodian-task-panel {
+  background: var(--background-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 10px;
+  max-height: 200px;
+  overflow-y: auto;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+  flex-shrink: 0;
+}
+
+.wikicodian-task-header {
+  font-size: 13px;
+  color: var(--text-accent);
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 4px;
+}
+
+.wikicodian-task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.wikicodian-task-row {
+  display: flex;
+  align-items: flex-start;
+}
+
+.wikicodian-task-icon-done, .wikicodian-task-icon-active {
+  margin-right: 6px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.wikicodian-task-text-done {
+  color: var(--text-muted);
+  text-decoration: line-through;
+  transition: all 0.3s ease;
+}
+
+.wikicodian-task-text-active {
+  color: var(--text-normal);
+}
+
+/* 确认框样式 */
+.wikicodian-confirm-box {
+  background: var(--background-secondary-alt);
+  border: 1px solid var(--text-error);
+  border-radius: 6px;
+  padding: 10px;
+  margin-top: 10px;
+}
+
+.wikicodian-confirm-box strong {
+  color: var(--text-error);
+}
+
+.wikicodian-confirm-box > div {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+/* 输入区域极简风格 (仿 Claudian) */
+.wikicodian-input-wrapper {
+  display: flex;
+  flex-direction: column;
+  background-color: var(--background-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+  margin-top: 8px;
+  flex-shrink: 0;
+}
+
+.wikicodian-input-wrapper textarea {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  resize: none;
+  min-height: 60px;
+  max-height: 150px;
+  padding: 10px;
+  border-radius: 0;
+}
+
+.wikicodian-input-wrapper textarea:focus {
+  box-shadow: none;
+  border: none;
+}
+
+.wikicodian-control-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  background-color: var(--background-secondary-alt);
+  border-top: 1px solid var(--border-color);
+}
+
+.wikicodian-control-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wikicodian-mode-select {
+  background: transparent;
+  border: none;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.wikicodian-mode-select:hover {
+  color: var(--text-normal);
+}
+
+.wikicodian-file-tag {
+  display: flex;
+  align-items: center;
+  background: var(--background-modifier-hover);
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  border: 1px solid var(--border-color);
+}
+
+.wikicodian-file-icon {
+  margin-right: 4px;
+}
+
+.wikicodian-file-close {
+  margin-left: 6px;
+  cursor: pointer;
+  font-weight: bold;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+}
+
+.wikicodian-file-close:hover {
+  opacity: 1;
+}
+
+.wikicodian-control-right {
+  display: flex;
+  align-items: center;
+}
+
+.wikicodian-yolo-btn {
+  background-color: transparent;
+  border: none;
+  color: #ff5722;
+  font-weight: bold;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.wikicodian-yolo-btn:hover {
+  background-color: rgba(255, 87, 34, 0.1);
+}
+
+/* 思考气泡样式 - 灵动岛风格 */
+.wikicodian-thought-bubble {
+  font-size: 11px;
+  color: var(--text-normal); /* 提亮颜色 */
+  background: var(--background-secondary-alt); /* 增强对比背景 */
+  padding: 8px 14px;
+  border-radius: 8px;
+  display: block;
+  margin-bottom: 10px;
+  border: 1px solid var(--interactive-accent); /* 强调边框 */
+  max-width: 100%;
+}
+
+.wikicodian-thought-step {
+  margin-bottom: 4px;
+  opacity: 1; /* 全不透明 */
+  line-height: 1.4;
+  animation: wikicodian-fade-in 0.3s ease-out;
+}
+
+@keyframes wikicodian-fade-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 0.8; transform: translateY(0); }
+}
+
+@keyframes wikicodian-pulse {
+  0% { opacity: 0.7; }
+  50% { opacity: 1; }
+  100% { opacity: 0.7; }
+}
+
+.wikicodian-wiki-status {
+  font-size: 10px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 2px 6px;
+  background: var(--background-modifier-hover);
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+}
+
+/* [Sync] 交互式决策卡片样式 */
+.wikicodian-interaction-card {
+  background: var(--background-secondary);
+  border: 1px solid var(--interactive-accent);
+  border-radius: 12px;
+  padding: 14px;
+  margin: 12px 0;
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+  animation: wikicodian-slide-up 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.wikicodian-interaction-question {
+  font-weight: 600;
+  font-size: 14px;
+  color: var(--text-normal);
+  margin-bottom: 12px;
+  line-height: 1.4;
+}
+
+.wikicodian-interaction-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.wikicodian-interaction-buttons button {
+  padding: 6px 16px;
+  font-size: 13px;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.wikicodian-interaction-buttons button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(var(--interactive-accent-rgb), 0.3);
+}
+
+@keyframes wikicodian-slide-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}

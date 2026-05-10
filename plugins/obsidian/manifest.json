@@ -1,0 +1,10 @@
+{
+  "id": "wikicodian",
+  "name": "Wikicodian",
+  "version": "0.1.0",
+  "minAppVersion": "0.15.0",
+  "description": "WikiCoder 的 Obsidian 官方集成插件。提供 AI 问答与本地知识库同步功能。",
+  "author": "lihuiqiang",
+  "authorUrl": "https://github.com/wikicodian",
+  "isDesktopOnly": true
+}

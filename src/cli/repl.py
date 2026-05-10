@@ -52,7 +52,7 @@ from src.cli.display import (
 from src.utils.config import load_config, ensure_workspace, AppConfig, PROJECT_ROOT, DEFAULT_CONFIG_PATH
 from src.skills.code_tools import read_file, backup_and_apply_single, backup_and_apply_multi, summarize_unified_diff
 from src.core.agent import AgentResponse, WikiFirstAgent
-from src.core.build_agent import BuildAgent, BuildStep
+from src.core.wikicoder_engine import BuildAgent, BuildStep
 from src.core.llm_client import LLMClient, global_stats
 
 class SlashCommandCompleter(Completer):
@@ -65,7 +65,7 @@ class SlashCommandCompleter(Completer):
             "/kbbackups": "查看知识库备份",
             "/kbsave": "备份知识库",
             "/kbrestore": "恢复知识库",
-            "/mode": {"plan": "规划模式", "build": "构建模式"},
+            "/mode": {"chat": "对话模式 (Chat)", "agent": "智能代理 (Agent)"},
             "/model": {"jiutian-think-v3": "思考模型", "jiutian-lan-comv3": "对话模型"},
             "/resume": "恢复上次会话",
             "/reset": "清空会话记忆",
@@ -210,26 +210,27 @@ def _save_session_state(history, mode):
     except: pass
 
 def _load_session_state():
-    if not SESSION_STATE_PATH.exists(): return [], "plan"
+    if not SESSION_STATE_PATH.exists(): return [], "chat"
     try:
         data = json.loads(SESSION_STATE_PATH.read_text(encoding="utf-8"))
-        return [(r["q"], r["a"]) for r in data.get("history", [])], data.get("mode", "plan")
-    except: return [], "plan"
+        return [(r["q"], r["a"]) for r in data.get("history", [])], data.get("mode", "chat")
+    except: return [], "chat"
 
 def _clear_wiki_output(wiki_path: Path) -> list[str]:
     messages: list[str] = []
     wiki_dir = Path(wiki_path)
     if not wiki_dir.exists(): return [f"Wiki dir not found: {wiki_dir}"]
+    count = 0
     for file_path in sorted([p for p in wiki_dir.rglob("*") if p.is_file()], key=lambda p: len(p.parts), reverse=True):
         try:
             file_path.unlink()
-            messages.append(f"Removed wiki file: {file_path}")
-        except Exception as e:
+            count += 1
+        except Exception:
             try:
                 file_path.write_text("", encoding="utf-8")
-                messages.append(f"Truncated locked wiki file: {file_path}")
-            except Exception as e2:
-                messages.append(f"Failed clearing wiki file {file_path}: {e}; {e2}")
+                count += 1
+            except Exception: pass
+    messages.append(f"✅ 已静默清理 {count} 个编译生成的 Wiki 页面。")
     return messages
 
 def chat_repl(trace: bool = False, stream: bool = False):
@@ -264,10 +265,18 @@ def chat_repl(trace: bool = False, stream: bool = False):
                     session_mode = parts[1]
                     ui.mode = session_mode
                     console.print(f"[green]Mode set to {session_mode}[/green]")
-            else:
-                console.print(f"[yellow]命令尚未完全支持：{text}[/yellow]")
+                else:
+                    # 循环切换
+                    session_mode = "agent" if session_mode == "chat" else "chat"
+                    ui.mode = session_mode
+                    console.print(f"[green]Mode toggled to {session_mode}[/green]")
             continue
         
+        # 实时同步快捷键修改的状态
+        if hasattr(session.app, "mode") and session.app.mode != session_mode:
+            session_mode = session.app.mode
+            ui.mode = session_mode
+
         resp = _run_agent_with_thinking(agent, text, force_wiki=False, ui=ui, history=session_history, mode=session_mode)
         
         session_history.append((text, resp.output))

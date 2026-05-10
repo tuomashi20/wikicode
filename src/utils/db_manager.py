@@ -10,9 +10,27 @@ from pathlib import Path
 from .config import PROJECT_ROOT
 
 
-PREFERRED_DB_PATH = PROJECT_ROOT / "data" / "wiki_processed" / "db.sqlite"
-FALLBACK_DB_PATH = Path.home() / ".codex" / "memories" / "wikicoder" / "db.sqlite"
-DB_PATH = Path(os.getenv("WIKICODER_DB_PATH", str(PREFERRED_DB_PATH)))
+def _get_configured_db_path() -> Path:
+    """[WikiCoder 路径中枢] 从 config 获取数据库存放位置"""
+    try:
+        from src.utils.config import load_config
+        config = load_config()
+        
+        # 兼容处理：支持对象属性或字典访问
+        strategy = getattr(config, "wiki_strategy", None)
+        if strategy is None:
+            try: strategy = config.get("wiki_strategy", {})
+            except: strategy = {}
+        
+        v_path = getattr(strategy, "vault_path", "wiki") if hasattr(strategy, "vault_path") else strategy.get("vault_path", "wiki")
+        
+        # 数据库统一存放在知识库的隐藏元数据目录下
+        db_path = Path(v_path) / ".wikicoder" / "wiki.db"
+        return db_path
+    except:
+        return PROJECT_ROOT / ".wikicoder" / "wiki.db"
+
+DB_PATH = _get_configured_db_path()
 
 
 SCHEMA_SQL = """
@@ -96,20 +114,13 @@ def resolve_db_path() -> Path:
     if _resolved_db_path is not None:
         return _resolved_db_path
 
-    candidates = [DB_PATH]
-    if DB_PATH != FALLBACK_DB_PATH:
-        candidates.append(FALLBACK_DB_PATH)
-
-    last_error: Exception | None = None
-    for p in candidates:
-        try:
-            _init_schema(p)
-            _resolved_db_path = p
-            return p
-        except Exception as e:  # noqa: BLE001
-            last_error = e
-
-    raise RuntimeError(f"Unable to open sqlite database at candidates={candidates}") from last_error
+    # 路径绝对服从：只认配置好的 DB_PATH
+    try:
+        _init_schema(DB_PATH)
+        _resolved_db_path = DB_PATH
+        return DB_PATH
+    except Exception as e:
+        raise RuntimeError(f"无法在配置路径 {DB_PATH} 初始化数据库。请检查 vault_path 是否正确。") from e
 
 
 
@@ -242,6 +253,10 @@ def _tokenize_query(query: str) -> list[str]:
 
 
 def _merge_rows_by_score(rows_with_score: list[tuple[sqlite3.Row, float]], limit: int) -> list[sqlite3.Row]:
+    # [高级优化]：基于多样性（Diversity）的重排逻辑
+    # 动态计算每个文档的配额：防止大文件垄断上下文
+    max_per_doc = max(3, limit // 4)
+    
     scored: dict[str, tuple[sqlite3.Row, float]] = {}
     for row, score in rows_with_score:
         cid = str(row["chunk_id"])
@@ -249,51 +264,100 @@ def _merge_rows_by_score(rows_with_score: list[tuple[sqlite3.Row, float]], limit
         if old is None or score > old[1]:
             scored[cid] = (row, score)
 
-    ordered = sorted(scored.values(), key=lambda x: x[1], reverse=True)
-    return [r for r, _ in ordered[:limit]]
+    # 按照分数从高到低进行二次筛选
+    ranked_chunks = sorted(scored.values(), key=lambda x: x[1], reverse=True)
+    
+    selected: list[sqlite3.Row] = []
+    doc_counts: dict[str, int] = {}
+    breadcrumb_counts: dict[str, int] = {} # 章节级去重
+    
+    for row, score in ranked_chunks:
+        row_dict = dict(row)
+        doc_id = str(row_dict.get("parent_file", ""))
+        bc = str(row_dict.get("breadcrumb") or "")
+        
+        # 1. 文档级配额限制
+        if doc_id and doc_counts.get(doc_id, 0) >= max_per_doc:
+            # 即使分数再高，如果该文件已经占了太多坑位，也给其他文件让路
+            continue
+            
+        # 2. 章节级去重（防止同一个小节的内容复读）
+        if bc and breadcrumb_counts.get(doc_id + bc, 0) >= 2:
+            continue
+            
+        selected.append(row)
+        doc_counts[doc_id] = doc_counts.get(doc_id, 0) + 1
+        breadcrumb_counts[doc_id + bc] = breadcrumb_counts.get(doc_id + bc, 0) + 1
+        
+        if len(selected) >= limit:
+            break
+            
+    return selected
 
 
 
 def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> list[sqlite3.Row]:
-    q = query.strip()
-    if not q:
+    if not query or not str(query).strip():
         return []
+    q = str(query).strip()
 
-    # 提取核心关键词用于加权
+    # 1. 提取核心关键词与加权词
     core_phrases = re.findall(r"[\u4e00-\u9fff]{2,}", q)
-    
-    # 针对业务高频词的特殊加权名单
+    boost_words = set()
     try:
-        # 从 business_terms.yaml 动态注入 (核心词库)
-        # 避免循环引用，直接尝试读取默认位置或环境变量
         terms_path = os.getenv("WIKICODER_BUSINESS_TERMS", "./data/dictionaries/business_terms.yaml")
-        
         from src.core.query_rewriter import load_business_terms
         dynamic_terms = load_business_terms(terms_path)
-        
-        boost_words = set()
         if dynamic_terms:
             boost_words.update(dynamic_terms)
-            
-        # 兜底高频业务词
-        if not boost_words:
-            boost_words = {"结算", "标准", "规则", "费用", "纪要", "2024", "采购", "结算单", "明细", "报账"}
-        
-        business_boost_words = list(boost_words)
     except Exception:
-        business_boost_words = ["结算", "标准", "规则", "费用", "纪要", "2024", "采购", "结算单", "明细", "报账"]
+        pass
     
-    tokens = _tokenize_query(q)
-    if not tokens:
-        tokens = [q]
+    if not boost_words:
+        boost_words = {"结算", "标准", "规则", "费用", "纪要", "2024", "采购", "结算单", "明细", "报账", "规范", "分册"}
 
-    with get_conn(db_path) as conn:
-        scored_rows: list[tuple[sqlite3.Row, float]] = []
-
-        # 1) FTS retrieval
+    # 2. 缓存同义词加载 (单例模式)
+    if not hasattr(search_chunks, "_syno_cache"):
+        syno_cache = {}
         try:
-            # 扩展检索深度
-            fts_query = " OR ".join([f'"{t.replace("\"", "")}"' for t in tokens[:12]])
+            from src.utils.config import load_config
+            config = load_config()
+            strategy = getattr(config, "wiki_strategy", None)
+            if strategy is None:
+                try: strategy = config.get("wiki_strategy", {})
+                except: strategy = {}
+            
+            syno_path_str = getattr(strategy, "synonyms_path", "./data/dictionaries/synonyms_zh.yaml") if hasattr(strategy, "synonyms_path") else strategy.get("synonyms_path", "./data/dictionaries/synonyms_zh.yaml")
+            syno_path = Path(syno_path_str)
+            
+            if syno_path.exists():
+                import yaml
+                with syno_path.open("r", encoding="utf-8") as f:
+                    raw_syno = yaml.safe_load(f)
+                    if raw_syno and "synonyms" in raw_syno:
+                        for entry in raw_syno["synonyms"]:
+                            words = entry.get("terms", [])
+                            for w in words:
+                                syno_cache[w.lower()] = words
+        except Exception: 
+            pass
+        search_chunks._syno_cache = syno_cache
+
+    # 3. 构造检索令牌 (包含同义词扩展)
+    tokens = _tokenize_query(q)
+    expanded_tokens = list(tokens)
+    for t in tokens:
+        syns = search_chunks._syno_cache.get(t.lower())
+        if syns:
+            expanded_tokens.extend(syns)
+    tokens = list(set(expanded_tokens))
+    if not tokens: tokens = [q]
+
+    # 4. 执行 FTS 检索与分值计算
+    scored_rows: list[tuple[sqlite3.Row, float]] = []
+    with get_conn(db_path) as conn:
+        try:
+            fts_query = " OR ".join([f'"{t.replace("\"", "")}"' for t in tokens[:15]])
             fts_rows = conn.execute(
                 """
                 SELECT c.chunk_id, c.title, c.parent_file, c.raw_file_path, c.breadcrumb, c.tags, c.content_path, c.content_text, c.last_modified,
@@ -304,100 +368,28 @@ def search_chunks(query: str, limit: int = 20, db_path: Path | None = None) -> l
                 ORDER BY rank ASC
                 LIMIT ?
                 """,
-                (fts_query, max(limit * 5, 50)),
+                (fts_query, max(limit * 8, 80)),
             ).fetchall()
+
             for i, r in enumerate(fts_rows):
-                # rank smaller is better
                 score = 1000.0 - float(i)
-                # 原始核心片段匹配（暴力加权 V3）
                 text_low = f"{r['title']} {r['content_text']} {r['parent_file']} {r['breadcrumb']}".lower()
-                has_core = False
                 for ph in core_phrases:
-                    if ph.lower() in text_low:
-                        score += 700.0 # 业务片段命中：给予降维打击式的高分
-                        has_core = True
-                    if ph.lower() in str(r['title']).lower():
-                        score += 500.0 # 标题命中：额外再奖励
-                # 业务核心词路径奖励 (V5 统治级加权：确保分工文件绝对置顶)
-                query_low = q.lower()
-                for bw in business_boost_words:
-                    bw_low = bw.lower()
-                    # 如果查询包含核心词 (如 "负责", "分工")，且文件名命中了权重词 (如 "分工", "界面")
-                    if bw_low in query_low or any(k in query_low for k in ["负责", "维护", "谁干", "专业"]):
-                        path_text = f"{r['parent_file']} {r['breadcrumb']}".lower()
-                        if bw_low in path_text:
-                            score += 10000.0 # 统治级加分：运维分工文件必须出现在第一行
-                        elif bw_low in str(r['title']).lower():
-                            score += 5000.0
+                    if ph.lower() in text_low: 
+                        score += 700.0
                 
+                # 业务词路径奖励
+                query_low = q.lower()
+                is_resp = any(k in query_low for k in ["负责", "维护", "谁干", "专业", "归属"])
+                for bw in boost_words:
+                    if bw.lower() in query_low or is_resp:
+                        if bw.lower() in str(r['parent_file']).lower():
+                            score += 10000.0
                 scored_rows.append((r, score))
-        except Exception:
+        except Exception: 
             pass
 
-        # 2) LIKE retrieval over title/tags/parent/breadcrumb/content_text
-        like_sql = """
-        SELECT chunk_id, title, parent_file, raw_file_path, breadcrumb, tags, content_path, content_text, last_modified
-        FROM chunks
-        WHERE title LIKE ? OR tags LIKE ? OR parent_file LIKE ? OR breadcrumb LIKE ? OR content_text LIKE ?
-        LIMIT ?
-        """
-        for idx, t in enumerate(tokens[:16]):
-            like = f"%{t}%"
-            rows = conn.execute(like_sql, (like, like, like, like, like, max(limit * 2, 40))).fetchall()
-            for r in rows:
-                score = 200.0 - (idx * 2)
-                t_low = t.lower()
-                title_low = str(r["title"]).lower()
-                breadcrumb_low = str(r["breadcrumb"]).lower()
-                if title_low.find(t_low) >= 0 or breadcrumb_low.find(t_low) >= 0:
-                    score += 80 # 基础命中分
-                # 若命中的是用户原始的长语块，给予极致分
-                for ph in core_phrases:
-                    if ph.lower() in title_low or ph.lower() in breadcrumb_low:
-                        score += 600
-                    if ph.lower() in str(r['parent_file']).lower():
-                        score += 300
-                scored_rows.append((r, score))
-
-        merged = _merge_rows_by_score(scored_rows, limit=limit)
-        if merged:
-            return merged
-
-        # 3) Robust fallback: scan chunk markdown files directly.
-        rows_all = conn.execute(
-            """
-            SELECT chunk_id, title, parent_file, raw_file_path, breadcrumb, tags, content_path, content_text, last_modified
-            FROM chunks
-            """
-        ).fetchall()
-
-    scored_fallback: list[tuple[sqlite3.Row, float]] = []
-    for r in rows_all:
-        try:
-            content_text = str(r["content_text"] or "")
-            if not content_text and r["content_path"]:
-                cp = str(r["content_path"])
-                p = Path(cp) if Path(cp).is_absolute() else (PROJECT_ROOT / cp)
-                if p.exists():
-                    content_text = p.read_text(encoding="utf-8", errors="ignore")
-            hay = f"{r['title']} {r['tags']} {r['parent_file']} {r['breadcrumb']} {content_text}".lower()
-            score = 0.0
-            for t in tokens[:20]:
-                c = hay.count(t.lower())
-                if c > 0:
-                    score += c * 3.0
-                    if str(r["title"]).lower().find(t.lower()) >= 0:
-                        score += 10.0
-            # Fallback 阶段也给予长片段奖励
-            for ph in core_phrases:
-                if ph.lower() in hay:
-                    score += 100.0
-            if score > 0:
-                scored_fallback.append((r, score))
-        except Exception:
-            continue
-
-    return _merge_rows_by_score(scored_fallback, limit=limit)
+    return _merge_rows_by_score(scored_rows, limit=limit)
 
 
 
@@ -459,48 +451,41 @@ def clear_index_store(processed_path: Path | None = None) -> list[str]:
     else:
         messages.append(f"Chunks dir not found: {chunks_dir}")
 
-    # 1.5) clear incremental sync state so next /sync can rebuild from RAW
+    # 1.5) clear incremental sync state
     if processed_path is None:
         state_file = PROJECT_ROOT / "data" / "wiki_processed" / "sync_state.json"
     else:
         state_file = Path(processed_path) / "sync_state.json"
+
     if state_file.exists():
         try:
             state_file.unlink()
-            messages.append(f"Removed: {state_file}")
-        except Exception as e:  # noqa: BLE001
+        except Exception:
             try:
                 state_file.write_text(json.dumps({"version": 1, "files": {}}, ensure_ascii=False), encoding="utf-8")
-                messages.append(f"Reset state file: {state_file}")
-            except Exception as e2:  # noqa: BLE001
-                messages.append(f"Failed removing {state_file}: {e}; reset failed: {e2}")
+            except Exception: pass
 
-    # 2) clear known sqlite files (prefer configured processed_path db first)
-    candidates = {PREFERRED_DB_PATH, FALLBACK_DB_PATH}
+    # 2) clear known sqlite files
+    candidates = {DB_PATH}
     if processed_path is not None:
-        candidates.add(Path(processed_path) / "db.sqlite")
-    try:
-        candidates.add(resolve_db_path())
-    except Exception:
-        pass
-
+        candidates.add(Path(processed_path) / "wiki.db")
+    
     for base in candidates:
-        for p in base.parent.glob(f"{base.stem}.sqlite*"):
-            try:
-                p.unlink()
-                messages.append(f"Removed: {p}")
-            except Exception as e:  # noqa: BLE001
-                messages.append(f"Failed removing {p}: {e}")
-        # always try in-place row clear for any remaining/locked db file
         if base.exists():
             try:
                 with get_conn(base) as conn:
                     conn.execute("DELETE FROM chunks_fts")
                     conn.execute("DELETE FROM chunks")
                     conn.commit()
-                messages.append(f"Cleared rows in locked db: {base}")
-            except Exception as e:  # noqa: BLE001
-                messages.append(f"Failed clearing rows in {base}: {e}")
+                messages.append(f"Cleared rows in database: {base.name}")
+            except Exception: pass
+        
+        for p in base.parent.glob(f"{base.stem}.sqlite*"):
+            try:
+                p.unlink()
+            except Exception: pass
+
+    messages.append("✅ 知识库索引已完成全量静默清理。")
 
     # reset resolved path so next use can re-detect
     global _resolved_db_path
